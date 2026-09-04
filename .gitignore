@@ -1,0 +1,16 @@
+/bin/
+/vendor/
+
+.env
+.env.*
+!.env.example
+
+*.test
+*.prof
+coverage*.out
+coverage*.html
+
+.DS_Store
+.idea/
+.vscode/
+
