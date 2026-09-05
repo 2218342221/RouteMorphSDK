@@ -10,6 +10,16 @@ var (
 	textParts             = routekit.TextParts
 	dataURL               = routekit.DataURL
 	parseDataURL          = routekit.ParseDataURL
+	parseFileData         = routekit.ParseFileData
+	openAIFileData        = routekit.OpenAIFileData
+	mimeTypeFromURL       = routekit.MIMETypeFromURL
+	validMIMEType         = routekit.ValidMIMEType
+	chatAudioMIMEType     = routekit.ChatAudioMIMEType
+	chatAudioFormat       = routekit.ChatAudioFormat
+	validBase64           = routekit.ValidBase64
+	validImageMIMEType    = routekit.ValidOpenAIImageMIMEType
+	geminiFileURI         = routekit.GeminiFileURICompatible
+	portableGeminiFileURI = routekit.PortableGeminiFileURI
 	appendDiagnostic      = routekit.AppendDiagnostic
 	rejectUnknownTopLevel = routekit.RejectUnknownTopLevel
 )

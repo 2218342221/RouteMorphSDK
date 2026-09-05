@@ -239,6 +239,58 @@ func TestKnownChatChunkMetadataIsAccepted(t *testing.T) {
 	}
 }
 
+func TestOpenAIV355ChunkEnvelopeIsMappedOrDiagnosed(t *testing.T) {
+	converter := New(Options{})
+	frames, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","service_tier":"priority","moderation":{"input":{"type":"moderation_results","model":"omni-moderation-latest","results":[{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false}]}},"system_fingerprint":"fp","obfuscation":"padding","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 2 || diagnostics[0].Code != "chat_system_fingerprint_not_representable" || diagnostics[1].Code != "chat_stream_obfuscation_not_representable" {
+		t.Fatalf("diagnostics = %#v", diagnostics)
+	}
+	if len(frames) == 0 || !strings.Contains(streamText(frames), `"service_tier":"priority"`) || !strings.Contains(streamText(frames), `"moderation":`) {
+		t.Fatalf("Responses events did not preserve envelope fields: %s", streamText(frames))
+	}
+}
+
+func TestOpenAIV355ModerationOnlyChunksAreAccumulated(t *testing.T) {
+	converter := New(Options{})
+	result := `{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false}`
+	for _, side := range []string{"input", "output"} {
+		chunk := `{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"moderation":{"` + side + `":{"type":"moderation_results","model":"omni-moderation-latest","results":[` + result + `]}}}`
+		frames, _, err := converter.Convert(context.Background(), frame(chunk))
+		if err != nil || len(frames) != 0 {
+			t.Fatalf("%s moderation-only chunk frames=%#v error=%v", side, frames, err)
+		}
+	}
+	if _, _, err := converter.Convert(context.Background(), frame(`{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	frames, _, err := converter.Convert(context.Background(), core.Frame{Done: true, Data: []byte("[DONE]")})
+	if err != nil || !strings.Contains(streamText(frames), `"moderation":{"input":`) || !strings.Contains(streamText(frames), `"output":`) {
+		t.Fatalf("terminal moderation frames=%s error=%v", streamText(frames), err)
+	}
+}
+
+func TestOpenAIV355ChunkUsageFailsClosed(t *testing.T) {
+	converter := New(Options{})
+	if _, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"completion_tokens_details":{"accepted_prediction_tokens":1}}}`))
+	if !errors.Is(err, core.ErrUnsupported) {
+		t.Fatalf("Convert() error = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestOpenAIV355ChunkCommonUsageIsValidated(t *testing.T) {
+	converter := New(Options{})
+	_, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"prompt_tokens_details":{"cached_tokens":2}}}`))
+	if !errors.Is(err, core.ErrUpstreamResponse) {
+		t.Fatalf("Convert() error = %v, want ErrUpstreamResponse", err)
+	}
+}
+
 func TestFinalizeRequiresFinishReason(t *testing.T) {
 	converter := New(Options{})
 	if _, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`)); err != nil {

@@ -7,7 +7,7 @@ import (
 )
 
 func (c *messagesToChatConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
 	body, diagnostics, err := mapMessagesRequestToChat(input, options)
@@ -25,13 +25,16 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 	if source.N != nil && *source.N != 1 {
 		return nil, nil, unsupported(ProtocolChat, "$.n", "cross-protocol conversion supports exactly one choice")
 	}
+	if err := validateOpenAIReasoningEffortForMessages(ProtocolChat, "$.reasoning_effort", source.ReasoningEffort); err != nil {
+		return nil, nil, err
+	}
 	for path, present := range map[string]bool{
 		"$.frequency_penalty": source.FrequencyPenalty != nil, "$.presence_penalty": source.PresencePenalty != nil,
 		"$.logprobs": source.Logprobs != nil, "$.top_logprobs": source.TopLogprobs != nil,
 		"$.verbosity": rawJSONValuePresent(source.Verbosity), "$.user": rawJSONValuePresent(source.User),
-		"$.service_tier": rawJSONValuePresent(source.ServiceTier), "$.store": rawJSONValuePresent(source.Store),
+		"$.service_tier":     rawJSONValuePresent(source.ServiceTier),
+		"$.store":            rawJSONValuePresent(source.Store),
 		"$.prompt_cache_key": rawJSONValuePresent(source.PromptCacheKey), "$.prompt_cache_retention": rawJSONValuePresent(source.PromptCacheRetention),
-		"$.safety_identifier": rawJSONValuePresent(source.SafetyIdentifier),
 	} {
 		if present {
 			return nil, nil, unsupported(ProtocolChat, path, "field is not representable on this route")
@@ -50,7 +53,17 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 	if options.Exchange.UpstreamModel != "" {
 		model = options.Exchange.UpstreamModel
 	}
-	target := messagesRequest{Model: model, MaxTokens: maxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange), Metadata: source.Metadata}
+	target := messagesRequest{Model: model, MaxTokens: maxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange)}
+	if len(source.Metadata) > 0 {
+		return nil, diagnostics, unsupported(ProtocolChat, "$.metadata", "OpenAI metadata is storage/query metadata, not Anthropic user attribution")
+	}
+	safetyID, err := decodeOpenAISafetyIdentifier(source.SafetyIdentifier, "$.safety_identifier")
+	if err != nil {
+		return nil, diagnostics, err
+	}
+	if safetyID != "" {
+		target.Metadata = map[string]string{"user_id": safetyID}
+	}
 	stop, err := decodeStop(ProtocolChat, source.Stop)
 	if err != nil {
 		return nil, diagnostics, err
@@ -91,10 +104,53 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 		target.Tools = append(target.Tools, messagesTool{Name: tool.Function.Name, Description: tool.Function.Description, InputSchema: schema, Strict: tool.Function.Strict})
 	}
 	var system []messagesBlock
+	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
+	seenConversation := false
 	for index, sourceMessage := range source.Messages {
+		path := fmt.Sprintf("$.messages[%d]", index)
 		message, err := decodeChatMessage(sourceMessage, index)
 		if err != nil {
 			return nil, diagnostics, err
+		}
+		if message.Role == roleSystem || message.Role == roleDeveloper {
+			if seenConversation {
+				return nil, diagnostics, unsupported(ProtocolChat, path+".role", "interleaved system/developer messages cannot be moved to Messages system")
+			}
+			for partIndex, part := range message.Parts {
+				if part.Kind != partText {
+					return nil, diagnostics, unsupported(ProtocolChat, fmt.Sprintf("%s.content[%d]", path, partIndex), "Messages system instructions support text only")
+				}
+			}
+		} else {
+			seenConversation = true
+		}
+		for partIndex, part := range message.Parts {
+			switch part.Kind {
+			case partToolCall:
+				if message.Role != roleAssistant || part.ToolCall == nil {
+					return nil, diagnostics, invalid(ProtocolChat, fmt.Sprintf("%s.tool_calls[%d]", path, partIndex), "tool calls require the assistant role")
+				}
+				if _, duplicate := callNames[part.ToolCall.ID]; duplicate {
+					return nil, diagnostics, invalid(ProtocolChat, path+".tool_calls", "duplicate tool call id %q", part.ToolCall.ID)
+				}
+				callNames[part.ToolCall.ID] = part.ToolCall.Name
+			case partToolResult:
+				if message.Role != roleTool || part.ToolResult == nil {
+					return nil, diagnostics, invalid(ProtocolChat, path, "tool results require the tool role")
+				}
+				name, found := callNames[part.ToolResult.CallID]
+				if !found {
+					return nil, diagnostics, invalid(ProtocolChat, path+".tool_call_id", "tool result references unknown call %q", part.ToolResult.CallID)
+				}
+				if part.ToolResult.Name != "" && part.ToolResult.Name != name {
+					return nil, diagnostics, invalid(ProtocolChat, path+".name", "tool result name %q does not match call name %q", part.ToolResult.Name, name)
+				}
+				if consumedCallIDs[part.ToolResult.CallID] {
+					return nil, diagnostics, invalid(ProtocolChat, path+".tool_call_id", "duplicate tool result for call %q", part.ToolResult.CallID)
+				}
+				consumedCallIDs[part.ToolResult.CallID] = true
+			}
 		}
 		blocks, err := encodeMessagesContent(message.Parts)
 		if err != nil {
@@ -122,6 +178,10 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 	if err := decodeJSON(ProtocolMessages, input, &source); err != nil {
 		return nil, nil, err
 	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(input, &envelope); err != nil || !jsonValuePresent(envelope["max_tokens"]) {
+		return nil, nil, invalid(ProtocolMessages, "$.max_tokens", "max_tokens is required")
+	}
 	if source.Model == "" || len(source.Messages) == 0 {
 		return nil, nil, invalid(ProtocolMessages, "$", "model and at least one message are required")
 	}
@@ -131,8 +191,18 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 	if source.MaxTokens < 0 {
 		return nil, nil, invalid(ProtocolMessages, "$.max_tokens", "must not be negative")
 	}
-	if jsonValuePresent(source.Container) {
+	if messagesRawNonNull(source.Container) {
 		return nil, nil, unsupported(ProtocolMessages, "$.container", "container state requires a native Messages provider")
+	}
+	for path, present := range map[string]bool{
+		"$.top_k":         source.TopK != nil,
+		"$.cache_control": jsonValuePresent(source.CacheControl),
+		"$.inference_geo": source.InferenceGeo != "",
+		"$.service_tier":  source.ServiceTier != "",
+	} {
+		if present {
+			return nil, nil, unsupported(ProtocolMessages, path, "field has no semantically equivalent Chat control")
+		}
 	}
 	if err := validateMessagesThinkingBudget(source.Thinking, source.MaxTokens, "$.thinking"); err != nil {
 		return nil, nil, err
@@ -144,7 +214,14 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 	if options.Exchange.UpstreamModel != "" {
 		model = options.Exchange.UpstreamModel
 	}
-	target := chatRequest{Model: model, MaxCompletion: &source.MaxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange), Metadata: source.Metadata}
+	target := chatRequest{Model: model, MaxCompletion: &source.MaxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange)}
+	safetyID, err := messagesSafetyIdentifier(source.Metadata, "$.metadata")
+	if err != nil {
+		return nil, nil, err
+	}
+	if safetyID != "" {
+		target.SafetyIdentifier = mustJSON(safetyID)
+	}
 	if len(source.StopSequences) == 1 {
 		target.Stop = mustJSON(source.StopSequences[0])
 	} else if len(source.StopSequences) > 1 {
@@ -175,11 +252,24 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 		}
 	}
 	for index, tool := range source.Tools {
+		path := fmt.Sprintf("$.tools[%d]", index)
 		if jsonValuePresent(tool.CacheControl) {
-			return nil, diagnostics, unsupported(ProtocolMessages, fmt.Sprintf("$.tools[%d].cache_control", index), "tool cache control has no Chat equivalent")
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".cache_control", "tool cache control has no Chat equivalent")
+		}
+		if tool.EagerInputStreaming != nil {
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".eager_input_streaming", "Chat has no eager tool-input streaming control")
+		}
+		if tool.DeferLoading != nil {
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".defer_loading", "Chat has no deferred tool-loading control")
+		}
+		if len(tool.AllowedCallers) > 0 {
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".allowed_callers", "Chat cannot preserve tool caller constraints")
+		}
+		if jsonValuePresent(tool.InputExamples) {
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".input_examples", "Chat function tools have no input examples field")
 		}
 		if tool.Type != "" && tool.Type != "custom" {
-			return nil, diagnostics, unsupported(ProtocolMessages, fmt.Sprintf("$.tools[%d].type", index), "server tool %q requires a native Messages provider", tool.Type)
+			return nil, diagnostics, unsupported(ProtocolMessages, path+".type", "server tool %q requires a native Messages provider", tool.Type)
 		}
 		if tool.Name == "" {
 			return nil, diagnostics, invalid(ProtocolMessages, fmt.Sprintf("$.tools[%d].name", index), "name is required")
@@ -198,6 +288,11 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 		if err != nil {
 			return nil, diagnostics, err
 		}
+		for index, part := range parts {
+			if part.Kind != partText {
+				return nil, diagnostics, unsupported(ProtocolMessages, fmt.Sprintf("$.system[%d]", index), "Chat developer instructions support text only")
+			}
+		}
 		content, err := encodeChatContent(parts)
 		if err != nil {
 			return nil, diagnostics, err
@@ -205,15 +300,58 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 		target.Messages = append(target.Messages, chatMessage{Role: "developer", Content: content})
 	}
 	portable := make([]portableMessage, 0, len(source.Messages))
+	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
+	seenConversation := false
 	for index, sourceMessage := range source.Messages {
-		if sourceMessage.Role != "user" && sourceMessage.Role != "assistant" {
-			return nil, diagnostics, invalid(ProtocolMessages, fmt.Sprintf("$.messages[%d].role", index), "role must be user or assistant")
+		path := fmt.Sprintf("$.messages[%d]", index)
+		if sourceMessage.Role != "user" && sourceMessage.Role != "assistant" && sourceMessage.Role != "system" {
+			return nil, diagnostics, invalid(ProtocolMessages, path+".role", "role must be user, assistant, or system")
 		}
-		parts, err := decodeMessagesContent(sourceMessage.Content, fmt.Sprintf("$.messages[%d].content", index))
+		parts, err := decodeMessagesContent(sourceMessage.Content, path+".content")
 		if err != nil {
 			return nil, diagnostics, err
 		}
+		if sourceMessage.Role == "system" {
+			if seenConversation {
+				return nil, diagnostics, unsupported(ProtocolMessages, path+".role", "interleaved system messages cannot be moved to Chat developer instructions")
+			}
+			for partIndex, part := range parts {
+				if part.Kind != partText {
+					return nil, diagnostics, unsupported(ProtocolMessages, fmt.Sprintf("%s.content[%d]", path, partIndex), "Chat developer instructions support text only")
+				}
+			}
+		} else {
+			seenConversation = true
+		}
+		for partIndex, part := range parts {
+			blockPath := fmt.Sprintf("%s.content[%d]", path, partIndex)
+			switch part.Kind {
+			case partToolCall:
+				if sourceMessage.Role != "assistant" || part.ToolCall == nil {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath, "tool_use blocks require the assistant role")
+				}
+				if _, duplicate := callNames[part.ToolCall.ID]; duplicate {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".id", "duplicate tool_use id %q", part.ToolCall.ID)
+				}
+				callNames[part.ToolCall.ID] = part.ToolCall.Name
+			case partToolResult:
+				if sourceMessage.Role != "user" || part.ToolResult == nil {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath, "tool_result blocks require the user role")
+				}
+				if _, found := callNames[part.ToolResult.CallID]; !found {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".tool_use_id", "tool_result references unknown call %q", part.ToolResult.CallID)
+				}
+				if consumedCallIDs[part.ToolResult.CallID] {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".tool_use_id", "duplicate tool_result for call %q", part.ToolResult.CallID)
+				}
+				consumedCallIDs[part.ToolResult.CallID] = true
+			}
+		}
 		role := semanticRole(sourceMessage.Role)
+		if role == roleSystem {
+			role = roleDeveloper
+		}
 		for _, part := range parts {
 			if part.Kind == partToolResult {
 				role = roleTool
@@ -303,11 +441,14 @@ func (c *messagesToChatConverter) ToClientResponse(_ context.Context, input []by
 	if jsonValuePresent(source.Choices[0].Logprobs) {
 		return conversionResult{}, unsupported(ProtocolChat, "$.choices[0].logprobs", "Messages cannot represent token log probabilities")
 	}
+	diagnostics, err := chatResponseExtensionDiagnostics(source, options.LossPolicy)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	message, err := decodeChatMessage(source.Choices[0].Message, 0)
 	if err != nil {
 		return conversionResult{}, err
 	}
-	var diagnostics []Diagnostic
 	for index, part := range message.Parts {
 		switch part.Kind {
 		case partReasoning:
@@ -338,6 +479,12 @@ func (c *messagesToChatConverter) ToClientResponse(_ context.Context, input []by
 	}
 	target.Usage.CacheReadInputTokens = source.Usage.PromptDetails.CachedTokens
 	target.Usage.OutputTokens = source.Usage.CompletionTokens
+	if source.Usage.CompletionDetails.ReasoningTokens < 0 || source.Usage.CompletionDetails.ReasoningTokens > source.Usage.CompletionTokens {
+		return conversionResult{}, upstreamResponseError(ProtocolChat, "$.usage.completion_tokens_details.reasoning_tokens", "must be between zero and completion_tokens")
+	}
+	if source.Usage.CompletionDetails.ReasoningTokens > 0 {
+		target.Usage.OutputTokensDetails = &messagesOutputTokensDetails{ThinkingTokens: source.Usage.CompletionDetails.ReasoningTokens}
+	}
 	body, err := marshal(ProtocolMessages, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
 }
@@ -351,12 +498,18 @@ func validateChatToMessagesRequest(input []byte, policy lossPolicy) ([]Diagnosti
 	if err := decodeJSON(ProtocolChat, input, &source); err != nil {
 		return nil, err
 	}
-	var diagnostics []Diagnostic
+	diagnostics, err := validateChatStreamOptionsForMessages(input, source.Stream, policy)
+	if err != nil {
+		return nil, err
+	}
 	sawConversation := false
 	for messageIndex, message := range source.Messages {
 		path := fmt.Sprintf("$.messages[%d]", messageIndex)
 		if rawJSONValuePresent(message.Audio) {
 			return nil, unsupported(ProtocolChat, path+".audio", "Chat assistant audio cannot be represented by Messages input")
+		}
+		if chatAnnotationsPresent(message.Annotations) {
+			return nil, unsupported(ProtocolChat, path+".annotations", "Chat URL citations cannot be represented as Messages input")
 		}
 		if message.Role == "system" || message.Role == "developer" {
 			if sawConversation {

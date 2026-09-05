@@ -304,12 +304,13 @@ func (a *Service) streamResponse(ctx context.Context, cancel context.CancelFunc,
 	}
 	response.Body = transportx.NewManagedBodyWithPeer(reader, upstream.Body, cancel)
 
-	go a.runStream(ctx, writer, upstream, ingress, clientModel, options.Exchange.RequestID, target, decoder, converter, response)
+	go a.runStream(ctx, writer, upstream, ingress, clientModel, options.Exchange.RequestID, source, target, decoder, converter, response)
 	return response, nil
 }
 
-func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream *http.Response, ingress core.Protocol, clientModel, requestID string, target core.Codec, decoder core.StreamDecoder, converter core.ResponseStream, response *Response) {
+func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream *http.Response, ingress core.Protocol, clientModel, requestID string, source, target core.Codec, decoder core.StreamDecoder, converter core.ResponseStream, response *Response) {
 	defer upstream.Body.Close()
+	sourceValidator := nativeStreamValidator{protocol: a.upstream, wire: source}
 	encoder, err := target.NewStreamEncoder(writer, core.StreamOptions{MaxFrameBytes: int(a.maxBodyBytes)})
 	if err != nil {
 		writer.CloseWithError(err)
@@ -363,6 +364,10 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 			fail("stream_decode_error", classifyStreamUpstreamError(readErr))
 			return
 		}
+		if err := sourceValidator.validate(ctx, frame); err != nil {
+			fail("stream_validation_error", classifyStreamUpstreamError(err))
+			return
+		}
 		frames, diagnostics, convertErr := converter.Convert(ctx, frame)
 		response.Meta.diagnostics.add(diagnostics...)
 		if convertErr != nil {
@@ -373,6 +378,10 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 			fail("stream_write_error", err)
 			return
 		}
+	}
+	if err := sourceValidator.finalize(); err != nil {
+		fail("stream_validation_error", classifyStreamUpstreamError(err))
+		return
 	}
 	frames, diagnostics, err := converter.Finalize(ctx)
 	response.Meta.diagnostics.add(diagnostics...)

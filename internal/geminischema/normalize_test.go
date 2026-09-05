@@ -156,3 +156,45 @@ func TestNormalizeParametersOmitsEmptySchemas(t *testing.T) {
 		t.Fatalf("NormalizeParameters() = %s", got)
 	}
 }
+
+func TestPreserveParametersJSONSchema(t *testing.T) {
+	raw := json.RawMessage(`{
+		"type":"object",
+		"$defs":{"coordinate":{"type":"number"}},
+		"properties":{"latitude":{"$ref":"#/$defs/coordinate"}},
+		"additionalProperties":false
+	}`)
+	got, err := PreserveParametersJSONSchema(raw, Limits{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"$defs"`, `"$ref"`, `"additionalProperties":false`, `"type":"object"`} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("PreserveParametersJSONSchema() lost %s: %s", want, got)
+		}
+	}
+}
+
+func TestPreserveParametersJSONSchemaValidatesEnvelope(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "non object document", raw: `[]`},
+		{name: "non object type", raw: `{"type":"string"}`},
+		{name: "non object properties", raw: `{"type":"object","properties":[]}`},
+		{name: "trailing document", raw: `{} {}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := PreserveParametersJSONSchema(json.RawMessage(test.raw), Limits{}); !errors.Is(err, ErrInvalidSchema) {
+				t.Fatalf("error = %v, want ErrInvalidSchema", err)
+			}
+		})
+	}
+	for _, raw := range []string{"", "null", `{}`, `{"type":"object"}`, `{"type":"object","properties":{}}`} {
+		got, err := PreserveParametersJSONSchema(json.RawMessage(raw), Limits{})
+		if err != nil || got != nil {
+			t.Fatalf("PreserveParametersJSONSchema(%q) = %s, %v; want nil, nil", raw, got, err)
+		}
+	}
+}

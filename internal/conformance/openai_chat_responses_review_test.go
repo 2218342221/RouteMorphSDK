@@ -16,7 +16,7 @@ func TestChatToResponsesPreservesCompatibleRequestFieldsAndParameterlessTools(t 
 	body := []byte(`{
 		"model":"public","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"ping","arguments":""}}]},{"role":"tool","tool_call_id":"call_1","content":"pong"}],
 		"tools":[{"type":"function","function":{"name":"ping","parameters":{}}}],"n":1,"stream":true,"stream_options":{"include_usage":true},
-		"frequency_penalty":0.2,"presence_penalty":0.3,"verbosity":"low","user":"u1","service_tier":"flex","store":false,
+		"verbosity":"low","user":"u1","service_tier":"flex","store":false,
 		"prompt_cache_key":"cache","prompt_cache_retention":"24h","safety_identifier":"safe"
 	}`)
 	execution, err := harness.ToUpstreamRequest(context.Background(), ProtocolChat, ProtocolResponses, body, conversionOptions{})
@@ -27,7 +27,7 @@ func TestChatToResponsesPreservesCompatibleRequestFieldsAndParameterlessTools(t 
 	if err := json.Unmarshal(execution.Result.Body, &got); err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{"frequency_penalty", "presence_penalty", "user", "service_tier", "store", "prompt_cache_key", "prompt_cache_retention", "safety_identifier"} {
+	for _, field := range []string{"user", "service_tier", "store", "prompt_cache_key", "prompt_cache_retention", "safety_identifier"} {
 		if _, ok := got[field]; !ok {
 			t.Errorf("missing converted field %q in %s", field, execution.Result.Body)
 		}
@@ -43,6 +43,24 @@ func TestChatToResponsesPreservesCompatibleRequestFieldsAndParameterlessTools(t 
 	}
 	if !strings.Contains(string(execution.Result.Body), `"strict":false`) {
 		t.Fatalf("omitted Chat strict must be made explicit for Responses: %s", execution.Result.Body)
+	}
+}
+
+func TestChatResponsesRejectUnsupportedPenaltyParameters(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	for _, test := range []struct {
+		from Protocol
+		to   Protocol
+		body string
+	}{
+		{ProtocolChat, ProtocolResponses, `{"model":"m","messages":[{"role":"user","content":"hi"}],"frequency_penalty":0.2}`},
+		{ProtocolChat, ProtocolResponses, `{"model":"m","messages":[{"role":"user","content":"hi"}],"presence_penalty":0.2}`},
+		{ProtocolResponses, ProtocolChat, `{"model":"m","input":"hi","frequency_penalty":0.2}`},
+		{ProtocolResponses, ProtocolChat, `{"model":"m","input":"hi","presence_penalty":0.2}`},
+	} {
+		if _, err := harness.ToUpstreamRequest(context.Background(), test.from, test.to, []byte(test.body), conversionOptions{}); !errors.Is(err, ErrUnsupported) {
+			t.Errorf("%s -> %s body=%s error=%v, want ErrUnsupported", test.from, test.to, test.body, err)
+		}
 	}
 }
 
@@ -107,12 +125,108 @@ func TestResponsesToChatRejectsUnrepresentableReasoningAndInclude(t *testing.T) 
 		`{"model":"x","input":"hi","reasoning":{"effort":"high","summary":"detailed"}}`,
 		`{"model":"x","input":"hi","reasoning":{"mode":"trace"}}`,
 		`{"model":"x","input":"hi","include":["reasoning.encrypted_content"]}`,
-		`{"model":"x","input":"hi","stream_options":{"include_obfuscation":true}}`,
 	} {
 		_, err := harness.ToUpstreamRequest(context.Background(), ProtocolResponses, ProtocolChat, []byte(body), conversionOptions{})
 		if !errors.Is(err, ErrUnsupported) {
 			t.Errorf("body=%s error=%v, want ErrUnsupported", body, err)
 		}
+	}
+}
+
+func TestResponsesDiscoveryAndConfigurationItemsRequireNativeRouting(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	items := []struct {
+		name string
+		item string
+	}{
+		{
+			name: "configuration update",
+			item: `{"type":"configuration_update","id":"cfg_1","reasoning":{"effort":"high"}}`,
+		},
+		{
+			name: "additional tools",
+			item: `{"type":"additional_tools","id":"tools_1","role":"developer","tools":[]}`,
+		},
+		{
+			name: "tool search output",
+			item: `{"type":"tool_search_output","id":"tso_1","call_id":"call_search","execution":"server","status":"completed","tools":[]}`,
+		},
+	}
+	for _, item := range items {
+		for _, target := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolGenerateContent} {
+			t.Run(item.name+"_request_to_"+string(target), func(t *testing.T) {
+				body := []byte(`{"model":"m","input":[` + item.item + `]}`)
+				_, err := harness.ToUpstreamRequest(context.Background(), ProtocolResponses, target, body, conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "provider"}})
+				if !errors.Is(err, ErrUnsupported) {
+					t.Fatalf("error=%v, want ErrUnsupported", err)
+				}
+			})
+			t.Run(item.name+"_response_to_"+string(target), func(t *testing.T) {
+				plan, err := harness.catalog().Plan(target, ProtocolResponses)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[` + item.item + `],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+				_, err = harness.ToClientResponse(context.Background(), plan, body, conversionOptions{Exchange: exchangeMetadata{ClientModel: "client"}})
+				if !errors.Is(err, ErrUnsupported) {
+					t.Fatalf("error=%v, want ErrUnsupported", err)
+				}
+			})
+		}
+	}
+}
+
+func TestResponsesToolHistoryRequiresArgumentsAndOutput(t *testing.T) {
+	harness, err := newTestRouterHarness()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestCases := []struct {
+		name   string
+		target Protocol
+		item   string
+	}{
+		{name: "function arguments to Chat", target: ProtocolChat, item: `{"type":"function_call","call_id":"call_1","name":"lookup"}`},
+		{name: "function output to Chat", target: ProtocolChat, item: `{"type":"function_call_output","call_id":"call_1"}`},
+		{name: "custom output to Chat", target: ProtocolChat, item: `{"type":"custom_tool_call_output","call_id":"call_1"}`},
+		{name: "function arguments to Messages", target: ProtocolMessages, item: `{"type":"function_call","call_id":"call_1","name":"lookup"}`},
+		{name: "function output to Messages", target: ProtocolMessages, item: `{"type":"function_call_output","call_id":"call_1"}`},
+		{name: "function arguments to Gemini", target: ProtocolGenerateContent, item: `{"type":"function_call","call_id":"call_1","name":"lookup"}`},
+		{name: "function output to Gemini", target: ProtocolGenerateContent, item: `{"type":"function_call_output","call_id":"call_1"}`},
+	}
+	for _, test := range requestCases {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"model":"gpt","input":[` + test.item + `]}`)
+			_, err := harness.ToUpstreamRequest(context.Background(), ProtocolResponses, test.target, body, conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "provider"}})
+			if !errors.Is(err, ErrInvalidPayload) {
+				t.Fatalf("error = %v, want ErrInvalidPayload", err)
+			}
+		})
+	}
+
+	terminal := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"gpt","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	for _, source := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolGenerateContent} {
+		t.Run("malformed provider output to "+string(source), func(t *testing.T) {
+			plan, err := harness.catalog().Plan(source, ProtocolResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = harness.ToClientResponse(context.Background(), plan, terminal, conversionOptions{Exchange: exchangeMetadata{ClientModel: "client"}})
+			if !errors.Is(err, ErrUpstreamResponse) {
+				t.Fatalf("error = %v, want ErrUpstreamResponse", err)
+			}
+		})
+	}
+}
+
+func TestResponsesToChatPreservesIncludeObfuscation(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	execution, err := harness.ToUpstreamRequest(context.Background(), ProtocolResponses, ProtocolChat, []byte(`{"model":"x","input":"hi","stream":true,"stream_options":{"include_obfuscation":false}}`), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(execution.Result.Body), `"stream_options":{"include_usage":true,"include_obfuscation":false}`) {
+		t.Fatalf("include_obfuscation not preserved: %s", execution.Result.Body)
 	}
 }
 

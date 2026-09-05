@@ -5,28 +5,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/2218342221/RouteMorphSDK/internal/openaicompat"
 )
 
 type responsesToChatStreamConverter struct {
-	id             string
-	model          string
-	providerID     string
-	providerModel  string
-	created        int64
-	toolIndexes    map[string]int
-	toolArguments  map[int]string
-	nextTool       int
-	completed      bool
-	finalized      bool
-	clientModel    string
-	includeUsage   bool
-	started        bool
-	text           string
-	refusal        string
-	reasoning      string
-	logprobs       []json.RawMessage
-	items          map[string]responsesItem
-	completedItems map[string]bool
+	id                string
+	model             string
+	providerID        string
+	providerModel     string
+	created           int64
+	toolIndexes       map[string]int
+	toolArguments     map[int]string
+	nextTool          int
+	completed         bool
+	finalized         bool
+	clientModel       string
+	includeUsage      bool
+	lossPolicy        lossPolicy
+	started           bool
+	text              string
+	refusal           string
+	reasoning         string
+	logprobs          []json.RawMessage
+	items             map[string]responsesItem
+	completedItems    map[string]bool
+	serviceTier       json.RawMessage
+	moderation        json.RawMessage
+	reportedMetadata  bool
+	reportedCache     bool
+	reportedWebSearch bool
+	sawObfuscation    bool
 }
 
 func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame streamFrame) ([]streamFrame, []Diagnostic, error) {
@@ -53,6 +62,7 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		Part         json.RawMessage `json:"part"`
 		Arguments    string          `json:"arguments"`
 		Response     json.RawMessage `json:"response"`
+		Obfuscation  string          `json:"obfuscation"`
 	}
 	if err := json.Unmarshal(frame.Data, &event); err != nil {
 		return nil, nil, invalid(ProtocolResponses, "$", "invalid stream event: %v", err)
@@ -63,17 +73,24 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 	if frame.Event != "" && frame.Event != event.Type {
 		return nil, nil, invalid(ProtocolResponses, "$.type", "SSE event %q does not match payload type %q", frame.Event, event.Type)
 	}
+	if event.Obfuscation != "" {
+		c.sawObfuscation = true
+	}
 	switch event.Type {
 	case "response.created":
 		var response responsesResponse
 		if err := json.Unmarshal(event.Response, &response); err != nil {
 			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid response.created object")
 		}
-		if err := c.setBase(response, "$.response"); err != nil {
+		if err := rejectUnrepresentableResponsesUsage(event.Response, "$.response"); err != nil {
+			return nil, nil, err
+		}
+		diagnostics, err := c.setBase(response, "$.response")
+		if err != nil {
 			return nil, nil, err
 		}
 		c.started = true
-		return []streamFrame{{Data: c.chatChunk(map[string]any{"role": "assistant"}, nil, nil)}}, nil, nil
+		return []streamFrame{{Data: c.chatChunk(map[string]any{"role": "assistant"}, nil, nil)}}, diagnostics, nil
 	case "response.output_text.delta":
 		if err := c.validateKnownItem(event.ItemID, "message"); err != nil {
 			return nil, nil, err
@@ -115,6 +132,19 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		if event.Item.Type == "reasoning" || event.Item.Type == "message" {
 			return nil, phaseDiagnostics, nil
 		}
+		if event.Item.Type == "web_search_call" {
+			if !c.reportedWebSearch {
+				c.reportedWebSearch = true
+				phaseDiagnostics = appendDiagnostic(phaseDiagnostics, "warning", "responses_web_search_call_not_representable", "$.item", "Chat preserves cited answer text but has no web-search lifecycle item")
+			}
+			return nil, phaseDiagnostics, nil
+		}
+		if event.Item.Type == "custom_tool_call" {
+			return nil, nil, unsupported(ProtocolResponses, "$.item.type", "custom tool calls have no official Chat streaming delta representation")
+		}
+		if event.Item.Type != "function_call" {
+			return nil, nil, unsupported(ProtocolResponses, "$.item.type", "output item %q cannot be represented by Chat", event.Item.Type)
+		}
 		if event.Item.CallID == "" || event.Item.Name == "" {
 			return nil, nil, upstreamResponseError(ProtocolResponses, "$.item", "function_call item is missing call_id or name")
 		}
@@ -144,6 +174,13 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		delta := map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": event.Delta}}}}
 		c.toolArguments[index] += event.Delta
 		return c.withStart([]streamFrame{{Data: c.chatChunk(delta, nil, nil)}}), nil, nil
+	case "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+		return nil, nil, unsupported(ProtocolResponses, "$.type", "custom tool calls have no official Chat streaming delta representation")
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		if err := c.validateKnownItem(event.ItemID, "web_search_call"); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, nil
 	case "response.content_part.added", "response.content_part.done":
 		if err := c.validateContentPartEvent(event.ItemID, event.Part); err != nil {
 			return nil, nil, err
@@ -184,18 +221,29 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		if err := json.Unmarshal(event.Response, &response); err != nil {
 			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid terminal response object")
 		}
+		if err := rejectUnrepresentableResponsesUsage(event.Response, "$.response"); err != nil {
+			return nil, nil, err
+		}
 		if err := validateResponsesTerminal(response); err != nil {
 			return nil, nil, err
 		}
 		if (event.Type == "response.completed") != (response.Status == "completed") || (event.Type == "response.incomplete") != (response.Status == "incomplete") {
 			return nil, nil, invalid(ProtocolResponses, "$.response.status", "terminal event %q does not match status %q", event.Type, response.Status)
 		}
-		if err := c.setBase(response, "$.response"); err != nil {
+		diagnostics, err := c.setBase(response, "$.response")
+		if err != nil {
 			return nil, nil, err
 		}
+		if err := openaicompat.ValidateCompleteModeration(c.moderation, ProtocolResponses, "$.response.moderation", true); err != nil {
+			return nil, nil, err
+		}
+		hadWebSearchDiagnostic := c.reportedWebSearch
 		fallback, err := c.terminalOutputChunks(response)
 		if err != nil {
 			return nil, nil, err
+		}
+		if !hadWebSearchDiagnostic && c.reportedWebSearch {
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_web_search_call_not_representable", "$.response.output", "Chat preserves cited answer text but has no web-search lifecycle item")
 		}
 		finish := finishStop
 		for _, item := range response.Output {
@@ -220,7 +268,7 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 			fallback = append(fallback, streamFrame{Data: c.chatUsageChunk(usage)})
 		}
 		fallback = append(fallback, streamFrame{Data: []byte("[DONE]"), Done: true})
-		return fallback, nil, nil
+		return fallback, diagnostics, nil
 	case "error":
 		var streamError struct {
 			Message string          `json:"message"`
@@ -284,6 +332,9 @@ func (c *responsesToChatStreamConverter) validateOutputItemDone(itemID string, i
 	if err := validateResponsesItems([]responsesItem{item}, "$.output"); err != nil {
 		return err
 	}
+	if (item.Type == "function_call" || item.Type == "custom_tool_call") && item.Status != "completed" {
+		return invalid(ProtocolResponses, "$.item.status", "completed tool-call item must have status completed")
+	}
 	if item.Type == "function_call" {
 		if !jsonValuePresent(item.Arguments) {
 			return invalid(ProtocolResponses, "$.item.arguments", "completed function_call arguments are required")
@@ -314,6 +365,8 @@ func (c *responsesToChatStreamConverter) validateOutputItemDone(itemID string, i
 
 func (c *responsesToChatStreamConverter) terminalOutputChunks(response responsesResponse) ([]streamFrame, error) {
 	var frames []streamFrame
+	sawWebSearch := false
+	sawPortableOutput := false
 	remainingText, remainingRefusal, remainingReasoning := c.text, c.refusal, c.reasoning
 	var terminalLogprobs []json.RawMessage
 	terminalItems := make(map[string]responsesItem, len(response.Output))
@@ -344,6 +397,7 @@ func (c *responsesToChatStreamConverter) terminalOutputChunks(response responses
 		}
 		switch item.Type {
 		case "message":
+			sawPortableOutput = true
 			parts, logprobs, err := responsesContentAndLogprobs(item.Content, path+".content")
 			if err != nil {
 				return nil, err
@@ -361,6 +415,7 @@ func (c *responsesToChatStreamConverter) terminalOutputChunks(response responses
 				}
 			}
 		case "reasoning":
+			sawPortableOutput = true
 			parts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
 			if err != nil {
 				return nil, err
@@ -376,6 +431,7 @@ func (c *responsesToChatStreamConverter) terminalOutputChunks(response responses
 				return nil, err
 			}
 		case "function_call":
+			sawPortableOutput = true
 			key := item.ID
 			index, ok := c.toolIndexes[key]
 			if !ok {
@@ -403,9 +459,17 @@ func (c *responsesToChatStreamConverter) terminalOutputChunks(response responses
 				frames = append(frames, streamFrame{Data: c.chatChunk(map[string]any{"tool_calls": []any{map[string]any{"index": index, "function": map[string]any{"arguments": suffix}}}}, nil, nil)})
 				c.toolArguments[index] += suffix
 			}
+		case "web_search_call":
+			sawWebSearch = true
+			c.reportedWebSearch = true
+		case "custom_tool_call":
+			return nil, unsupported(ProtocolResponses, path+".type", "custom tool calls have no official Chat streaming delta representation")
 		default:
 			return nil, unsupported(ProtocolResponses, path+".type", "output item %q cannot be represented by Chat", item.Type)
 		}
+	}
+	if sawWebSearch && !sawPortableOutput {
+		return nil, unsupported(ProtocolResponses, "$.response.output", "a web_search_call without a portable answer item cannot be represented by Chat")
 	}
 	for itemID, streamed := range c.items {
 		terminal, exists := terminalItems[itemID]
@@ -469,20 +533,24 @@ func (c *responsesToChatStreamConverter) Finalize(context.Context) ([]streamFram
 	if !c.completed {
 		return nil, nil, invalid(ProtocolResponses, "$", "stream ended before a terminal response event")
 	}
+	if c.sawObfuscation {
+		return nil, []Diagnostic{{Severity: "warning", Code: "responses_stream_obfuscation_not_representable", Path: "$.obfuscation", Message: "Responses event padding cannot be preserved across generated Chat chunks"}}, nil
+	}
 	return nil, nil, nil
 }
 
-func (c *responsesToChatStreamConverter) setBase(response responsesResponse, path string) error {
+func (c *responsesToChatStreamConverter) setBase(response responsesResponse, path string) ([]Diagnostic, error) {
+	var diagnostics []Diagnostic
 	if response.ID != "" {
 		if c.providerID != "" && c.providerID != response.ID {
-			return invalid(ProtocolResponses, path+".id", "response id changed from %q to %q", c.providerID, response.ID)
+			return nil, invalid(ProtocolResponses, path+".id", "response id changed from %q to %q", c.providerID, response.ID)
 		}
 		c.providerID = response.ID
 		c.id = c.providerID
 	}
 	if response.Model != "" {
 		if c.providerModel != "" && c.providerModel != response.Model {
-			return invalid(ProtocolResponses, path+".model", "response model changed from %q to %q", c.providerModel, response.Model)
+			return nil, invalid(ProtocolResponses, path+".model", "response model changed from %q to %q", c.providerModel, response.Model)
 		}
 		c.providerModel = response.Model
 	}
@@ -494,7 +562,37 @@ func (c *responsesToChatStreamConverter) setBase(response responsesResponse, pat
 	} else if c.providerModel != "" {
 		c.model = c.providerModel
 	}
-	return nil
+	if rawJSONValuePresent(response.ServiceTier) {
+		if err := openaicompat.ValidateResponsesServiceTierForChat(response.ServiceTier, path+".service_tier", true); err != nil {
+			return nil, err
+		}
+		if rawJSONValuePresent(c.serviceTier) && !jsonObjectsEqual(c.serviceTier, response.ServiceTier) {
+			return nil, invalid(ProtocolResponses, path+".service_tier", "changed during stream")
+		}
+		c.serviceTier = append(json.RawMessage(nil), response.ServiceTier...)
+	}
+	if rawJSONValuePresent(response.Moderation) {
+		converted, err := openaicompat.ResponsesModerationToChat(response.Moderation, path+".moderation", true)
+		if err != nil {
+			return nil, err
+		}
+		c.moderation, err = openaicompat.MergeModeration(c.moderation, converted, ProtocolResponses, path+".moderation", true)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(response.Metadata) > 0 && !c.reportedMetadata {
+		c.reportedMetadata = true
+		diagnostics = appendDiagnostic(diagnostics, "warning", "responses_metadata_not_representable_in_chat_stream", path+".metadata", "Chat completion chunks have no metadata field")
+	}
+	if nonNullJSON(response.PromptCacheOptions) && !c.reportedCache {
+		if c.lossPolicy == rejectSemanticLoss {
+			return nil, unsupported(ProtocolResponses, path+".prompt_cache_options", "Chat response chunks have no prompt cache options field")
+		}
+		c.reportedCache = true
+		diagnostics = appendDiagnostic(diagnostics, "warning", "responses_prompt_cache_options_not_representable", path+".prompt_cache_options", "Responses prompt cache options were omitted from the Chat stream")
+	}
+	return diagnostics, nil
 }
 
 func (c *responsesToChatStreamConverter) chatChunk(delta map[string]any, finish any, usage any) []byte {
@@ -510,6 +608,12 @@ func (c *responsesToChatStreamConverter) chatChunkWithLogprobs(delta map[string]
 		"id": c.id, "object": "chat.completion.chunk", "created": c.created, "model": c.model,
 		"choices": []any{choice},
 	}
+	if rawJSONValuePresent(c.serviceTier) {
+		chunk["service_tier"] = json.RawMessage(c.serviceTier)
+	}
+	if rawJSONValuePresent(c.moderation) {
+		chunk["moderation"] = json.RawMessage(c.moderation)
+	}
 	if usage != nil {
 		chunk["usage"] = usage
 	} else if c.includeUsage {
@@ -519,8 +623,15 @@ func (c *responsesToChatStreamConverter) chatChunkWithLogprobs(delta map[string]
 }
 
 func (c *responsesToChatStreamConverter) chatUsageChunk(usage any) []byte {
-	return mustJSON(map[string]any{
+	chunk := map[string]any{
 		"id": c.id, "object": "chat.completion.chunk", "created": c.created, "model": c.model,
 		"choices": []any{}, "usage": usage,
-	})
+	}
+	if rawJSONValuePresent(c.serviceTier) {
+		chunk["service_tier"] = json.RawMessage(c.serviceTier)
+	}
+	if rawJSONValuePresent(c.moderation) {
+		chunk["moderation"] = json.RawMessage(c.moderation)
+	}
+	return mustJSON(chunk)
 }

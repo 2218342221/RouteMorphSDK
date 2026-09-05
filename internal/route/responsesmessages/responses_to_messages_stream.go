@@ -25,6 +25,7 @@ type responsesToMessagesStreamConverter struct {
 	identityKnown  bool
 	completed      bool
 	finalized      bool
+	reportedLosses map[string]bool
 }
 
 type streamToolIdentity struct {
@@ -77,6 +78,10 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if response.Status != "in_progress" && response.Status != "queued" {
 			return nil, nil, invalid(ProtocolResponses, "$.response.status", "unexpected created status %q", response.Status)
 		}
+		diagnostics, err := c.responseExtensionDiagnostics(response, "$.response")
+		if err != nil {
+			return nil, nil, err
+		}
 		c.id, c.providerModel = response.ID, response.Model
 		c.model = c.providerModel
 		c.started = true
@@ -84,11 +89,16 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if c.clientModel != "" {
 			c.model = c.clientModel
 		}
-		if response.Usage.InputTokens < response.Usage.InputTokenDetails.CachedTokens {
-			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.input_tokens_details.cached_tokens", "cached tokens exceed input tokens")
+		cachedTokens := response.Usage.InputTokenDetails.CachedTokens
+		cacheWriteTokens := response.Usage.InputTokenDetails.CacheWriteTokens
+		if cachedTokens > response.Usage.InputTokens || cacheWriteTokens > response.Usage.InputTokens-cachedTokens {
+			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.input_tokens_details", "cached and cache-write tokens exceed input tokens")
 		}
-		message := map[string]any{"id": c.id, "type": "message", "role": "assistant", "model": c.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": response.Usage.InputTokens - response.Usage.InputTokenDetails.CachedTokens, "output_tokens": 0, "cache_read_input_tokens": response.Usage.InputTokenDetails.CachedTokens}}
-		var diagnostics []Diagnostic
+		accountedCacheTokens := cachedTokens + cacheWriteTokens
+		if response.Usage.OutputTokenDetails.ReasoningTokens < 0 || response.Usage.OutputTokenDetails.ReasoningTokens > response.Usage.OutputTokens {
+			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.output_tokens_details.reasoning_tokens", "must be between zero and output_tokens")
+		}
+		message := map[string]any{"id": c.id, "type": "message", "role": "assistant", "model": c.model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": response.Usage.InputTokens - accountedCacheTokens, "output_tokens": 0, "cache_read_input_tokens": response.Usage.InputTokenDetails.CachedTokens, "cache_creation_input_tokens": response.Usage.InputTokenDetails.CacheWriteTokens}}
 		if response.Usage.InputTokens == 0 {
 			diagnostics = appendDiagnostic(diagnostics, "warning", "stream_input_usage_deferred", "$.response.usage", "Responses does not provide final input usage in response.created; cumulative usage is emitted in message_delta")
 		}
@@ -241,6 +251,9 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if err := validateResponsesItems([]responsesItem{event.Item}, "$.output"); err != nil {
 			return nil, nil, err
 		}
+		if event.Item.Type == "function_call" && event.Item.Status != "completed" {
+			return nil, nil, invalid(ProtocolResponses, "$.item.status", "completed function_call item must have status completed")
+		}
 		if known && event.Item.Type != knownType {
 			return nil, nil, invalid(ProtocolResponses, "$.item.type", "output item identity changed from type %q to %q", knownType, event.Item.Type)
 		}
@@ -306,8 +319,18 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if err := validateResponsesTerminal(response); err != nil {
 			return nil, nil, err
 		}
-		if response.Usage.InputTokens < response.Usage.InputTokenDetails.CachedTokens {
-			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.input_tokens_details.cached_tokens", "cached tokens exceed input tokens")
+		diagnostics, err := c.responseExtensionDiagnostics(response, "$.response")
+		if err != nil {
+			return nil, nil, err
+		}
+		cachedTokens := response.Usage.InputTokenDetails.CachedTokens
+		cacheWriteTokens := response.Usage.InputTokenDetails.CacheWriteTokens
+		if cachedTokens > response.Usage.InputTokens || cacheWriteTokens > response.Usage.InputTokens-cachedTokens {
+			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.input_tokens_details", "cached and cache-write tokens exceed input tokens")
+		}
+		accountedCacheTokens := cachedTokens + cacheWriteTokens
+		if response.Usage.OutputTokenDetails.ReasoningTokens < 0 || response.Usage.OutputTokenDetails.ReasoningTokens > response.Usage.OutputTokens {
+			return nil, nil, upstreamResponseError(ProtocolResponses, "$.response.usage.output_tokens_details.reasoning_tokens", "must be between zero and output_tokens")
 		}
 		if c.identityKnown && response.ID != c.id {
 			return nil, nil, invalid(ProtocolResponses, "$.response.id", "terminal response id %q does not match %q", response.ID, c.id)
@@ -326,13 +349,6 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 			if item.Type == "message" && item.Role != "assistant" {
 				return nil, nil, upstreamResponseError(ProtocolResponses, path+".role", "output message role must be assistant")
 			}
-		}
-		var diagnostics []Diagnostic
-		if response.Usage.OutputTokenDetails.ReasoningTokens > 0 {
-			if c.LossPolicy == rejectSemanticLoss {
-				return nil, nil, unsupported(ProtocolResponses, "$.response.usage.output_tokens_details.reasoning_tokens", "Messages usage has no reasoning-token field")
-			}
-			diagnostics = appendDiagnostic(diagnostics, "warning", "reasoning_usage_not_representable", "$.response.usage.output_tokens_details.reasoning_tokens", "reasoning-token usage was omitted")
 		}
 		frames, fallbackDiagnostics, err := c.terminalOutputFrames(response)
 		if err != nil {
@@ -357,8 +373,12 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 				stop = "refusal"
 			}
 		}
+		usage := map[string]any{"input_tokens": response.Usage.InputTokens - accountedCacheTokens, "output_tokens": response.Usage.OutputTokens, "cache_read_input_tokens": response.Usage.InputTokenDetails.CachedTokens, "cache_creation_input_tokens": response.Usage.InputTokenDetails.CacheWriteTokens}
+		if response.Usage.OutputTokenDetails.ReasoningTokens > 0 {
+			usage["output_tokens_details"] = map[string]any{"thinking_tokens": response.Usage.OutputTokenDetails.ReasoningTokens}
+		}
 		frames = append(frames,
-			streamFrame{Event: "message_delta", Data: mustJSON(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": map[string]any{"input_tokens": response.Usage.InputTokens - response.Usage.InputTokenDetails.CachedTokens, "output_tokens": response.Usage.OutputTokens, "cache_read_input_tokens": response.Usage.InputTokenDetails.CachedTokens, "cache_creation_input_tokens": 0}})},
+			streamFrame{Event: "message_delta", Data: mustJSON(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": stop, "stop_sequence": nil}, "usage": usage})},
 			streamFrame{Event: "message_stop", Data: mustJSON(map[string]any{"type": "message_stop"})},
 		)
 		c.completed = true

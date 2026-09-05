@@ -40,11 +40,27 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 	} else {
 		diagnostics = appendDiagnostic(diagnostics, "warning", "default_max_tokens", "$.max_tokens", "Messages requires max_tokens; RouteMorph used 4096")
 	}
-	target := messagesRequest{Model: source.Model, MaxTokens: maxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange), Metadata: source.Metadata}
+	target := messagesRequest{Model: source.Model, MaxTokens: maxTokens, Temperature: source.Temperature, TopP: source.TopP, Stream: resolveExchangeStream(source.Stream, options.Exchange)}
+	if rawJSONValuePresent(source.ServiceTier) {
+		return conversionResult{}, unsupported(ProtocolResponses, "$.service_tier", "service tier controls are not semantically portable to Messages")
+	}
+	if len(source.Metadata) > 0 {
+		return conversionResult{}, unsupported(ProtocolResponses, "$.metadata", "OpenAI metadata is storage/query metadata, not Anthropic user attribution")
+	}
+	safetyID, err := decodeOpenAISafetyIdentifier(source.SafetyIdentifier, "$.safety_identifier")
+	if err != nil {
+		return conversionResult{}, err
+	}
+	if safetyID != "" {
+		target.Metadata = map[string]string{"user_id": safetyID}
+	}
 	if options.Exchange.UpstreamModel != "" {
 		target.Model = options.Exchange.UpstreamModel
 	}
 	if source.Reasoning != nil {
+		if err := validateOpenAIReasoningEffortForMessages(ProtocolResponses, "$.reasoning.effort", source.Reasoning.Effort); err != nil {
+			return conversionResult{}, err
+		}
 		if options.LossPolicy == rejectSemanticLoss {
 			return conversionResult{}, unsupported(ProtocolResponses, "$.reasoning", "Responses reasoning is not semantically equivalent to Messages thinking")
 		}
@@ -103,7 +119,7 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 		if err != nil {
 			return conversionResult{}, err
 		}
-		target.Tools = append(target.Tools, messagesTool{Name: tool.Name, Description: tool.Description, InputSchema: schema, Strict: tool.Strict})
+		target.Tools = append(target.Tools, messagesTool{Name: tool.Name, Description: tool.Description, InputSchema: schema, Strict: tool.Strict, AllowedCallers: append([]string(nil), tool.AllowedCallers...)})
 	}
 	if len(source.Instructions) > 0 && string(source.Instructions) != "null" {
 		if source.Instructions[0] != '"' {
@@ -119,6 +135,9 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 		return conversionResult{}, invalid(ProtocolResponses, "$.input", "at least one input item is required for Messages")
 	}
 	seenConversationTurn := false
+	callIDsByName := make(map[string][]string)
+	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
 	for index, item := range items {
 		path := fmt.Sprintf("$.input[%d]", index)
 		var message messagesMessage
@@ -127,6 +146,13 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 			parts, err := decodeResponsesContentRaw(item.Content, path+".content", true)
 			if err != nil {
 				return conversionResult{}, err
+			}
+			if item.Role == "system" || item.Role == "developer" {
+				for partIndex, part := range parts {
+					if part.Kind != partText {
+						return conversionResult{}, unsupported(ProtocolResponses, fmt.Sprintf("%s.content[%d]", path, partIndex), "Messages system instructions support text only")
+					}
+				}
 			}
 			blocks, err := encodeMessagesContent(parts)
 			if err != nil {
@@ -153,14 +179,40 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 			if err != nil {
 				return conversionResult{}, err
 			}
-			message = messagesMessage{Role: "assistant", Content: mustJSON([]messagesBlock{{Type: "tool_use", ID: item.CallID, Name: item.Name, Input: arguments}})}
+			if _, duplicate := callNames[item.CallID]; duplicate {
+				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "duplicate call_id %q", item.CallID)
+			}
+			callNames[item.CallID] = item.Name
+			callIDsByName[item.Name] = append(callIDsByName[item.Name], item.CallID)
+			message = messagesMessage{Role: "assistant", Content: mustJSON([]messagesBlock{{Type: "tool_use", ID: item.CallID, Name: item.Name, Input: arguments, Caller: append(json.RawMessage(nil), item.Caller...)}})}
 		case "function_call_output":
 			seenConversationTurn = true
+			callID := item.CallID
+			if callID == "" && item.Name != "" {
+				for _, candidate := range callIDsByName[item.Name] {
+					if !consumedCallIDs[candidate] {
+						if callID != "" {
+							return conversionResult{}, unsupported(ProtocolResponses, path+".name", "multiple pending calls named %q make the output ambiguous without call_id", item.Name)
+						}
+						callID = candidate
+					}
+				}
+			}
+			if callID == "" || callNames[callID] == "" {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".call_id", "tool output cannot be correlated with an earlier function call")
+			}
+			if item.Name != "" && item.Name != callNames[callID] {
+				return conversionResult{}, invalid(ProtocolResponses, path+".name", "function output name %q does not match call name %q", item.Name, callNames[callID])
+			}
+			if consumedCallIDs[callID] {
+				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "function call %q already has an output", callID)
+			}
+			consumedCallIDs[callID] = true
 			content, err := responsesToolOutputToMessages(item.Output, path+".output")
 			if err != nil {
 				return conversionResult{}, err
 			}
-			message = messagesMessage{Role: "user", Content: mustJSON([]messagesBlock{{Type: "tool_result", ToolUseID: item.CallID, Content: content}})}
+			message = messagesMessage{Role: "user", Content: mustJSON([]messagesBlock{{Type: "tool_result", ToolUseID: callID, Content: content}})}
 		case "reasoning":
 			return conversionResult{}, unsupported(ProtocolResponses, path, "reasoning items cannot be injected as signed Messages thinking")
 		default:
@@ -220,7 +272,7 @@ func (c *responsesToMessagesConverter) ToClientResponse(_ context.Context, input
 			if err != nil {
 				return conversionResult{}, err
 			}
-			target.Output = append(target.Output, responsesItem{Type: "function_call", ID: "fc_" + block.ID, CallID: block.ID, Name: block.Name, Arguments: json.RawMessage(mustJSONString(string(arguments))), Status: "completed"})
+			target.Output = append(target.Output, responsesItem{Type: "function_call", ID: "fc_" + block.ID, CallID: block.ID, Name: block.Name, Arguments: json.RawMessage(mustJSONString(string(arguments))), Status: "completed", Caller: append(json.RawMessage(nil), block.Caller...)})
 		case "thinking", "redacted_thinking":
 			return conversionResult{}, unsupported(ProtocolMessages, path, "signed or redacted thinking cannot be represented as Responses reasoning")
 		default:
@@ -234,7 +286,10 @@ func (c *responsesToMessagesConverter) ToClientResponse(_ context.Context, input
 	if err != nil {
 		return conversionResult{}, err
 	}
-	var diagnostics []Diagnostic
+	diagnostics, err := messagesResponseExtensionDiagnostics(source, options.LossPolicy)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	if source.StopReason == "stop_sequence" && source.StopSequence != "" {
 		if options.LossPolicy == rejectSemanticLoss {
 			return conversionResult{}, unsupported(ProtocolMessages, "$.stop_sequence", "Responses cannot expose the matched stop sequence")
@@ -255,11 +310,9 @@ func (c *responsesToMessagesConverter) ToClientResponse(_ context.Context, input
 	target.Usage.OutputTokens = source.Usage.OutputTokens
 	target.Usage.TotalTokens = target.Usage.InputTokens + source.Usage.OutputTokens
 	target.Usage.InputTokenDetails.CachedTokens = source.Usage.CacheReadInputTokens
-	if source.Usage.CacheCreationInputTokens > 0 {
-		if options.LossPolicy == rejectSemanticLoss {
-			return conversionResult{}, unsupported(ProtocolMessages, "$.usage.cache_creation_input_tokens", "Responses usage has no cache-creation token field")
-		}
-		diagnostics = appendDiagnostic(diagnostics, "warning", "cache_creation_usage_not_representable", "$.usage.cache_creation_input_tokens", "cache-creation tokens were omitted from the Responses usage object")
+	target.Usage.InputTokenDetails.CacheWriteTokens = source.Usage.CacheCreationInputTokens
+	if source.Usage.OutputTokensDetails != nil {
+		target.Usage.OutputTokenDetails.ReasoningTokens = source.Usage.OutputTokensDetails.ThinkingTokens
 	}
 	if len(source.Usage.ServerToolUse) > 0 && string(source.Usage.ServerToolUse) != "null" && string(source.Usage.ServerToolUse) != "{}" {
 		if options.LossPolicy == rejectSemanticLoss {

@@ -51,6 +51,7 @@ func upstreamResponseError(protocol Protocol, path, format string, args ...any) 
 var (
 	jsonValuePresent      = routekit.ValuePresent
 	rawJSONValuePresent   = routekit.ValuePresent
+	nonNullJSON           = routekit.NonNullValue
 	mustJSONString        = routekit.MustJSONString
 	resolveExchangeStream = routekit.ResolveExchangeStream
 )

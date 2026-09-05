@@ -102,11 +102,14 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 	if source.Error != nil {
 		return conversionResult{}, upstreamResponseError(ProtocolChat, "$.error", "%s", source.Error.Message)
 	}
+	diagnostics, err := chatResponseExtensionDiagnostics(source, options.LossPolicy)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	if len(source.Choices) != 1 {
 		return conversionResult{}, unsupported(ProtocolChat, "$.choices", "Gemini conversion requires exactly one Chat choice")
 	}
 	choice := source.Choices[0]
-	var diagnostics []Diagnostic
 	if jsonValuePresent(choice.Logprobs) {
 		if options.LossPolicy == rejectSemanticLoss {
 			return conversionResult{}, unsupported(ProtocolChat, "$.choices[0].logprobs", "Gemini logprobs require token ids that Chat does not provide")
@@ -116,7 +119,13 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 	if choice.Message.Role != "" && choice.Message.Role != "assistant" {
 		return conversionResult{}, upstreamResponseError(ProtocolChat, "$.choices[0].message.role", "expected assistant role, got %q", choice.Message.Role)
 	}
-	parts, err := chatContentToGeminiParts(choice.Message.Content, "$.choices[0].message.content")
+	if rawJSONValuePresent(choice.Message.Annotations) {
+		if options.LossPolicy == rejectSemanticLoss {
+			return conversionResult{}, unsupported(ProtocolChat, "$.choices[0].message.annotations", "Chat response annotations have no Gemini equivalent")
+		}
+		diagnostics = appendDiagnostic(diagnostics, "warning", "chat_annotations_not_representable", "$.choices[0].message.annotations", "Chat response annotations were omitted")
+	}
+	parts, err := chatContentToGeminiParts(choice.Message.Content, "$.choices[0].message.content", "assistant")
 	if err != nil {
 		return conversionResult{}, err
 	}
@@ -127,11 +136,9 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 		parts = append(parts, geminiPart{Text: choice.Message.Refusal})
 		diagnostics = appendDiagnostic(diagnostics, "warning", "chat_refusal_approximated", "$.choices[0].message.refusal", "structured Chat refusal was emitted as Gemini text")
 	}
-	signatureAttached := false
 	if choice.Message.ReasoningContent != "" {
-		parts = append([]geminiPart{{Text: choice.Message.ReasoningContent, Thought: true, ThoughtSignature: geminiThoughtSignatureBypass}}, parts...)
-		signatureAttached = true
-		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", "$.choices[0].message.reasoning_content", "a Gemini-compatible thought signature bypass was attached to converted reasoning")
+		parts = append([]geminiPart{{Text: choice.Message.ReasoningContent, Thought: true}}, parts...)
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", "$.choices[0].message.reasoning_content", "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 	}
 	for index, call := range choice.Message.ToolCalls {
 		path := fmt.Sprintf("$.choices[0].message.tool_calls[%d]", index)
@@ -146,11 +153,7 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 			return conversionResult{}, err
 		}
 		part := geminiPart{FunctionCall: &geminiFunctionCall{ID: call.ID, Name: call.Function.Name, Args: arguments}}
-		if !signatureAttached {
-			part.ThoughtSignature = geminiThoughtSignatureBypass
-			signatureAttached = true
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", path, "a Gemini-compatible thought signature bypass was attached to the converted function call")
-		}
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", path, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 		parts = append(parts, part)
 	}
 	finish, err := parseChatFinish(choice.FinishReason)
@@ -167,14 +170,52 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 	})
 	target.UsageMetadata.PromptTokenCount = source.Usage.PromptTokens
 	target.UsageMetadata.CandidatesTokenCount = source.Usage.CompletionTokens - source.Usage.CompletionDetails.ReasoningTokens
-	if target.UsageMetadata.CandidatesTokenCount < 0 {
-		target.UsageMetadata.CandidatesTokenCount = 0
-	}
 	target.UsageMetadata.ThoughtsTokenCount = source.Usage.CompletionDetails.ReasoningTokens
 	target.UsageMetadata.TotalTokenCount = source.Usage.TotalTokens
 	target.UsageMetadata.CachedContentTokenCount = source.Usage.PromptDetails.CachedTokens
 	body, err := marshal(ProtocolGenerateContent, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
+}
+
+func chatResponseExtensionDiagnostics(source chatResponse, policy lossPolicy) ([]Diagnostic, error) {
+	if source.Usage.PromptTokens < 0 || source.Usage.CompletionTokens < 0 || source.Usage.TotalTokens < 0 ||
+		source.Usage.PromptDetails.CachedTokens < 0 || source.Usage.PromptDetails.AudioTokens < 0 ||
+		source.Usage.CompletionDetails.ReasoningTokens < 0 || source.Usage.CompletionDetails.AudioTokens < 0 ||
+		source.Usage.CompletionDetails.AcceptedPredictionTokens < 0 || source.Usage.CompletionDetails.RejectedPredictionTokens < 0 {
+		return nil, upstreamResponseError(ProtocolChat, "$.usage", "token counts must not be negative")
+	}
+	if source.Usage.PromptDetails.CachedTokens > source.Usage.PromptTokens {
+		return nil, upstreamResponseError(ProtocolChat, "$.usage.prompt_tokens_details.cached_tokens", "cached tokens cannot exceed prompt_tokens")
+	}
+	if source.Usage.CompletionDetails.ReasoningTokens > source.Usage.CompletionTokens {
+		return nil, upstreamResponseError(ProtocolChat, "$.usage.completion_tokens_details.reasoning_tokens", "reasoning tokens cannot exceed completion_tokens")
+	}
+	fields := []struct {
+		path    string
+		code    string
+		present bool
+		message string
+	}{
+		{"$.metadata", "chat_response_metadata_not_representable", len(source.Metadata) > 0, "Chat response metadata was omitted"},
+		{"$.moderation", "chat_response_moderation_not_representable", rawJSONValuePresent(source.Moderation), "Chat response moderation metadata was omitted"},
+		{"$.service_tier", "chat_response_service_tier_not_representable", rawJSONValuePresent(source.ServiceTier), "Chat response service tier was omitted"},
+		{"$.system_fingerprint", "chat_system_fingerprint_not_representable", source.SystemFingerprint != "", "Chat system fingerprint was omitted"},
+		{"$.usage.prompt_tokens_details.audio_tokens", "chat_input_audio_usage_not_representable", source.Usage.PromptDetails.AudioTokens != 0, "Chat input audio token usage was omitted"},
+		{"$.usage.completion_tokens_details.audio_tokens", "chat_output_audio_usage_not_representable", source.Usage.CompletionDetails.AudioTokens != 0, "Chat output audio token usage was omitted"},
+		{"$.usage.completion_tokens_details.accepted_prediction_tokens", "chat_accepted_prediction_usage_not_representable", source.Usage.CompletionDetails.AcceptedPredictionTokens != 0, "Chat accepted prediction token usage was omitted"},
+		{"$.usage.completion_tokens_details.rejected_prediction_tokens", "chat_rejected_prediction_usage_not_representable", source.Usage.CompletionDetails.RejectedPredictionTokens != 0, "Chat rejected prediction token usage was omitted"},
+	}
+	var diagnostics []Diagnostic
+	for _, field := range fields {
+		if !field.present {
+			continue
+		}
+		if policy == rejectSemanticLoss {
+			return nil, unsupported(ProtocolChat, field.path, "field has no Gemini response equivalent")
+		}
+		diagnostics = appendDiagnostic(diagnostics, "warning", field.code, field.path, field.message)
+	}
+	return diagnostics, nil
 }
 
 func (c *chatToGeminiConverter) NewClientStream(_ context.Context, options conversionOptions) (responseStreamConverter, error) {
@@ -209,9 +250,12 @@ func geminiToolConfigForChoice(choice toolChoice) *geminiToolConfig {
 	return config
 }
 
-func chatContentToGeminiParts(raw json.RawMessage, path string) ([]geminiPart, error) {
+func chatContentToGeminiParts(raw json.RawMessage, path, role string) ([]geminiPart, error) {
 	parts, err := decodeChatContent(raw, path)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateChatContentRole(role, parts, path); err != nil {
 		return nil, err
 	}
 	return encodeGeminiParts(parts)
@@ -253,6 +297,11 @@ func geminiConfigToChat(config *geminiGenerationConfig, target *chatRequest, pol
 		{"$.generationConfig.responseModalities", len(config.ResponseModalities) > 0},
 		{"$.generationConfig.speechConfig", jsonValuePresent(config.SpeechConfig)},
 		{"$.generationConfig.imageConfig", jsonValuePresent(config.ImageConfig)},
+		{"$.generationConfig.enableAffectiveDialog", config.EnableAffectiveDialog != nil},
+		{"$.generationConfig.responseFormat", jsonValuePresent(config.ResponseFormat)},
+		{"$.generationConfig.translationConfig", jsonValuePresent(config.TranslationConfig)},
+		{"$.generationConfig.audioTranscriptionConfig", jsonValuePresent(config.AudioTranscriptionConfig)},
+		{"$.generationConfig._responseJsonSchema", jsonValuePresent(config.InternalResponseJSONSchema)},
 	} {
 		if field.set {
 			return unsupported(ProtocolGenerateContent, field.path, "generation setting has no Chat equivalent")
@@ -260,6 +309,9 @@ func geminiConfigToChat(config *geminiGenerationConfig, target *chatRequest, pol
 	}
 	if config.CandidateCount != nil && *config.CandidateCount != 1 {
 		return unsupported(ProtocolGenerateContent, "$.generationConfig.candidateCount", "Chat cross-protocol conversion supports exactly one choice")
+	}
+	if len(config.StopSequences) > 4 {
+		return unsupported(ProtocolGenerateContent, "$.generationConfig.stopSequences", "Chat supports at most four stop sequences")
 	}
 	if config.Logprobs != nil && (config.ResponseLogprobs == nil || !*config.ResponseLogprobs) {
 		return invalid(ProtocolGenerateContent, "$.generationConfig.logprobs", "logprobs requires responseLogprobs=true")
@@ -415,6 +467,9 @@ func geminiPartsToChat(source []geminiPart, path, role string, policy lossPolicy
 			if err != nil {
 				return nil, nil, err
 			}
+			if role != "user" && converted.Kind != partText {
+				return nil, nil, unsupported(ProtocolGenerateContent, partPath, "Chat %s messages cannot contain Gemini media", role)
+			}
 			parts = append(parts, converted)
 		}
 	}
@@ -428,15 +483,33 @@ func geminiMediaOrTextToChatPart(part geminiPart, path string) (portablePart, er
 	case part.InlineData != nil:
 		mime := strings.ToLower(part.InlineData.MIMEType)
 		if strings.HasPrefix(mime, "image/") {
+			if !validImageMIMEType(mime) {
+				return portablePart{}, unsupported(ProtocolGenerateContent, path+".inlineData.mimeType", "Chat images require JPEG, PNG, GIF, or WebP")
+			}
+			if part.InlineData.DisplayName != "" {
+				return portablePart{}, unsupported(ProtocolGenerateContent, path+".inlineData.displayName", "Chat image content cannot preserve a display name")
+			}
 			return portablePart{Kind: partImage, Media: &portableMedia{MIMEType: part.InlineData.MIMEType, Data: part.InlineData.Data}}, nil
 		}
 		if mime == "audio/wav" || mime == "audio/mpeg" || mime == "audio/mp3" {
+			if part.InlineData.DisplayName != "" {
+				return portablePart{}, unsupported(ProtocolGenerateContent, path+".inlineData.displayName", "Chat audio content cannot preserve a display name")
+			}
 			return portablePart{Kind: partAudio, Media: &portableMedia{MIMEType: part.InlineData.MIMEType, Data: part.InlineData.Data}}, nil
 		}
-		return portablePart{}, unsupported(ProtocolGenerateContent, path+".inlineData.mimeType", "Chat cannot represent inline media type %q", part.InlineData.MIMEType)
+		return portablePart{Kind: partFile, Media: &portableMedia{MIMEType: part.InlineData.MIMEType, Data: part.InlineData.Data}}, nil
 	case part.FileData != nil:
 		if !strings.HasPrefix(strings.ToLower(part.FileData.MIMEType), "image/") {
 			return portablePart{}, unsupported(ProtocolGenerateContent, path+".fileData", "Chat can only preserve Gemini fileData as an image URL")
+		}
+		if !validImageMIMEType(strings.ToLower(part.FileData.MIMEType)) {
+			return portablePart{}, unsupported(ProtocolGenerateContent, path+".fileData.mimeType", "Chat images require JPEG, PNG, GIF, or WebP")
+		}
+		if !portableGeminiFileURI(part.FileData.FileURI) {
+			return portablePart{}, unsupported(ProtocolGenerateContent, path+".fileData.fileUri", "provider-scoped Gemini file URIs cannot be represented as Chat image URLs")
+		}
+		if part.FileData.DisplayName != "" {
+			return portablePart{}, unsupported(ProtocolGenerateContent, path+".fileData.displayName", "Chat image URLs cannot preserve a display name")
 		}
 		return portablePart{Kind: partImage, Media: &portableMedia{URL: part.FileData.FileURI}}, nil
 	default:

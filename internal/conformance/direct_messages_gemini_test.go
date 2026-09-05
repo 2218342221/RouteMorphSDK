@@ -38,7 +38,7 @@ func TestDirectMessagesToGeminiRequestPreservesPortableSemantics(t *testing.T) {
 	if target.SystemInstruction == nil || len(target.SystemInstruction.Parts) != 1 || target.SystemInstruction.Parts[0].Text != "be exact" {
 		t.Fatalf("systemInstruction = %#v", target.SystemInstruction)
 	}
-	if len(target.Tools) != 1 || len(target.Tools[0].FunctionDeclarations) != 1 || !strings.Contains(string(target.Tools[0].FunctionDeclarations[0].Parameters), `"type":"OBJECT"`) {
+	if len(target.Tools) != 1 || len(target.Tools[0].FunctionDeclarations) != 1 || !strings.Contains(string(target.Tools[0].FunctionDeclarations[0].ParametersJSONSchema), `"type":"object"`) {
 		t.Fatalf("tools = %#v", target.Tools)
 	}
 	if target.ToolConfig == nil || target.ToolConfig.FunctionCallingConfig.Mode != "ANY" || len(target.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) != 1 || target.ToolConfig.FunctionCallingConfig.AllowedFunctionNames[0] != "weather" {
@@ -48,14 +48,14 @@ func TestDirectMessagesToGeminiRequestPreservesPortableSemantics(t *testing.T) {
 		t.Fatalf("contents = %#v", target.Contents)
 	}
 	call := target.Contents[1].Parts[0]
-	if call.FunctionCall == nil || call.FunctionCall.ID != "call_1" || call.ThoughtSignature != geminiThoughtSignatureBypass {
+	if call.FunctionCall == nil || call.FunctionCall.ID != "call_1" || call.ThoughtSignature != "" {
 		t.Fatalf("functionCall = %#v", call)
 	}
 	response := target.Contents[2].Parts[0].FunctionResponse
 	if response == nil || response.ID != "call_1" || response.Name != "weather" || string(response.Response) != `{"temp":20}` {
 		t.Fatalf("functionResponse = %#v", response)
 	}
-	if !hasMessagesGeminiDiagnostic(result.Diagnostics, "gemini_thought_signature_bypass_added") {
+	if !hasMessagesGeminiDiagnostic(result.Diagnostics, "gemini_thought_signature_unavailable") {
 		t.Fatalf("diagnostics = %#v", result.Diagnostics)
 	}
 }
@@ -64,12 +64,12 @@ func TestDirectGeminiToMessagesRequestPreservesPortableSemantics(t *testing.T) {
 	converter := newMessagesGeminiRoute(routeSpec{ID: "gemini_to_messages", From: ProtocolGenerateContent, To: ProtocolMessages})
 	input := []byte(`{
 		"systemInstruction":{"parts":[{"text":"be exact"}]},
-		"generationConfig":{"maxOutputTokens":222,"temperature":0.3,"topP":0.9,"stopSequences":["END"],"responseMimeType":"application/json","responseJsonSchema":{"type":"OBJECT","properties":{"answer":{"type":"STRING","nullable":true}}}},
+		"generationConfig":{"maxOutputTokens":222,"temperature":0.3,"topP":0.9,"stopSequences":["END"],"responseMimeType":"application/json","responseJsonSchema":{"type":"object","properties":{"answer":{"type":["string","null"]}}}},
 		"tools":[{"functionDeclarations":[{"name":"weather","description":"lookup","parameters":{"type":"OBJECT","properties":{"city":{"type":"STRING"}},"required":["city"]}}]}],
 		"toolConfig":{"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["weather"]}},
 		"contents":[
 			{"role":"user","parts":[{"text":"weather?"},{"inlineData":{"mimeType":"image/png","data":"aGVsbG8="}}]},
-			{"role":"model","parts":[{"functionCall":{"name":"weather","args":{"city":"Paris"}},"thoughtSignature":"context_engineering_is_the_way_to_go"}]},
+			{"role":"model","parts":[{"functionCall":{"name":"weather","args":{"city":"Paris"}}}]},
 			{"role":"user","parts":[{"functionResponse":{"name":"weather","response":{"output":{"temp":20}}}}]}
 		]
 	}`)
@@ -106,7 +106,7 @@ func TestDirectGeminiToMessagesRequestPreservesPortableSemantics(t *testing.T) {
 	if len(callBlocks) != 1 || callBlocks[0].ID == "" || len(resultBlocks) != 1 || resultBlocks[0].ToolUseID != callBlocks[0].ID || rawString(resultBlocks[0].Content) != `{"temp":20}` {
 		t.Fatalf("call=%#v result=%#v", callBlocks, resultBlocks)
 	}
-	if !hasMessagesGeminiDiagnostic(result.Diagnostics, "function_call_id_generated") || !hasMessagesGeminiDiagnostic(result.Diagnostics, "gemini_thought_signature_bypass_removed") {
+	if !hasMessagesGeminiDiagnostic(result.Diagnostics, "function_call_id_generated") {
 		t.Fatalf("diagnostics = %#v", result.Diagnostics)
 	}
 }
@@ -154,7 +154,7 @@ func TestDirectMessagesToGeminiResponsePreservesUsageAndFunctionCall(t *testing.
 		t.Fatalf("response = %#v", target)
 	}
 	call := target.Candidates[0].Content.Parts[1]
-	if call.FunctionCall == nil || call.FunctionCall.ID != "call_1" || call.ThoughtSignature != geminiThoughtSignatureBypass {
+	if call.FunctionCall == nil || call.FunctionCall.ID != "call_1" || call.ThoughtSignature != "" {
 		t.Fatalf("function call = %#v", call)
 	}
 	if target.UsageMetadata.PromptTokenCount != 13 || target.UsageMetadata.CandidatesTokenCount != 4 || target.UsageMetadata.TotalTokenCount != 17 || target.UsageMetadata.CachedContentTokenCount != 3 {

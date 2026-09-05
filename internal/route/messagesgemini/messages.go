@@ -13,6 +13,7 @@ type messagesBlock = messageswire.Block
 type messagesTool = messageswire.Tool
 type messagesThinking = messageswire.Thinking
 type messagesOutputConfig = messageswire.OutputConfig
+type messagesOutputTokensDetails = messageswire.OutputTokensDetails
 
 func validateMessagesThinking(thinking *messagesThinking, path string) error {
 	if thinking == nil {
@@ -53,6 +54,15 @@ func rejectMessagesBlockMetadata(block messagesBlock, path string) error {
 	}
 	if block.ToolsetName != "" {
 		return unsupported(ProtocolMessages, path+".toolset_name", "toolset membership has no portable cross-protocol equivalent")
+	}
+	if block.Title != "" {
+		return unsupported(ProtocolMessages, path+".title", "document title metadata has no Gemini equivalent")
+	}
+	if block.Context != "" {
+		return unsupported(ProtocolMessages, path+".context", "document context metadata has no Gemini equivalent")
+	}
+	if jsonValuePresent(block.Transformations) {
+		return unsupported(ProtocolMessages, path+".transformations", "document transformations have no Gemini equivalent")
 	}
 	return nil
 }
@@ -152,6 +162,12 @@ func validateMessagesResponse(source messagesResponse) error {
 	}
 	if source.Usage.InputTokens < 0 || source.Usage.OutputTokens < 0 || source.Usage.CacheCreationInputTokens < 0 || source.Usage.CacheReadInputTokens < 0 {
 		return upstreamResponseError(ProtocolMessages, "$.usage", "token counts must not be negative")
+	}
+	if source.Usage.CacheCreation != nil && (source.Usage.CacheCreation.Ephemeral1hInputTokens < 0 || source.Usage.CacheCreation.Ephemeral5mInputTokens < 0) {
+		return upstreamResponseError(ProtocolMessages, "$.usage.cache_creation", "cache-creation token counts must not be negative")
+	}
+	if source.Usage.OutputTokensDetails != nil && (source.Usage.OutputTokensDetails.ThinkingTokens < 0 || source.Usage.OutputTokensDetails.ThinkingTokens > source.Usage.OutputTokens) {
+		return upstreamResponseError(ProtocolMessages, "$.usage.output_tokens_details.thinking_tokens", "thinking tokens must be between zero and output_tokens")
 	}
 	if _, err := parseMessagesFinish(source.StopReason); err != nil {
 		return err

@@ -12,13 +12,8 @@ type responsesItem = responseswire.Item
 func validateResponsesItems(items []responsesItem, path string) error {
 	for index, item := range items {
 		itemPath := fmt.Sprintf("%s[%d]", path, index)
-		if item.Phase != "" {
-			if path != "$.output" || (item.Phase != "final_answer" && item.Phase != "commentary") {
-				return unsupported(ProtocolResponses, itemPath+".phase", "message phase %q has no portable cross-protocol equivalent", item.Phase)
-			}
-		}
-		if len(item.EncryptedContent) > 0 && string(item.EncryptedContent) != "null" {
-			return unsupported(ProtocolResponses, itemPath+".encrypted_content", "encrypted reasoning content requires a native Responses provider")
+		if len(item.EncryptedContent) > 0 && string(item.EncryptedContent) != "null" && item.Type != "reasoning" {
+			return upstreamResponseError(ProtocolResponses, itemPath+".encrypted_content", "encrypted_content is only valid on reasoning items")
 		}
 		switch item.Type {
 		case "message", "":

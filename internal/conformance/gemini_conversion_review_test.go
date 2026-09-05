@@ -37,8 +37,8 @@ func TestResponsesToGeminiParameterlessToolAndEmptyArguments(t *testing.T) {
 	}
 	contents := request["contents"].([]any)
 	call := contents[0].(map[string]any)["parts"].([]any)[0].(map[string]any)
-	if call["thoughtSignature"] != geminiThoughtSignatureBypass {
-		t.Fatalf("thoughtSignature = %#v", call["thoughtSignature"])
+	if _, exists := call["thoughtSignature"]; exists {
+		t.Fatalf("thoughtSignature must not be forged: %#v", call["thoughtSignature"])
 	}
 	args := call["functionCall"].(map[string]any)["args"].(map[string]any)
 	if len(args) != 0 {
@@ -273,6 +273,41 @@ func TestGeminiToResponsesStreamKeepsCallIDsUnique(t *testing.T) {
 	}
 	if got, want := strings.Join(callIDs, ","), "rm_call_1,rm_call_2"; got != want {
 		t.Fatalf("call ids = %q, want %q", got, want)
+	}
+}
+
+func TestGeminiToResponsesStreamPassesNativeResponsesValidation(t *testing.T) {
+	stream, err := newResponsesGeminiRoute(routeSpec{From: ProtocolResponses, To: ProtocolGenerateContent}).NewClientStream(context.Background(), conversionOptions{Exchange: exchangeMetadata{ClientModel: "responses-client"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := []streamFrame{
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"text":"answer"}]}}]}`)},
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"lookup","args":{"q":"x"}}}]} ,"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5}}`)},
+	}
+	var generated []streamFrame
+	for _, input := range inputs {
+		frames, _, err := stream.Convert(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generated = append(generated, frames...)
+	}
+	finalFrames, _, err := stream.Finalize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated = append(generated, finalFrames...)
+	body, _, err := collectNativeStreamResponse(ProtocolResponses, generated, rejectSemanticLoss)
+	if err != nil {
+		t.Fatalf("generated Responses SSE failed native validation: %v", err)
+	}
+	var response responsesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "completed" || len(response.Output) != 2 || response.Output[0].Type != "message" || response.Output[1].Type != "function_call" {
+		t.Fatalf("collected response = %s", body)
 	}
 }
 

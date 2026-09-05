@@ -28,8 +28,6 @@ func mustJSON(value any) []byte {
 	return data
 }
 
-const geminiThoughtSignatureBypass = geminiwire.ExternalFunctionCallSignature
-
 func rawString(raw json.RawMessage) string { return jsonx.RawString(raw) }
 
 func jsonValuePresent(raw json.RawMessage) bool {

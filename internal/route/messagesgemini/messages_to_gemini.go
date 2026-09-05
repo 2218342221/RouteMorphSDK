@@ -23,7 +23,7 @@ func (c *messagesToGeminiConverter) Specification() routeSpec { return c.spec }
 func (c *geminiToMessagesConverter) Specification() routeSpec { return c.spec }
 
 func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
 	var source messagesRequest
@@ -47,6 +47,15 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 	}
 	if len(source.Metadata) > 0 {
 		return conversionResult{}, unsupported(ProtocolMessages, "$.metadata", "generateContent has no request metadata equivalent")
+	}
+	if jsonValuePresent(source.CacheControl) {
+		return conversionResult{}, unsupported(ProtocolMessages, "$.cache_control", "top-level cache control has no Gemini equivalent")
+	}
+	if source.InferenceGeo != "" {
+		return conversionResult{}, unsupported(ProtocolMessages, "$.inference_geo", "inference geography has no Gemini equivalent")
+	}
+	if source.ServiceTier != "" {
+		return conversionResult{}, unsupported(ProtocolMessages, "$.service_tier", "Messages service-tier semantics are provider specific")
 	}
 	if source.Thinking != nil {
 		if err := validateMessagesThinking(source.Thinking, "$.thinking"); err != nil {
@@ -81,6 +90,10 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 	target.GenerationConfig.MaxOutputTokens = &source.MaxTokens
 	target.GenerationConfig.Temperature = source.Temperature
 	target.GenerationConfig.TopP = source.TopP
+	target.GenerationConfig.TopK = source.TopK
+	if len(source.StopSequences) > 5 {
+		return conversionResult{}, unsupported(ProtocolMessages, "$.stop_sequences", "Gemini supports at most five stop sequences")
+	}
 	target.GenerationConfig.StopSequences = append([]string(nil), source.StopSequences...)
 
 	if jsonValuePresent(source.System) {
@@ -88,7 +101,7 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 		if err != nil {
 			return conversionResult{}, err
 		}
-		parts, blockDiagnostics, err := messagesBlocksToGemini(blocks, "system", "$.system", nil)
+		parts, blockDiagnostics, err := messagesBlocksToGemini(blocks, "system", "$.system", nil, nil)
 		if err != nil {
 			return conversionResult{}, err
 		}
@@ -117,11 +130,27 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 			if function.Strict != nil {
 				return conversionResult{}, unsupported(ProtocolMessages, path+".strict", "Gemini function declarations cannot preserve Anthropic strict-tool semantics")
 			}
-			schema, err := normalizeGeminiSchema(function.InputSchema)
+			if function.EagerInputStreaming != nil {
+				return conversionResult{}, unsupported(ProtocolMessages, path+".eager_input_streaming", "eager tool-input streaming has no Gemini equivalent")
+			}
+			if function.DeferLoading != nil {
+				return conversionResult{}, unsupported(ProtocolMessages, path+".defer_loading", "deferred tool loading has no Gemini equivalent")
+			}
+			if len(function.AllowedCallers) > 0 {
+				return conversionResult{}, unsupported(ProtocolMessages, path+".allowed_callers", "tool caller restrictions have no Gemini equivalent")
+			}
+			if jsonValuePresent(function.InputExamples) {
+				return conversionResult{}, unsupported(ProtocolMessages, path+".input_examples", "tool input examples have no Gemini equivalent")
+			}
+			schema, err := normalizeMessagesInputSchema(function.InputSchema, path+".input_schema")
 			if err != nil {
 				return conversionResult{}, err
 			}
-			tool.FunctionDeclarations = append(tool.FunctionDeclarations, geminiFunctionDeclaration{Name: function.Name, Description: function.Description, Parameters: schema})
+			schema, err = normalizeGeminiFunctionSchema(ProtocolMessages, path+".input_schema", schema)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			tool.FunctionDeclarations = append(tool.FunctionDeclarations, geminiFunctionDeclaration{Name: function.Name, Description: function.Description, ParametersJSONSchema: schema})
 		}
 		target.Tools = []geminiTool{tool}
 	}
@@ -151,16 +180,39 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 	}
 
 	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
+	sawConversation := false
 	for messageIndex, message := range source.Messages {
 		path := fmt.Sprintf("$.messages[%d]", messageIndex)
-		if message.Role != "user" && message.Role != "assistant" {
-			return conversionResult{}, invalid(ProtocolMessages, path+".role", "role must be user or assistant")
+		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
+			return conversionResult{}, invalid(ProtocolMessages, path+".role", "role must be user, assistant, or system")
 		}
 		blocks, err := decodeMessagesBlocks(message.Content, path+".content")
 		if err != nil {
 			return conversionResult{}, err
 		}
-		parts, blockDiagnostics, err := messagesBlocksToGemini(blocks, message.Role, path+".content", callNames)
+		if message.Role == "system" {
+			if sawConversation {
+				return conversionResult{}, unsupported(ProtocolMessages, path+".role", "interleaved system messages cannot be moved to Gemini systemInstruction")
+			}
+			parts, blockDiagnostics, err := messagesBlocksToGemini(blocks, message.Role, path+".content", nil, nil)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			for index, part := range parts {
+				if part.Text == "" || part.Thought || part.FunctionCall != nil || part.FunctionResponse != nil || part.InlineData != nil || part.FileData != nil {
+					return conversionResult{}, unsupported(ProtocolMessages, fmt.Sprintf("%s.content[%d]", path, index), "Gemini systemInstruction only has a portable text mapping")
+				}
+			}
+			diagnostics = append(diagnostics, blockDiagnostics...)
+			if target.SystemInstruction == nil {
+				target.SystemInstruction = &geminiContent{}
+			}
+			target.SystemInstruction.Parts = append(target.SystemInstruction.Parts, parts...)
+			continue
+		}
+		sawConversation = true
+		parts, blockDiagnostics, err := messagesBlocksToGemini(blocks, message.Role, path+".content", callNames, consumedCallIDs)
 		if err != nil {
 			return conversionResult{}, err
 		}
@@ -229,6 +281,9 @@ func (c *messagesToGeminiConverter) ToClientResponse(_ context.Context, input []
 	target.Usage.InputTokens = promptTokens - source.UsageMetadata.CachedContentTokenCount
 	target.Usage.OutputTokens = source.UsageMetadata.CandidatesTokenCount + source.UsageMetadata.ThoughtsTokenCount
 	target.Usage.CacheReadInputTokens = source.UsageMetadata.CachedContentTokenCount
+	if source.UsageMetadata.ThoughtsTokenCount > 0 {
+		target.Usage.OutputTokensDetails = &messagesOutputTokensDetails{ThinkingTokens: source.UsageMetadata.ThoughtsTokenCount}
+	}
 	body, err := marshal(ProtocolMessages, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
 }

@@ -132,16 +132,20 @@ func TestProviderFailureIsNotFabricatedAsCompletion(t *testing.T) {
 	}
 }
 
-func TestMessagesCacheCreationUsageRequiresExplicitLossPolicy(t *testing.T) {
+func TestMessagesCacheCreationUsageMapsToResponsesCacheWrite(t *testing.T) {
 	harness, _ := newTestRouterHarness()
 	plan, _ := harness.catalog().Plan(ProtocolResponses, ProtocolMessages)
 	response := []byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":4}}`)
-	if _, err := harness.ToClientResponse(context.Background(), plan, response, conversionOptions{}); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("strict error = %v, want ErrUnsupported", err)
-	}
-	result, err := harness.ToClientResponse(context.Background(), plan, response, conversionOptions{LossPolicy: allowDocumentedLoss})
-	if err != nil || len(result.Diagnostics) != 1 || result.Diagnostics[0].Code != "cache_creation_usage_not_representable" {
+	result, err := harness.ToClientResponse(context.Background(), plan, response, conversionOptions{})
+	if err != nil || len(result.Diagnostics) != 0 {
 		t.Fatalf("result=%#v error=%v", result, err)
+	}
+	var converted responsesResponse
+	if err := json.Unmarshal(result.Body, &converted); err != nil {
+		t.Fatal(err)
+	}
+	if converted.Usage.InputTokenDetails.CacheWriteTokens != 4 {
+		t.Fatalf("Responses usage = %#v", converted.Usage)
 	}
 }
 
@@ -173,7 +177,7 @@ func TestEncryptedReasoningOutputFailsClosed(t *testing.T) {
 func TestKnownResponsesOutputPhaseIsDiagnosed(t *testing.T) {
 	harness, _ := newTestRouterHarness()
 	plan, _ := harness.catalog().Plan(ProtocolChat, ProtocolResponses)
-	response := []byte(`{"id":"resp_1","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello","annotations":[]}]}]}`)
+	response := []byte(`{"id":"resp_1","object":"response","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","phase":"final_answer","content":[{"type":"output_text","text":"hello","annotations":[]}]}]}`)
 	result, err := harness.ToClientResponse(context.Background(), plan, response, conversionOptions{})
 	if err != nil {
 		t.Fatal(err)

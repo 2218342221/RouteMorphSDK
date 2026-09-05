@@ -99,7 +99,12 @@ func TestMessagesToChatSplitsParallelToolResults(t *testing.T) {
 	converter := newChatMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolChat})
 	result, err := converter.ToUpstreamRequest(context.Background(), []byte(`{
 		"model":"claude","max_tokens":64,
-		"messages":[{"role":"user","content":[
+		"messages":[
+		{"role":"assistant","content":[
+			{"type":"tool_use","id":"call_1","name":"one","input":{}},
+			{"type":"tool_use","id":"call_2","name":"two","input":{}}
+		]},
+		{"role":"user","content":[
 			{"type":"tool_result","tool_use_id":"call_1","content":"one"},
 			{"type":"tool_result","tool_use_id":"call_2","content":"two"}
 		]}]
@@ -111,14 +116,14 @@ func TestMessagesToChatSplitsParallelToolResults(t *testing.T) {
 	if err := json.Unmarshal(result.Body, &target); err != nil {
 		t.Fatal(err)
 	}
-	if len(target.Messages) != 2 || target.Messages[0].Role != "tool" || target.Messages[0].ToolCallID != "call_1" || target.Messages[1].Role != "tool" || target.Messages[1].ToolCallID != "call_2" {
+	if len(target.Messages) != 3 || target.Messages[1].Role != "tool" || target.Messages[1].ToolCallID != "call_1" || target.Messages[2].Role != "tool" || target.Messages[2].ToolCallID != "call_2" {
 		t.Fatalf("messages = %#v", target.Messages)
 	}
 }
 
 func TestMessagesToChatToolResultErrorUsesLossPolicy(t *testing.T) {
 	converter := newChatMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolChat})
-	body := []byte(`{"model":"claude","max_tokens":64,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"failed","is_error":true}]}]}`)
+	body := []byte(`{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"lookup","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"failed","is_error":true}]}]}`)
 	if _, err := converter.ToUpstreamRequest(context.Background(), body, conversionOptions{}); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("strict error = %v, want ErrUnsupported", err)
 	}

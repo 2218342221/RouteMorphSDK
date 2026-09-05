@@ -9,4 +9,18 @@ var (
 	normalizeArguments    = routekit.NormalizeArguments
 	appendDiagnostic      = routekit.AppendDiagnostic
 	rejectUnknownTopLevel = routekit.RejectUnknownTopLevel
+	geminiFileURI         = routekit.GeminiFileURICompatible
+	portableGeminiFileURI = routekit.PortableGeminiFileURI
+	validBase64           = routekit.ValidBase64
+	mimeTypeFromURL       = routekit.MIMETypeFromURL
+	validMIMEType         = routekit.ValidMIMEType
 )
+
+func validMessagesImageMediaType(value string) bool {
+	switch value {
+	case "image/jpeg", "image/png", "image/gif", "image/webp":
+		return true
+	default:
+		return false
+	}
+}

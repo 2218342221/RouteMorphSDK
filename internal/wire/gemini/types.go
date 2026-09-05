@@ -11,6 +11,9 @@ type Request struct {
 	GenerationConfig  *GenerationConfig `json:"generationConfig,omitempty"`
 	SafetySettings    json.RawMessage   `json:"safetySettings,omitempty"`
 	CachedContent     string            `json:"cachedContent,omitempty"`
+	Model             string            `json:"model,omitempty"`
+	ServiceTier       string            `json:"serviceTier,omitempty"`
+	Store             *bool             `json:"store,omitempty"`
 }
 
 type Content struct {
@@ -30,15 +33,22 @@ type Part struct {
 	VideoMetadata       json.RawMessage   `json:"videoMetadata,omitempty"`
 	ExecutableCode      json.RawMessage   `json:"executableCode,omitempty"`
 	CodeExecutionResult json.RawMessage   `json:"codeExecutionResult,omitempty"`
+	ToolCall            json.RawMessage   `json:"toolCall,omitempty"`
+	ToolResponse        json.RawMessage   `json:"toolResponse,omitempty"`
+	PartMetadata        json.RawMessage   `json:"partMetadata,omitempty"`
+	AudioTranscription  json.RawMessage   `json:"audioTranscription,omitempty"`
+	MediaProcessing     string            `json:"mediaProcessing,omitempty"`
 }
 
 type Blob struct {
-	MIMEType string `json:"mimeType"`
-	Data     string `json:"data"`
+	MIMEType    string `json:"mimeType"`
+	Data        string `json:"data"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 type FileData struct {
-	MIMEType string `json:"mimeType,omitempty"`
-	FileURI  string `json:"fileUri"`
+	MIMEType    string `json:"mimeType,omitempty"`
+	FileURI     string `json:"fileUri"`
+	DisplayName string `json:"displayName,omitempty"`
 }
 type FunctionCall struct {
 	ID   string          `json:"id,omitempty"`
@@ -60,11 +70,19 @@ type Tool struct {
 	GoogleSearch          json.RawMessage       `json:"googleSearch,omitempty"`
 	GoogleSearchRetrieval json.RawMessage       `json:"googleSearchRetrieval,omitempty"`
 	URLContext            json.RawMessage       `json:"urlContext,omitempty"`
+	ComputerUse           json.RawMessage       `json:"computerUse,omitempty"`
+	FileSearch            json.RawMessage       `json:"fileSearch,omitempty"`
+	GoogleMaps            json.RawMessage       `json:"googleMaps,omitempty"`
+	MCPServers            json.RawMessage       `json:"mcpServers,omitempty"`
 }
 type FunctionDeclaration struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description,omitempty"`
-	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	Name                 string          `json:"name"`
+	Description          string          `json:"description,omitempty"`
+	Parameters           json.RawMessage `json:"parameters,omitempty"`
+	ParametersJSONSchema json.RawMessage `json:"parametersJsonSchema,omitempty"`
+	Response             json.RawMessage `json:"response,omitempty"`
+	ResponseJSONSchema   json.RawMessage `json:"responseJsonSchema,omitempty"`
+	Behavior             string          `json:"behavior,omitempty"`
 }
 type ToolConfig struct {
 	FunctionCallingConfig struct {
@@ -83,12 +101,13 @@ type GenerationConfig struct {
 	MaxOutputTokens            *int            `json:"maxOutputTokens,omitempty"`
 	Temperature                *float64        `json:"temperature,omitempty"`
 	TopP                       *float64        `json:"topP,omitempty"`
-	TopK                       *float64        `json:"topK,omitempty"`
+	TopK                       *int            `json:"topK,omitempty"`
 	CandidateCount             *int            `json:"candidateCount,omitempty"`
 	StopSequences              []string        `json:"stopSequences,omitempty"`
 	ResponseMIMEType           string          `json:"responseMimeType,omitempty"`
 	ResponseSchema             json.RawMessage `json:"responseSchema,omitempty"`
 	ResponseJSONSchema         json.RawMessage `json:"responseJsonSchema,omitempty"`
+	InternalResponseJSONSchema json.RawMessage `json:"_responseJsonSchema,omitempty"`
 	PresencePenalty            *float64        `json:"presencePenalty,omitempty"`
 	FrequencyPenalty           *float64        `json:"frequencyPenalty,omitempty"`
 	ResponseLogprobs           *bool           `json:"responseLogprobs,omitempty"`
@@ -100,19 +119,25 @@ type GenerationConfig struct {
 	SpeechConfig               json.RawMessage `json:"speechConfig,omitempty"`
 	ImageConfig                json.RawMessage `json:"imageConfig,omitempty"`
 	ThinkingConfig             *ThinkingConfig `json:"thinkingConfig,omitempty"`
+	EnableAffectiveDialog      *bool           `json:"enableAffectiveDialog,omitempty"`
+	ResponseFormat             json.RawMessage `json:"responseFormat,omitempty"`
+	TranslationConfig          json.RawMessage `json:"translationConfig,omitempty"`
+	AudioTranscriptionConfig   json.RawMessage `json:"audioTranscriptionConfig,omitempty"`
 }
 
 type Candidate struct {
-	Content            Content         `json:"content"`
-	FinishReason       string          `json:"finishReason"`
-	FinishMessage      string          `json:"finishMessage,omitempty"`
-	Index              int64           `json:"index,omitempty"`
-	AvgLogprobs        *float64        `json:"avgLogprobs,omitempty"`
-	LogprobsResult     json.RawMessage `json:"logprobsResult,omitempty"`
-	SafetyRatings      json.RawMessage `json:"safetyRatings,omitempty"`
-	CitationMetadata   json.RawMessage `json:"citationMetadata,omitempty"`
-	GroundingMetadata  json.RawMessage `json:"groundingMetadata,omitempty"`
-	URLContextMetadata json.RawMessage `json:"urlContextMetadata,omitempty"`
+	Content               Content         `json:"content"`
+	FinishReason          string          `json:"finishReason"`
+	FinishMessage         string          `json:"finishMessage,omitempty"`
+	Index                 int64           `json:"index,omitempty"`
+	AvgLogprobs           *float64        `json:"avgLogprobs,omitempty"`
+	LogprobsResult        json.RawMessage `json:"logprobsResult,omitempty"`
+	SafetyRatings         json.RawMessage `json:"safetyRatings,omitempty"`
+	CitationMetadata      json.RawMessage `json:"citationMetadata,omitempty"`
+	GroundingMetadata     json.RawMessage `json:"groundingMetadata,omitempty"`
+	URLContextMetadata    json.RawMessage `json:"urlContextMetadata,omitempty"`
+	GroundingAttributions json.RawMessage `json:"groundingAttributions,omitempty"`
+	TokenCount            *int64          `json:"tokenCount,omitempty"`
 }
 type Response struct {
 	Candidates    []Candidate `json:"candidates"`
@@ -126,8 +151,11 @@ type Response struct {
 		PromptTokensDetails        json.RawMessage `json:"promptTokensDetails,omitempty"`
 		ToolUsePromptTokensDetails json.RawMessage `json:"toolUsePromptTokensDetails,omitempty"`
 		CandidatesTokensDetails    json.RawMessage `json:"candidatesTokensDetails,omitempty"`
+		CacheTokensDetails         json.RawMessage `json:"cacheTokensDetails,omitempty"`
+		ServiceTier                string          `json:"serviceTier,omitempty"`
 	} `json:"usageMetadata"`
 	PromptFeedback json.RawMessage `json:"promptFeedback,omitempty"`
 	ModelVersion   string          `json:"modelVersion"`
 	ResponseID     string          `json:"responseId"`
+	ModelStatus    json.RawMessage `json:"modelStatus,omitempty"`
 }

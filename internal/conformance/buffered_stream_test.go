@@ -66,7 +66,7 @@ func TestBufferedMessagesStreamAppliesResponseLossPolicy(t *testing.T) {
 			{Event: "message_stop", Data: []byte(`{"type":"message_stop"}`)},
 		}
 	}
-	run := func(t *testing.T, frames []streamFrame, policy lossPolicy) ([]Diagnostic, error) {
+	run := func(t *testing.T, frames []streamFrame, policy lossPolicy) ([]streamFrame, []Diagnostic, error) {
 		t.Helper()
 		route := newResponsesMessagesRoute(routeSpec{From: ProtocolResponses, To: ProtocolMessages})
 		converter := newBufferedRouteStream(
@@ -76,11 +76,11 @@ func TestBufferedMessagesStreamAppliesResponseLossPolicy(t *testing.T) {
 		)
 		for _, frame := range frames {
 			if _, _, err := converter.Convert(context.Background(), frame); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
-		_, diagnostics, err := converter.Finalize(context.Background())
-		return diagnostics, err
+		output, diagnostics, err := converter.Finalize(context.Background())
+		return output, diagnostics, err
 	}
 
 	thinking := base(
@@ -88,7 +88,7 @@ func TestBufferedMessagesStreamAppliesResponseLossPolicy(t *testing.T) {
 		`{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}`,
 		"end_turn", "null", `{"output_tokens":1}`,
 	)
-	if _, err := run(t, thinking, allowDocumentedLoss); !errors.Is(err, ErrUnsupported) {
+	if _, _, err := run(t, thinking, allowDocumentedLoss); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("signed thinking error = %v, want ErrUnsupported", err)
 	}
 
@@ -97,10 +97,10 @@ func TestBufferedMessagesStreamAppliesResponseLossPolicy(t *testing.T) {
 		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
 		"stop_sequence", `"END"`, `{"output_tokens":1}`,
 	)
-	if _, err := run(t, stop, rejectSemanticLoss); !errors.Is(err, ErrUnsupported) {
+	if _, _, err := run(t, stop, rejectSemanticLoss); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("stop sequence error = %v, want ErrUnsupported", err)
 	}
-	if diagnostics, err := run(t, stop, allowDocumentedLoss); err != nil || !hasBufferedDiagnostic(diagnostics, "stop_sequence_not_representable") {
+	if _, diagnostics, err := run(t, stop, allowDocumentedLoss); err != nil || !hasBufferedDiagnostic(diagnostics, "stop_sequence_not_representable") {
 		t.Fatalf("stop sequence allow diagnostics=%#v error=%v", diagnostics, err)
 	}
 
@@ -109,11 +109,16 @@ func TestBufferedMessagesStreamAppliesResponseLossPolicy(t *testing.T) {
 		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
 		"end_turn", "null", `{"output_tokens":1,"cache_creation_input_tokens":2}`,
 	)
-	if _, err := run(t, cache, rejectSemanticLoss); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("cache creation error = %v, want ErrUnsupported", err)
+	output, diagnostics, err := run(t, cache, rejectSemanticLoss)
+	if err != nil || hasBufferedDiagnostic(diagnostics, "cache_creation_usage_not_representable") {
+		t.Fatalf("cache creation output=%#v diagnostics=%#v error=%v", output, diagnostics, err)
 	}
-	if diagnostics, err := run(t, cache, allowDocumentedLoss); err != nil || !hasBufferedDiagnostic(diagnostics, "cache_creation_usage_not_representable") {
-		t.Fatalf("cache creation allow diagnostics=%#v error=%v", diagnostics, err)
+	var rendered strings.Builder
+	for _, frame := range output {
+		rendered.Write(frame.Data)
+	}
+	if !strings.Contains(rendered.String(), `"cache_write_tokens":2`) {
+		t.Fatalf("cache creation stream = %s", rendered.String())
 	}
 }
 

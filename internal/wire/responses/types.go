@@ -51,7 +51,16 @@ type Tool struct {
 	Description           string          `json:"description,omitempty"`
 	Parameters            json.RawMessage `json:"parameters,omitempty"`
 	Strict                *bool           `json:"strict,omitempty"`
+	Async                 *bool           `json:"async,omitempty"`
 	DeferLoading          bool            `json:"defer_loading,omitempty"`
+	AllowedCallers        []string        `json:"allowed_callers,omitempty"`
+	OutputSchema          json.RawMessage `json:"output_schema,omitempty"`
+	Format                json.RawMessage `json:"format,omitempty"`
+	Execution             string          `json:"execution,omitempty"`
+	ExternalWebAccess     *bool           `json:"external_web_access,omitempty"`
+	Filters               json.RawMessage `json:"filters,omitempty"`
+	UserLocation          json.RawMessage `json:"user_location,omitempty"`
+	SearchContextSize     string          `json:"search_context_size,omitempty"`
 	PromptCacheBreakpoint json.RawMessage `json:"prompt_cache_breakpoint,omitempty"`
 }
 
@@ -63,10 +72,18 @@ type Item struct {
 	CallID           string          `json:"call_id,omitempty"`
 	Name             string          `json:"name,omitempty"`
 	Arguments        json.RawMessage `json:"arguments,omitempty"`
+	Input            json.RawMessage `json:"input,omitempty"`
 	Output           json.RawMessage `json:"output,omitempty"`
 	Summary          json.RawMessage `json:"summary,omitempty"`
 	Status           string          `json:"status,omitempty"`
+	Async            *bool           `json:"async,omitempty"`
 	Phase            string          `json:"phase,omitempty"`
+	Caller           json.RawMessage `json:"caller,omitempty"`
+	Namespace        string          `json:"namespace,omitempty"`
+	Action           json.RawMessage `json:"action,omitempty"`
+	Execution        string          `json:"execution,omitempty"`
+	CreatedBy        string          `json:"created_by,omitempty"`
+	Tools            json.RawMessage `json:"tools,omitempty"`
 	EncryptedContent json.RawMessage `json:"encrypted_content,omitempty"`
 }
 
@@ -87,19 +104,24 @@ type ContentPart struct {
 }
 
 type Response struct {
-	ID        string `json:"id"`
-	Object    string `json:"object"`
-	CreatedAt int64  `json:"created_at"`
-	Model     string `json:"model"`
-	Status    string `json:"status"`
-	Error     *Error `json:"error,omitempty"`
-	Output    []Item `json:"output"`
-	Usage     struct {
+	ID                 string            `json:"id"`
+	Object             string            `json:"object"`
+	CreatedAt          int64             `json:"created_at"`
+	Model              string            `json:"model"`
+	Status             string            `json:"status"`
+	Error              *Error            `json:"error,omitempty"`
+	Output             []Item            `json:"output"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+	Moderation         json.RawMessage   `json:"moderation,omitempty"`
+	ServiceTier        json.RawMessage   `json:"service_tier,omitempty"`
+	PromptCacheOptions json.RawMessage   `json:"prompt_cache_options,omitempty"`
+	Usage              struct {
 		InputTokens       int64 `json:"input_tokens"`
 		OutputTokens      int64 `json:"output_tokens"`
 		TotalTokens       int64 `json:"total_tokens"`
 		InputTokenDetails struct {
-			CachedTokens int64 `json:"cached_tokens"`
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
+			CachedTokens     int64 `json:"cached_tokens"`
 		} `json:"input_tokens_details"`
 		OutputTokenDetails struct {
 			ReasoningTokens int64 `json:"reasoning_tokens"`

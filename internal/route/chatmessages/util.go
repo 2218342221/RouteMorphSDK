@@ -11,6 +11,14 @@ var (
 	textParts             = routekit.TextParts
 	dataURL               = routekit.DataURL
 	parseDataURL          = routekit.ParseDataURL
+	parseFileData         = routekit.ParseFileData
+	openAIFileData        = routekit.OpenAIFileData
+	chatAudioMIMEType     = routekit.ChatAudioMIMEType
+	chatAudioFormat       = routekit.ChatAudioFormat
+	validBase64           = routekit.ValidBase64
+	validImageMIMEType    = routekit.ValidOpenAIImageMIMEType
+	validHTTPURL          = routekit.ValidHTTPURL
+	mimeTypeFromURL       = routekit.MIMETypeFromURL
 	appendDiagnostic      = routekit.AppendDiagnostic
 	rejectUnknownTopLevel = routekit.RejectUnknownTopLevel
 	jsonValuePresent      = routekit.ValuePresent

@@ -228,7 +228,27 @@ buffered routes enforce terminal validation and a 32 MiB aggregate bound before
 rendering the target stream.
 
 See [Cross-protocol compatibility](docs/compatibility.md) for field-level
-behavior and fail-closed cases.
+behavior and the [unsupported feature inventory](docs/unsupported.md) for
+explicit fail-closed and diagnostic-only boundaries.
+
+Important protocol boundaries in this release:
+
+- ordinary function declarations, calls, and results use the portable common
+  subset on every cross-protocol route;
+- OpenAI Chat and Responses additionally share a **non-streaming** custom-tool
+  subset. The official Responses item names are `custom_tool_call` and
+  `custom_tool_call_output` (not `customized_tool_call`);
+- Chat `web_search_options` and the unversioned Responses `web_search` tool map
+  only for their common non-streaming request fields. Responses `tool_search`
+  and `additional_tools` remain Responses-native. Responses
+  `configuration_update` is also native-only because it updates persisted
+  conversation state rather than the current request's top-level reasoning;
+- multimodal input is converted only when role, source, MIME type, URL/file
+  provenance, and detail controls all have a destination equivalent. In
+  particular, Responses Create message content has no `input_audio` member;
+- reasoning request controls, visible reasoning text, opaque provider replay
+  state, and reasoning-token usage are separate capabilities. Opaque state is
+  never fabricated or silently discarded across providers.
 
 ## Resource limits and failure policy
 

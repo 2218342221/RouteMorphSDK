@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"unicode/utf8"
 )
 
 // Chat and Responses use the same token-logprob entry shape. Chat wraps the
@@ -64,31 +65,57 @@ func encodeChatLogprobs(content, refusal []json.RawMessage) json.RawMessage {
 }
 
 func responsesContentAndLogprobs(raw json.RawMessage, path string) ([]portablePart, []json.RawMessage, error) {
+	parts, logprobs, _, err := responsesContentLogprobsAndAnnotations(raw, path, false, 0)
+	return parts, logprobs, err
+}
+
+func responsesContentLogprobsAndAnnotations(raw json.RawMessage, path string, allowAnnotations bool, textOffset int) ([]portablePart, []json.RawMessage, []urlCitation, error) {
 	if !jsonValuePresent(raw) {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	var content []responsesContentPart
 	if err := json.Unmarshal(raw, &content); err != nil {
-		return nil, nil, invalid(ProtocolResponses, path, "content must be an array: %v", err)
+		return nil, nil, nil, invalid(ProtocolResponses, path, "content must be an array: %v", err)
 	}
 	var logprobs []json.RawMessage
+	var citations []urlCitation
+	messageTextLength := 0
+	for index := range content {
+		if content[index].Type == "output_text" {
+			messageTextLength += utf8.RuneCountInString(content[index].Text)
+		}
+	}
 	for index := range content {
 		entries, err := decodeLogprobArray(ProtocolResponses, fmt.Sprintf("%s[%d].logprobs", path, index), content[index].Logprobs)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if len(entries) > 0 && content[index].Type != "output_text" {
-			return nil, nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].logprobs", path, index), "only output_text logprobs have a Chat equivalent")
+			return nil, nil, nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].logprobs", path, index), "only output_text logprobs have a Chat equivalent")
 		}
 		logprobs = append(logprobs, entries...)
 		content[index].Logprobs = nil
+		if jsonValuePresent(content[index].Annotations) {
+			if !allowAnnotations {
+				return nil, nil, nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].annotations", path, index), "output annotations cannot be represented in a Chat stream")
+			}
+			if content[index].Type != "output_text" {
+				return nil, nil, nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].annotations", path, index), "only output_text URL citations have a Chat equivalent")
+			}
+			converted, err := decodeResponsesURLCitations(content[index].Annotations, fmt.Sprintf("%s[%d].annotations", path, index), textOffset, messageTextLength)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			citations = append(citations, converted...)
+		}
+		content[index].Annotations = nil
 	}
 	clean, err := json.Marshal(content)
 	if err != nil {
-		return nil, nil, invalid(ProtocolResponses, path, "invalid content: %v", err)
+		return nil, nil, nil, invalid(ProtocolResponses, path, "invalid content: %v", err)
 	}
 	parts, err := decodeResponsesContentRaw(clean, path, false)
-	return parts, logprobs, err
+	return parts, logprobs, citations, err
 }
 
 func attachResponsesLogprobs(content []responsesContentPart, entries []json.RawMessage, path string) ([]responsesContentPart, error) {

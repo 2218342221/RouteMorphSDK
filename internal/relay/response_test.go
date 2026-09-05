@@ -88,7 +88,8 @@ func TestLimitedSSEBodyCloseDelegates(t *testing.T) {
 
 func TestValidatingSSEBodyPreservesValidatedBytes(t *testing.T) {
 	t.Parallel()
-	payload := []byte(": keepalive\r\nevent: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\r\n\r\n")
+	payload := []byte(": keepalive\r\nevent: response.created\r\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\r\n\r\n" +
+		"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\",\"output\":[]}}\r\n\r\n")
 	for _, size := range []int{1, 7, len(payload)} {
 		body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
 		got, err := readWithBuffer(body, size)
@@ -124,10 +125,16 @@ func TestValidatingSSEBodySupportsEverySSELineEnding(t *testing.T) {
 func TestValidatingResponsesAllowsCompatibleLifecycleEvents(t *testing.T) {
 	t.Parallel()
 	payload := []byte(
-		"event: response.queued\ndata: {\"type\":\"response.queued\"}\n\n" +
-			"event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n" +
-			"event: response.refusal.done\ndata: {\"type\":\"response.refusal.done\",\"item_id\":\"msg_1\",\"content_index\":0,\"refusal\":\"no\"}\n\n" +
-			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+			"event: response.queued\ndata: {\"type\":\"response.queued\",\"sequence_number\":1,\"response\":{\"status\":\"queued\",\"output\":[]}}\n\n" +
+			"event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":2,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":3,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\n" +
+			"event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":4,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"\"}}\n\n" +
+			"event: response.refusal.delta\ndata: {\"type\":\"response.refusal.delta\",\"sequence_number\":5,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"no\"}\n\n" +
+			"event: response.refusal.done\ndata: {\"type\":\"response.refusal.done\",\"sequence_number\":6,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"refusal\":\"no\"}\n\n" +
+			"event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":7,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"no\"}}\n\n" +
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":8,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"no\"}]}}\n\n" +
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
 	)
 	body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
 	got, err := readWithBuffer(body, 5)
@@ -136,6 +143,28 @@ func TestValidatingResponsesAllowsCompatibleLifecycleEvents(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("body changed:\n got %q\nwant %q", got, payload)
+	}
+}
+
+func TestValidatingResponsesPreservesCustomAndToolSearchEvents(t *testing.T) {
+	t.Parallel()
+	payload := []byte(
+		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"in_progress\"}}\n\n" +
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"completed\"}}\n\n" +
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":3,\"output_index\":1,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"\"}}\n\n" +
+			"event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"sequence_number\":4,\"output_index\":1,\"item_id\":\"ctc_1\",\"delta\":\"echo hi\"}\n\n" +
+			"event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"sequence_number\":5,\"output_index\":1,\"item_id\":\"ctc_1\",\"input\":\"echo hi\"}\n\n" +
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":6,\"output_index\":1,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}}\n\n" +
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":7,\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"completed\"},{\"id\":\"tso_1\",\"type\":\"tool_search_output\",\"call_id\":\"call_1\",\"execution\":\"server\",\"status\":\"completed\",\"tools\":[]},{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}]}}\n\n",
+	)
+	body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
+	got, err := readWithBuffer(body, 11)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("native Responses stream changed:\n got %q\nwant %q", got, payload)
 	}
 }
 
@@ -194,7 +223,7 @@ func TestValidatingGeminiAllowsUnspecifiedPromptFeedback(t *testing.T) {
 
 func TestValidatingSSEBodyRejectsMissingTerminal(t *testing.T) {
 	t.Parallel()
-	payload := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n")
+	payload := []byte("event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n")
 	body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
 	got, err := readWithBuffer(body, 11)
 	if !bytes.Equal(got, payload) || !errors.Is(err, core.ErrUpstreamResponse) || !errors.Is(err, core.ErrInvalidPayload) {
@@ -291,7 +320,10 @@ func TestValidatingSSEBodyRejectsMalformedKnownFields(t *testing.T) {
 		{
 			name:     "responses delta type",
 			protocol: core.ProtocolResponses,
-			payload:  "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":123}\n\n",
+			payload: "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n" +
+				"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\"}}\n\n" +
+				"event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n" +
+				"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":123,\"logprobs\":[]}\n\n",
 		},
 		{
 			name:     "messages text delta type",

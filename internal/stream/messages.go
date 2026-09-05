@@ -8,6 +8,9 @@ import (
 )
 
 type messagesBlock = messageswire.Block
+type messagesCacheCreation = messageswire.CacheCreation
+type messagesOutputTokensDetails = messageswire.OutputTokensDetails
+type messagesUsage = messageswire.Usage
 
 func decodeMessagesBlocks(raw json.RawMessage, path string) ([]messagesBlock, error) {
 	trimmed := bytes.TrimSpace(raw)
@@ -48,6 +51,57 @@ func validateMessagesResponse(source messagesResponse) error {
 	}
 	if source.Usage.InputTokens < 0 || source.Usage.OutputTokens < 0 || source.Usage.CacheCreationInputTokens < 0 || source.Usage.CacheReadInputTokens < 0 {
 		return upstreamResponseError(ProtocolMessages, "$.usage", "token counts must not be negative")
+	}
+	if source.Usage.CacheCreation != nil {
+		creation := source.Usage.CacheCreation
+		if creation.Ephemeral1hInputTokens < 0 || creation.Ephemeral5mInputTokens < 0 {
+			return upstreamResponseError(ProtocolMessages, "$.usage.cache_creation", "token counts must not be negative")
+		}
+		if creation.Ephemeral1hInputTokens+creation.Ephemeral5mInputTokens > source.Usage.CacheCreationInputTokens {
+			return upstreamResponseError(ProtocolMessages, "$.usage.cache_creation", "TTL breakdown exceeds cache_creation_input_tokens")
+		}
+	}
+	if source.Usage.OutputTokensDetails != nil {
+		thinking := source.Usage.OutputTokensDetails.ThinkingTokens
+		if thinking < 0 || thinking > source.Usage.OutputTokens {
+			return upstreamResponseError(ProtocolMessages, "$.usage.output_tokens_details.thinking_tokens", "must be between zero and output_tokens")
+		}
+	}
+	if jsonValuePresent(source.Usage.ServerToolUse) {
+		var usage map[string]json.RawMessage
+		if err := json.Unmarshal(source.Usage.ServerToolUse, &usage); err != nil || usage == nil {
+			return upstreamResponseError(ProtocolMessages, "$.usage.server_tool_use", "must be an object")
+		}
+		for name, raw := range usage {
+			if name != "web_search_requests" && name != "web_fetch_requests" {
+				return upstreamResponseError(ProtocolMessages, "$.usage.server_tool_use."+name, "unknown server-tool usage field")
+			}
+			var count int64
+			if err := json.Unmarshal(raw, &count); err != nil || count < 0 {
+				return upstreamResponseError(ProtocolMessages, "$.usage.server_tool_use."+name, "must be a non-negative integer")
+			}
+		}
+	}
+	if source.Usage.ServiceTier != "" && source.Usage.ServiceTier != "standard" && source.Usage.ServiceTier != "priority" && source.Usage.ServiceTier != "batch" {
+		return upstreamResponseError(ProtocolMessages, "$.usage.service_tier", "unsupported service tier %q", source.Usage.ServiceTier)
+	}
+	if jsonValuePresent(source.Container) {
+		var container map[string]json.RawMessage
+		if err := json.Unmarshal(source.Container, &container); err != nil || container == nil {
+			return upstreamResponseError(ProtocolMessages, "$.container", "must be an object or null")
+		}
+	}
+	if jsonValuePresent(source.StopDetails) {
+		var details struct {
+			Type     string `json:"type"`
+			Category string `json:"category"`
+		}
+		if err := json.Unmarshal(source.StopDetails, &details); err != nil || details.Type != "refusal" || details.Category == "" {
+			return upstreamResponseError(ProtocolMessages, "$.stop_details", "must be a refusal details object")
+		}
+		if source.StopReason != "refusal" {
+			return upstreamResponseError(ProtocolMessages, "$.stop_details", "is only valid when stop_reason is refusal")
+		}
 	}
 	if _, err := parseMessagesFinish(source.StopReason); err != nil {
 		return err

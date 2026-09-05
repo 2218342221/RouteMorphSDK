@@ -14,7 +14,7 @@ type geminiToResponsesConverter struct {
 func (c *geminiToResponsesConverter) Specification() routeSpec { return c.spec }
 
 func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent", "model", "serviceTier", "store"); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateGeminiNestedFields(input); err != nil {
@@ -30,6 +30,15 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 	if source.CachedContent != "" {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.cachedContent", "cached content state requires a native generateContent provider")
 	}
+	if source.Model != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.model", "body model selection cannot be preserved when routing to Responses")
+	}
+	if source.ServiceTier != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.serviceTier", "Gemini service-tier semantics are provider specific")
+	}
+	if source.Store != nil {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.store", "Gemini logging policy has no exact Responses equivalent")
+	}
 	if len(source.SafetySettings) > 0 && string(source.SafetySettings) != "null" && string(source.SafetySettings) != "[]" {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.safetySettings", "provider safety policy is not portable")
 	}
@@ -41,12 +50,14 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 		if len(config.StopSequences) > 0 {
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.stopSequences", "Responses has no equivalent stop parameter")
 		}
-		schema := config.ResponseJSONSchema
-		if !jsonValuePresent(schema) {
-			schema = config.ResponseSchema
-		}
-		if jsonValuePresent(schema) {
-			normalized, err := messagesGeminiSchemaToJSONSchema(schema, "$.generationConfig.responseSchema")
+		if nonNullJSON(config.ResponseJSONSchema) {
+			normalized, err := normalizeGeminiJSONSchema(ProtocolGenerateContent, "$.generationConfig.responseJsonSchema", config.ResponseJSONSchema)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			target.Text = mustJSON(map[string]any{"format": map[string]any{"type": "json_schema", "name": "response", "schema": normalized}})
+		} else if nonNullJSON(config.ResponseSchema) {
+			normalized, err := messagesGeminiSchemaToJSONSchema(config.ResponseSchema, "$.generationConfig.responseSchema")
 			if err != nil {
 				return conversionResult{}, err
 			}
@@ -82,11 +93,30 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 	}
 	for toolIndex, tool := range source.Tools {
 		for functionIndex, function := range tool.FunctionDeclarations {
-			parameters, err := messagesGeminiSchemaToJSONSchema(function.Parameters, fmt.Sprintf("$.tools[%d].functionDeclarations[%d].parameters", toolIndex, functionIndex))
+			path := fmt.Sprintf("$.tools[%d].functionDeclarations[%d]", toolIndex, functionIndex)
+			parameters := function.ParametersJSONSchema
+			parameterPath := path + ".parametersJsonSchema"
+			var err error
+			if jsonValuePresent(parameters) {
+				parameters, err = normalizeGeminiJSONSchema(ProtocolGenerateContent, parameterPath, parameters)
+			} else {
+				parameterPath = path + ".parameters"
+				parameters, err = messagesGeminiSchemaToJSONSchema(function.Parameters, parameterPath)
+			}
 			if err != nil {
 				return conversionResult{}, err
 			}
-			target.Tools = append(target.Tools, responsesTool{Type: "function", Name: function.Name, Description: function.Description, Parameters: parameters})
+			outputSchema, err := normalizeGeminiJSONSchema(ProtocolGenerateContent, path+".responseJsonSchema", function.ResponseJSONSchema)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			target.Tools = append(target.Tools, responsesTool{
+				Type:         "function",
+				Name:         function.Name,
+				Description:  function.Description,
+				Parameters:   parameters,
+				OutputSchema: outputSchema,
+			})
 		}
 	}
 	if source.ToolConfig != nil {
@@ -241,7 +271,11 @@ func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input [
 		target.ModelVersion = options.Exchange.ClientModel
 	}
 	var parts []geminiPart
-	diagnostics := responsesPhaseDiagnostics(source.Output, "$.output")
+	diagnostics, err := responsesResponseExtensionDiagnostics(source, options.LossPolicy, "$")
+	if err != nil {
+		return conversionResult{}, err
+	}
+	diagnostics = append(diagnostics, responsesPhaseDiagnostics(source.Output, "$.output")...)
 	for index, item := range source.Output {
 		path := fmt.Sprintf("$.output[%d]", index)
 		switch item.Type {
@@ -265,12 +299,15 @@ func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input [
 			}
 			parts = append(parts, converted...)
 		case "function_call":
+			if item.Status != "completed" {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Gemini cannot preserve function_call status %q", item.Status)
+			}
 			arguments, err := normalizeArguments(ProtocolResponses, path+".arguments", item.Arguments)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{ID: item.CallID, Name: item.Name, Args: arguments}, ThoughtSignature: geminiThoughtSignatureBypass})
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", path, "a Gemini-compatible thought signature bypass was attached to the converted function call")
+			parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{ID: item.CallID, Name: item.Name, Args: arguments}})
+			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", path, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 			if item.ID != "" && item.ID != item.CallID {
 				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_item_id_not_representable", path+".id", "Gemini preserves call_id but has no separate output item id")
 			}
@@ -350,15 +387,22 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		return nil, nil, invalid(ProtocolResponses, "$.type", "SSE event %q does not match payload type %q", frame.Event, event.Type)
 	}
 	switch event.Type {
-	case "response.created":
+	case "response.created", "response.queued", "response.in_progress":
+		if !jsonValuePresent(event.Response) {
+			if event.Type == "response.created" {
+				return nil, nil, invalid(ProtocolResponses, "$.response", "response.created requires a response object")
+			}
+			return nil, nil, nil
+		}
 		var response responsesResponse
 		if err := json.Unmarshal(event.Response, &response); err != nil {
-			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid response.created object")
+			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid response state object")
 		}
 		if err := c.setBase(response, "$.response"); err != nil {
 			return nil, nil, err
 		}
-		return nil, nil, nil
+		diagnostics, err := responsesResponseExtensionDiagnostics(response, c.LossPolicy, "$.response")
+		return nil, diagnostics, err
 	case "response.output_text.delta":
 		if err := c.validateKnownItem(event.ItemID, "message"); err != nil {
 			return nil, nil, err
@@ -441,7 +485,7 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		delete(c.calls, event.Item.ID)
 		c.completedItems[event.Item.ID] = true
 		c.completedArguments[event.Item.ID] = string(call.Args)
-		return []streamFrame{{Data: c.chunk([]geminiPart{{FunctionCall: call, ThoughtSignature: geminiThoughtSignatureBypass}}, "", nil)}}, []Diagnostic{{Severity: "warning", Code: "gemini_thought_signature_bypass_added", Path: "$.item", Message: "a Gemini-compatible thought signature bypass was attached to the converted function call"}}, nil
+		return []streamFrame{{Data: c.chunk([]geminiPart{{FunctionCall: call}}, "", nil)}}, []Diagnostic{{Severity: "warning", Code: "gemini_thought_signature_unavailable", Path: "$.item", Message: "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history"}}, nil
 	case "response.content_part.added", "response.content_part.done":
 		if err := c.validateContentPartEvent(event.ItemID, event.Part); err != nil {
 			return nil, nil, err
@@ -464,8 +508,6 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 			return nil, nil, upstreamResponseError(ProtocolResponses, "$.arguments", "completed function arguments do not match streamed deltas")
 		}
 		return nil, nil, nil
-	case "response.queued", "response.in_progress":
-		return nil, nil, nil
 	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_text.delta", "response.reasoning_text.done":
 		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
 			return nil, nil, err
@@ -485,10 +527,15 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		if err := c.setBase(response, "$.response"); err != nil {
 			return nil, nil, err
 		}
+		extensionDiagnostics, err := responsesResponseExtensionDiagnostics(response, c.LossPolicy, "$.response")
+		if err != nil {
+			return nil, nil, err
+		}
 		fallback, diagnostics, err := c.terminalOutputChunks(response)
 		if err != nil {
 			return nil, diagnostics, err
 		}
+		diagnostics = append(extensionDiagnostics, diagnostics...)
 		finish := finishStop
 		if response.Status == "incomplete" {
 			finish = finishLength
@@ -511,6 +558,41 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 	default:
 		return nil, nil, unsupported(ProtocolResponses, "$.type", "stream event %q is not supported by the Gemini conversion", event.Type)
 	}
+}
+
+func responsesResponseExtensionDiagnostics(source responsesResponse, policy lossPolicy, path string) ([]Diagnostic, error) {
+	if source.Usage.InputTokens < 0 || source.Usage.OutputTokens < 0 || source.Usage.TotalTokens < 0 || source.Usage.InputTokenDetails.CacheWriteTokens < 0 || source.Usage.InputTokenDetails.CachedTokens < 0 || source.Usage.OutputTokenDetails.ReasoningTokens < 0 {
+		return nil, upstreamResponseError(ProtocolResponses, path+".usage", "token counts must not be negative")
+	}
+	if source.Usage.InputTokenDetails.CachedTokens > source.Usage.InputTokens {
+		return nil, upstreamResponseError(ProtocolResponses, path+".usage.input_tokens_details.cached_tokens", "cached tokens cannot exceed input_tokens")
+	}
+	if source.Usage.OutputTokenDetails.ReasoningTokens > source.Usage.OutputTokens {
+		return nil, upstreamResponseError(ProtocolResponses, path+".usage.output_tokens_details.reasoning_tokens", "reasoning tokens cannot exceed output_tokens")
+	}
+	fields := []struct {
+		path    string
+		code    string
+		present bool
+		message string
+	}{
+		{path + ".metadata", "responses_metadata_not_representable", len(source.Metadata) > 0, "Responses metadata was omitted"},
+		{path + ".moderation", "responses_moderation_not_representable", jsonValuePresent(source.Moderation), "Responses moderation metadata was omitted"},
+		{path + ".service_tier", "responses_service_tier_not_representable", jsonValuePresent(source.ServiceTier), "Responses service tier was omitted"},
+		{path + ".prompt_cache_options", "responses_prompt_cache_options_not_representable", jsonValuePresent(source.PromptCacheOptions), "Responses prompt cache options were omitted"},
+		{path + ".usage.input_tokens_details.cache_write_tokens", "responses_cache_write_usage_not_representable", source.Usage.InputTokenDetails.CacheWriteTokens != 0, "Responses cache-write token usage was omitted"},
+	}
+	var diagnostics []Diagnostic
+	for _, field := range fields {
+		if !field.present {
+			continue
+		}
+		if policy == rejectSemanticLoss {
+			return nil, unsupported(ProtocolResponses, field.path, "field has no Gemini response equivalent")
+		}
+		diagnostics = appendDiagnostic(diagnostics, "warning", field.code, field.path, field.message)
+	}
+	return diagnostics, nil
 }
 
 func (c *responsesToGeminiStreamConverter) setBase(response responsesResponse, path string) error {
@@ -573,6 +655,9 @@ func (c *responsesToGeminiStreamConverter) validateOutputItemDone(itemID string,
 	}
 	if err := validateResponsesItems([]responsesItem{item}, "$.output"); err != nil {
 		return err
+	}
+	if item.Type == "function_call" && item.Status != "completed" {
+		return invalid(ProtocolResponses, "$.item.status", "completed function_call item must have status completed")
 	}
 	if item.Type == "reasoning" {
 		return unsupported(ProtocolResponses, "$.item.type", "Responses reasoning cannot be represented as a signed Gemini thought")
@@ -666,8 +751,8 @@ func (c *responsesToGeminiStreamConverter) terminalOutputChunks(response respons
 			if call.ID == "" || call.Name == "" {
 				return nil, diagnostics, upstreamResponseError(ProtocolResponses, path, "function_call item is missing call_id or name")
 			}
-			frames = append(frames, streamFrame{Data: c.chunk([]geminiPart{{FunctionCall: call, ThoughtSignature: geminiThoughtSignatureBypass}}, "", nil)})
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", path, "a Gemini-compatible thought signature bypass was attached to the converted function call")
+			frames = append(frames, streamFrame{Data: c.chunk([]geminiPart{{FunctionCall: call}}, "", nil)})
+			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", path, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 			delete(c.calls, item.ID)
 			c.completedItems[item.ID] = true
 		case "reasoning":
@@ -707,7 +792,8 @@ func (c *responsesToGeminiStreamConverter) chunk(parts []geminiPart, finish stri
 	OutputTokens      int64 `json:"output_tokens"`
 	TotalTokens       int64 `json:"total_tokens"`
 	InputTokenDetails struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
 	OutputTokenDetails struct {
 		ReasoningTokens int64 `json:"reasoning_tokens"`

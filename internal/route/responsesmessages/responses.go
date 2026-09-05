@@ -44,21 +44,54 @@ func decodeResponsesContent(source []responsesContentPart, path string, input bo
 		case "refusal":
 			parts = append(parts, portablePart{Kind: partRefusal, Text: part.Refusal})
 		case "input_image":
-			media := parseDataURL(part.ImageURL)
+			if (part.ImageURL == "") == (part.FileID == "") {
+				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d]", path, i), "input_image requires exactly one of image_url or file_id")
+			}
+			if part.Detail != "" && part.Detail != "auto" && part.Detail != "low" && part.Detail != "high" && part.Detail != "original" {
+				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].detail", path, i), "detail must be auto, low, high, or original")
+			}
+			media := &portableMedia{}
+			if part.ImageURL != "" {
+				var err error
+				media, err = parseDataURL(part.ImageURL)
+				if err != nil {
+					return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].image_url", path, i), "%v", err)
+				}
+				if media.Data != "" && !validImageMIMEType(media.MIMEType) {
+					return nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].image_url", path, i), "Responses image data URLs require JPEG, PNG, GIF, or WebP")
+				}
+			}
 			media.FileID = part.FileID
 			media.Detail = part.Detail
 			parts = append(parts, portablePart{Kind: partImage, Media: media})
 		case "input_file":
-			parts = append(parts, portablePart{Kind: partFile, Media: &portableMedia{FileID: part.FileID, URL: part.FileURL, Data: part.FileData, Filename: part.Filename}})
+			sources := 0
+			for _, value := range []string{part.FileID, part.FileURL, part.FileData} {
+				if value != "" {
+					sources++
+				}
+			}
+			if sources != 1 {
+				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d]", path, i), "input_file requires exactly one of file_id, file_url, or file_data")
+			}
+			if part.Detail != "" && part.Detail != "auto" && part.Detail != "low" && part.Detail != "high" {
+				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].detail", path, i), "detail must be auto, low, or high")
+			}
+			media := &portableMedia{FileID: part.FileID, URL: part.FileURL, Filename: part.Filename, Detail: part.Detail}
+			if part.FileURL != "" && !validHTTPURL(part.FileURL) {
+				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].file_url", path, i), "must be an absolute HTTP(S) URL")
+			}
+			if part.FileData != "" {
+				var err error
+				media, err = parseFileData(part.FileData, part.Filename)
+				if err != nil {
+					return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].file_data", path, i), "%v", err)
+				}
+				media.Detail = part.Detail
+			}
+			parts = append(parts, portablePart{Kind: partFile, Media: media})
 		case "input_audio":
-			var audio struct {
-				Data   string `json:"data"`
-				Format string `json:"format"`
-			}
-			if len(part.InputAudio) == 0 || json.Unmarshal(part.InputAudio, &audio) != nil || audio.Data == "" || audio.Format == "" {
-				return nil, invalid(ProtocolResponses, fmt.Sprintf("%s[%d].input_audio", path, i), "input_audio requires data and format")
-			}
-			parts = append(parts, portablePart{Kind: partAudio, Media: &portableMedia{Data: audio.Data, MIMEType: "audio/" + audio.Format}})
+			return nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].type", path, i), "input_audio is not part of the Responses Create message-content union")
 		default:
 			return nil, unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].type", path, i), "content part %q is not portable", part.Type)
 		}
@@ -84,21 +117,26 @@ func encodeResponsesContent(parts []portablePart, input bool) ([]responsesConten
 			if part.Media == nil {
 				return nil, invalid(ProtocolResponses, "$.input", "nil image")
 			}
+			if (part.Media.FileID == "") == (part.Media.URL == "" && part.Media.Data == "") || (part.Media.URL != "" && part.Media.Data != "") {
+				return nil, invalid(ProtocolResponses, "$.input", "input_image requires exactly one source")
+			}
 			converted = append(converted, responsesContentPart{Type: "input_image", ImageURL: dataURL(part.Media), FileID: part.Media.FileID, Detail: part.Media.Detail})
 		case partFile:
 			if part.Media == nil {
 				return nil, invalid(ProtocolResponses, "$.input", "nil file")
 			}
-			converted = append(converted, responsesContentPart{Type: "input_file", FileID: part.Media.FileID, FileURL: part.Media.URL, FileData: part.Media.Data, Filename: part.Media.Filename})
+			sources := 0
+			for _, value := range []string{part.Media.FileID, part.Media.URL, part.Media.Data} {
+				if value != "" {
+					sources++
+				}
+			}
+			if sources != 1 {
+				return nil, invalid(ProtocolResponses, "$.input", "input_file requires exactly one source")
+			}
+			converted = append(converted, responsesContentPart{Type: "input_file", FileID: part.Media.FileID, FileURL: part.Media.URL, FileData: openAIFileData(part.Media), Filename: part.Media.Filename})
 		case partAudio:
-			if part.Media == nil || part.Media.Data == "" {
-				return nil, unsupported(ProtocolResponses, "$.input", "Responses input audio requires inline data")
-			}
-			format := "wav"
-			if part.Media.MIMEType == "audio/mp3" || part.Media.MIMEType == "audio/mpeg" {
-				format = "mp3"
-			}
-			converted = append(converted, responsesContentPart{Type: "input_audio", InputAudio: mustJSON(map[string]any{"data": part.Media.Data, "format": format})})
+			return nil, unsupported(ProtocolResponses, "$.input", "Responses Create message content has no input_audio part")
 		default:
 			return nil, unsupported(ProtocolResponses, "$.input", "part %q cannot be encoded as message content", part.Kind)
 		}
@@ -137,14 +175,79 @@ func encodeResponsesToolChoice(choice toolChoice) json.RawMessage {
 }
 
 func validateResponsesTool(tool responsesTool, path string) error {
-	if tool.Type == "function" && tool.Name == "" {
+	if tool.Type != "function" {
+		return unsupported(ProtocolResponses, path+".type", "tool type %q has no Messages equivalent", tool.Type)
+	}
+	if tool.Name == "" {
 		return invalid(ProtocolResponses, path+".name", "function name is required")
+	}
+	if tool.Async != nil && *tool.Async {
+		return unsupported(ProtocolResponses, path+".async", "asynchronous tool execution has no Messages equivalent")
 	}
 	if tool.DeferLoading {
 		return unsupported(ProtocolResponses, path+".defer_loading", "deferred tool loading requires a native Responses provider")
 	}
+	if len(tool.AllowedCallers) > 0 && (len(tool.AllowedCallers) != 1 || tool.AllowedCallers[0] != "direct") {
+		return unsupported(ProtocolResponses, path+".allowed_callers", "only the direct caller constraint is portable to Messages")
+	}
+	if nonNullJSON(tool.OutputSchema) {
+		return unsupported(ProtocolResponses, path+".output_schema", "function output schemas have no Messages tool equivalent")
+	}
+	if nonNullJSON(tool.Format) || tool.Execution != "" || tool.ExternalWebAccess != nil || nonNullJSON(tool.Filters) || nonNullJSON(tool.UserLocation) || tool.SearchContextSize != "" {
+		return invalid(ProtocolResponses, path, "function tool contains fields for another tool type")
+	}
 	if len(tool.PromptCacheBreakpoint) > 0 && string(tool.PromptCacheBreakpoint) != "null" {
 		return unsupported(ProtocolResponses, path+".prompt_cache_breakpoint", "tool prompt cache breakpoints require a native Responses provider")
+	}
+	return nil
+}
+
+func validateResponsesCaller(raw json.RawMessage, path string) error {
+	if !nonNullJSON(raw) {
+		return nil
+	}
+	var caller map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &caller); err != nil || caller == nil {
+		return invalid(ProtocolResponses, path, "caller must be an object")
+	}
+	var callerType string
+	if err := json.Unmarshal(caller["type"], &callerType); err != nil || callerType == "" {
+		return invalid(ProtocolResponses, path+".type", "caller type is required")
+	}
+	if callerType != "direct" {
+		return unsupported(ProtocolResponses, path+".type", "only direct callers are portable to Messages")
+	}
+	for field := range caller {
+		if field != "type" {
+			return unsupported(ProtocolResponses, path+"."+field, "direct caller field is not portable")
+		}
+	}
+	return nil
+}
+
+func validateResponsesFunctionItemFields(item responsesItem, path string, allowDirectCaller bool) error {
+	if item.Async != nil && *item.Async {
+		return unsupported(ProtocolResponses, path+".async", "asynchronous tool execution has no Messages equivalent")
+	}
+	if nonNullJSON(item.Caller) {
+		if !allowDirectCaller {
+			return unsupported(ProtocolResponses, path+".caller", "Messages tool_result blocks have no caller field")
+		}
+		if err := validateResponsesCaller(item.Caller, path+".caller"); err != nil {
+			return err
+		}
+	}
+	if item.Namespace != "" {
+		return unsupported(ProtocolResponses, path+".namespace", "tool namespaces have no Messages equivalent")
+	}
+	if item.CreatedBy != "" {
+		return unsupported(ProtocolResponses, path+".created_by", "tool creator metadata has no Messages equivalent")
+	}
+	if item.Status != "" && item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
+		return invalid(ProtocolResponses, path+".status", "invalid function item status %q", item.Status)
+	}
+	if item.Execution != "" || nonNullJSON(item.Action) || nonNullJSON(item.Tools) {
+		return unsupported(ProtocolResponses, path, "hosted-tool metadata has no Messages function-call equivalent")
 	}
 	return nil
 }
@@ -177,23 +280,80 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if path == "$.output" && item.Role != "assistant" {
 				return upstreamResponseError(ProtocolResponses, itemPath+".role", "output message role must be assistant")
 			}
+			if path == "$.output" {
+				if item.ID == "" || item.Status == "" {
+					return upstreamResponseError(ProtocolResponses, itemPath, "output messages require id and status")
+				}
+				if item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
+					return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid message status %q", item.Status)
+				}
+			}
 			if item.Role != "user" && item.Role != "assistant" && item.Role != "system" && item.Role != "developer" {
 				return invalid(ProtocolResponses, itemPath+".role", "unsupported message role %q", item.Role)
 			}
+			if err := validateResponsesMessageContent(item.Content, itemPath+".content", path != "$.output", item.Role); err != nil {
+				return err
+			}
 		case "function_call":
+			if err := validateResponsesFunctionItemFields(item, itemPath, true); err != nil {
+				return err
+			}
+			if !nonNullJSON(item.Arguments) {
+				return invalid(ProtocolResponses, itemPath+".arguments", "function_call arguments are required")
+			}
 			if item.CallID == "" || item.Name == "" {
 				return invalid(ProtocolResponses, itemPath, "function_call requires call_id and name")
 			}
-		case "function_call_output":
-			if path == "$.output" {
-				return unsupported(ProtocolResponses, itemPath+".type", "function_call_output is not a valid response output item")
+			if path != "$.output" && item.Status != "" && item.Status != "completed" {
+				return unsupported(ProtocolResponses, itemPath+".status", "Messages history cannot preserve function_call status %q", item.Status)
 			}
-			if item.CallID == "" {
-				return invalid(ProtocolResponses, itemPath+".call_id", "call_id is required")
+		case "function_call_output":
+			if err := validateResponsesFunctionItemFields(item, itemPath, false); err != nil {
+				return err
+			}
+			if !nonNullJSON(item.Output) {
+				return invalid(ProtocolResponses, itemPath+".output", "function_call_output output is required")
+			}
+			if path == "$.output" {
+				return unsupported(ProtocolResponses, itemPath+".type", "Messages responses cannot represent a function_call_output item")
+			}
+			if item.CallID == "" && item.Name == "" {
+				return unsupported(ProtocolResponses, itemPath, "Messages tool results require call_id or name correlation")
 			}
 		case "reasoning":
 		default:
 			return unsupported(ProtocolResponses, itemPath+".type", "item type %q is not supported by this cross-protocol route", item.Type)
+		}
+	}
+	return nil
+}
+
+func validateResponsesMessageContent(raw json.RawMessage, path string, input bool, role string) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		if input {
+			return invalid(ProtocolResponses, path, "message content is required")
+		}
+		return upstreamResponseError(ProtocolResponses, path, "output message content is required")
+	}
+	if raw[0] == '"' {
+		if !input {
+			return upstreamResponseError(ProtocolResponses, path, "output message content must be an array")
+		}
+		return nil
+	}
+	var parts []responsesContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return invalid(ProtocolResponses, path, "message content must be a string or content-part array")
+	}
+	for index, part := range parts {
+		allowed := part.Type == "output_text" || part.Type == "refusal"
+		if input && role == "assistant" {
+			allowed = allowed || part.Type == "input_text" || part.Type == "input_image" || part.Type == "input_file"
+		} else if input {
+			allowed = part.Type == "input_text" || part.Type == "input_image" || part.Type == "input_file"
+		}
+		if !allowed {
+			return unsupported(ProtocolResponses, fmt.Sprintf("%s[%d].type", path, index), "content part %q is not valid in this message context", part.Type)
 		}
 	}
 	return nil
@@ -250,6 +410,19 @@ func validateResponsesTerminal(source responsesResponse) error {
 	}
 	if source.Status == "incomplete" && source.IncompleteDetails != nil && source.IncompleteDetails.Reason != "" && source.IncompleteDetails.Reason != "max_output_tokens" && source.IncompleteDetails.Reason != "content_filter" {
 		return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "unsupported incomplete reason %q", source.IncompleteDetails.Reason)
+	}
+	for index, item := range source.Output {
+		path := fmt.Sprintf("$.output[%d]", index)
+		switch item.Type {
+		case "function_call":
+			if !nonNullJSON(item.Arguments) {
+				return upstreamResponseError(ProtocolResponses, path+".arguments", "function_call arguments are required")
+			}
+		case "function_call_output":
+			if !nonNullJSON(item.Output) {
+				return upstreamResponseError(ProtocolResponses, path+".output", "function_call_output output is required")
+			}
+		}
 	}
 	return validateResponsesItems(source.Output, "$.output")
 }

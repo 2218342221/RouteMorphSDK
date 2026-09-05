@@ -13,12 +13,16 @@ type messagesToResponsesConverter struct {
 func (c *messagesToResponsesConverter) Specification() routeSpec { return c.spec }
 
 func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
 	var source messagesRequest
 	if err := decodeJSON(ProtocolMessages, input, &source); err != nil {
 		return conversionResult{}, err
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(input, &envelope); err != nil || !jsonValuePresent(envelope["max_tokens"]) {
+		return conversionResult{}, invalid(ProtocolMessages, "$.max_tokens", "max_tokens is required")
 	}
 	if source.Model == "" || len(source.Messages) == 0 {
 		return conversionResult{}, invalid(ProtocolMessages, "$", "model and messages are required")
@@ -29,8 +33,18 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 	if source.MaxTokens < 0 {
 		return conversionResult{}, invalid(ProtocolMessages, "$.max_tokens", "must not be negative")
 	}
-	if len(source.Container) > 0 && string(source.Container) != "null" {
+	if messagesRawNonNull(source.Container) {
 		return conversionResult{}, unsupported(ProtocolMessages, "$.container", "container state requires a native Messages provider")
+	}
+	for path, present := range map[string]bool{
+		"$.top_k":         source.TopK != nil,
+		"$.cache_control": jsonValuePresent(source.CacheControl),
+		"$.inference_geo": source.InferenceGeo != "",
+		"$.service_tier":  source.ServiceTier != "",
+	} {
+		if present {
+			return conversionResult{}, unsupported(ProtocolMessages, path, "field has no semantically equivalent Responses control")
+		}
 	}
 	if source.Thinking != nil && source.Thinking.Type != "disabled" && options.LossPolicy == rejectSemanticLoss {
 		return conversionResult{}, unsupported(ProtocolMessages, "$.thinking", "Messages thinking configuration is not semantically equivalent to Responses reasoning")
@@ -50,7 +64,13 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		Temperature:     source.Temperature,
 		TopP:            source.TopP,
 		Stream:          resolveExchangeStream(source.Stream, options.Exchange),
-		Metadata:        source.Metadata,
+	}
+	safetyID, err := messagesSafetyIdentifier(source.Metadata, "$.metadata")
+	if err != nil {
+		return conversionResult{}, err
+	}
+	if safetyID != "" {
+		target.SafetyIdentifier = mustJSON(safetyID)
 	}
 	if options.Exchange.UpstreamModel != "" {
 		target.Model = options.Exchange.UpstreamModel
@@ -100,11 +120,24 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 	}
 	target.ParallelToolCalls = parallelToolCalls
 	for index, tool := range source.Tools {
+		path := fmt.Sprintf("$.tools[%d]", index)
 		if len(tool.CacheControl) > 0 && string(tool.CacheControl) != "null" {
-			return conversionResult{}, unsupported(ProtocolMessages, fmt.Sprintf("$.tools[%d].cache_control", index), "tool cache control has no portable equivalent")
+			return conversionResult{}, unsupported(ProtocolMessages, path+".cache_control", "tool cache control has no portable equivalent")
+		}
+		if tool.EagerInputStreaming != nil {
+			return conversionResult{}, unsupported(ProtocolMessages, path+".eager_input_streaming", "Responses has no equivalent eager input-streaming control")
+		}
+		if tool.DeferLoading != nil {
+			return conversionResult{}, unsupported(ProtocolMessages, path+".defer_loading", "deferred loading requires protocol-specific tool-search semantics")
+		}
+		if len(tool.AllowedCallers) > 0 && (len(tool.AllowedCallers) != 1 || tool.AllowedCallers[0] != "direct") {
+			return conversionResult{}, unsupported(ProtocolMessages, path+".allowed_callers", "only the direct caller constraint is portable to Responses")
+		}
+		if jsonValuePresent(tool.InputExamples) {
+			return conversionResult{}, unsupported(ProtocolMessages, path+".input_examples", "Responses function tools have no equivalent input examples field")
 		}
 		if tool.Type != "" && tool.Type != "custom" {
-			return conversionResult{}, unsupported(ProtocolMessages, fmt.Sprintf("$.tools[%d].type", index), "server tool %q requires a native Messages provider", tool.Type)
+			return conversionResult{}, unsupported(ProtocolMessages, path+".type", "server tool %q requires a native Messages provider", tool.Type)
 		}
 		if tool.Name == "" {
 			return conversionResult{}, invalid(ProtocolMessages, fmt.Sprintf("$.tools[%d].name", index), "name is required")
@@ -113,7 +146,7 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		if err != nil {
 			return conversionResult{}, err
 		}
-		target.Tools = append(target.Tools, responsesTool{Type: "function", Name: tool.Name, Description: tool.Description, Parameters: schema, Strict: tool.Strict})
+		target.Tools = append(target.Tools, responsesTool{Type: "function", Name: tool.Name, Description: tool.Description, Parameters: schema, Strict: tool.Strict, AllowedCallers: append([]string(nil), tool.AllowedCallers...)})
 	}
 	if len(source.System) > 0 && string(source.System) != "null" {
 		parts, err := decodeMessagesContent(source.System, "$.system")
@@ -131,9 +164,11 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		target.Instructions = json.RawMessage(mustJSONString(instructionText))
 	}
 	items := make([]responsesItem, 0, len(source.Messages))
+	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
 	for messageIndex, message := range source.Messages {
-		if message.Role != "user" && message.Role != "assistant" {
-			return conversionResult{}, invalid(ProtocolMessages, fmt.Sprintf("$.messages[%d].role", messageIndex), "role must be user or assistant")
+		if message.Role != "user" && message.Role != "assistant" && message.Role != "system" {
+			return conversionResult{}, invalid(ProtocolMessages, fmt.Sprintf("$.messages[%d].role", messageIndex), "role must be user, assistant, or system")
 		}
 		if len(message.Content) == 0 || string(message.Content) == "null" {
 			return conversionResult{}, invalid(ProtocolMessages, fmt.Sprintf("$.messages[%d].content", messageIndex), "content is required")
@@ -155,7 +190,11 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 			if err != nil {
 				return err
 			}
-			items = append(items, responsesItem{Type: "message", Role: message.Role, Content: mustJSON(content)})
+			role := message.Role
+			if role == "system" {
+				role = "developer"
+			}
+			items = append(items, responsesItem{Type: "message", Role: role, Content: mustJSON(content)})
 			ordinary = nil
 			return nil
 		}
@@ -181,11 +220,15 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 				if block.ID == "" || block.Name == "" {
 					return conversionResult{}, invalid(ProtocolMessages, path, "tool_use requires id and name")
 				}
+				if _, duplicate := callNames[block.ID]; duplicate {
+					return conversionResult{}, invalid(ProtocolMessages, path+".id", "duplicate tool_use id %q", block.ID)
+				}
 				arguments, err := normalizeArguments(ProtocolMessages, path+".input", block.Input)
 				if err != nil {
 					return conversionResult{}, err
 				}
-				items = append(items, responsesItem{Type: "function_call", CallID: block.ID, Name: block.Name, Arguments: json.RawMessage(mustJSONString(string(arguments)))})
+				callNames[block.ID] = block.Name
+				items = append(items, responsesItem{Type: "function_call", CallID: block.ID, Name: block.Name, Arguments: json.RawMessage(mustJSONString(string(arguments))), Caller: append(json.RawMessage(nil), block.Caller...)})
 			case "tool_result":
 				if message.Role != "user" {
 					return conversionResult{}, invalid(ProtocolMessages, path, "tool_result blocks require the user role")
@@ -196,6 +239,13 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 				if block.ToolUseID == "" {
 					return conversionResult{}, invalid(ProtocolMessages, path+".tool_use_id", "tool_use_id is required")
 				}
+				if _, found := callNames[block.ToolUseID]; !found {
+					return conversionResult{}, invalid(ProtocolMessages, path+".tool_use_id", "tool_result references unknown call %q", block.ToolUseID)
+				}
+				if consumedCallIDs[block.ToolUseID] {
+					return conversionResult{}, invalid(ProtocolMessages, path+".tool_use_id", "tool call %q already has an output", block.ToolUseID)
+				}
+				consumedCallIDs[block.ToolUseID] = true
 				if block.IsError {
 					return conversionResult{}, unsupported(ProtocolMessages, path+".is_error", "Responses function_call_output cannot preserve the tool error flag")
 				}
@@ -235,13 +285,17 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 	if err := validateResponsesTerminal(source); err != nil {
 		return conversionResult{}, err
 	}
+	diagnostics, err := responsesResponseExtensionDiagnostics(source, options.LossPolicy, "$")
+	if err != nil {
+		return conversionResult{}, err
+	}
 	var target messagesResponse
 	target.ID, target.Type, target.Role, target.Model = source.ID, "message", "assistant", source.Model
 	if options.Exchange.ClientModel != "" {
 		target.Model = options.Exchange.ClientModel
 	}
 	var blocks []messagesBlock
-	diagnostics := responsesPhaseDiagnostics(source.Output, "$.output")
+	diagnostics = append(diagnostics, responsesPhaseDiagnostics(source.Output, "$.output")...)
 	for index, item := range source.Output {
 		path := fmt.Sprintf("$.output[%d]", index)
 		switch item.Type {
@@ -269,11 +323,14 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 				blocks = append(blocks, converted...)
 			}
 		case "function_call":
+			if item.Status != "completed" {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Messages cannot preserve function_call status %q", item.Status)
+			}
 			arguments, err := normalizeArguments(ProtocolResponses, path+".arguments", item.Arguments)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			blocks = append(blocks, messagesBlock{Type: "tool_use", ID: item.CallID, Name: item.Name, Input: arguments})
+			blocks = append(blocks, messagesBlock{Type: "tool_use", ID: item.CallID, Name: item.Name, Input: arguments, Caller: append(json.RawMessage(nil), item.Caller...)})
 			if item.ID != "" && item.ID != item.CallID {
 				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_item_id_not_representable", path+".id", "Messages preserves call_id as tool_use.id but has no separate output item id")
 			}
@@ -297,17 +354,21 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 			}
 		}
 	}
-	if source.Usage.InputTokens < source.Usage.InputTokenDetails.CachedTokens {
-		return conversionResult{}, upstreamResponseError(ProtocolResponses, "$.usage.input_tokens_details.cached_tokens", "cached tokens exceed input tokens")
+	cachedTokens := source.Usage.InputTokenDetails.CachedTokens
+	cacheWriteTokens := source.Usage.InputTokenDetails.CacheWriteTokens
+	if cachedTokens > source.Usage.InputTokens || cacheWriteTokens > source.Usage.InputTokens-cachedTokens {
+		return conversionResult{}, upstreamResponseError(ProtocolResponses, "$.usage.input_tokens_details", "cached and cache-write tokens exceed input tokens")
 	}
-	target.Usage.InputTokens = source.Usage.InputTokens - source.Usage.InputTokenDetails.CachedTokens
+	accountedCacheTokens := cachedTokens + cacheWriteTokens
+	target.Usage.InputTokens = source.Usage.InputTokens - accountedCacheTokens
 	target.Usage.OutputTokens = source.Usage.OutputTokens
 	target.Usage.CacheReadInputTokens = source.Usage.InputTokenDetails.CachedTokens
+	target.Usage.CacheCreationInputTokens = source.Usage.InputTokenDetails.CacheWriteTokens
+	if source.Usage.OutputTokenDetails.ReasoningTokens < 0 || source.Usage.OutputTokenDetails.ReasoningTokens > source.Usage.OutputTokens {
+		return conversionResult{}, upstreamResponseError(ProtocolResponses, "$.usage.output_tokens_details.reasoning_tokens", "must be between zero and output_tokens")
+	}
 	if source.Usage.OutputTokenDetails.ReasoningTokens > 0 {
-		if options.LossPolicy == rejectSemanticLoss {
-			return conversionResult{}, unsupported(ProtocolResponses, "$.usage.output_tokens_details.reasoning_tokens", "Messages usage has no reasoning-token field")
-		}
-		diagnostics = appendDiagnostic(diagnostics, "warning", "reasoning_usage_not_representable", "$.usage.output_tokens_details.reasoning_tokens", "reasoning-token usage was omitted")
+		target.Usage.OutputTokensDetails = &messagesOutputTokensDetails{ThinkingTokens: source.Usage.OutputTokenDetails.ReasoningTokens}
 	}
 	body, err := marshal(ProtocolMessages, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
@@ -325,5 +386,6 @@ func (c *messagesToResponsesConverter) NewClientStream(_ context.Context, option
 		toolArgs:       make(map[string]string),
 		toolIdentities: make(map[string]streamToolIdentity),
 		completedItems: make(map[string]bool),
+		reportedLosses: make(map[string]bool),
 	}, nil
 }

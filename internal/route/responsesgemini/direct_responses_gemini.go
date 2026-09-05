@@ -114,11 +114,20 @@ func (c *responsesToGeminiConverter) ToUpstreamRequest(_ context.Context, input 
 				}
 				diagnostics = appendDiagnostic(diagnostics, "warning", "function_strict_not_representable", fmt.Sprintf("$.tools[%d].strict", index), "Responses strict tool mode was omitted")
 			}
-			parameters, err := normalizeGeminiSchema(function.Parameters)
+			parameters, err := normalizeGeminiFunctionSchema(ProtocolResponses, fmt.Sprintf("$.tools[%d].parameters", index), function.Parameters)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			tool.FunctionDeclarations = append(tool.FunctionDeclarations, geminiFunctionDeclaration{Name: function.Name, Description: function.Description, Parameters: parameters})
+			outputSchema, err := normalizeGeminiJSONSchema(ProtocolResponses, fmt.Sprintf("$.tools[%d].output_schema", index), function.OutputSchema)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			tool.FunctionDeclarations = append(tool.FunctionDeclarations, geminiFunctionDeclaration{
+				Name:                 function.Name,
+				Description:          function.Description,
+				ParametersJSONSchema: parameters,
+				ResponseJSONSchema:   outputSchema,
+			})
 		}
 		target.Tools = []geminiTool{tool}
 	}
@@ -145,6 +154,8 @@ func (c *responsesToGeminiConverter) ToUpstreamRequest(_ context.Context, input 
 		return conversionResult{}, err
 	}
 	callNames := make(map[string]string)
+	callIDsByName := make(map[string][]string)
+	consumedCallIDs := make(map[string]bool)
 	for index, item := range items {
 		path := fmt.Sprintf("$.input[%d]", index)
 		switch item.Type {
@@ -152,6 +163,13 @@ func (c *responsesToGeminiConverter) ToUpstreamRequest(_ context.Context, input 
 			parts, err := decodeResponsesContentRaw(item.Content, path+".content", true)
 			if err != nil {
 				return conversionResult{}, err
+			}
+			if item.Role == "system" || item.Role == "developer" {
+				for partIndex, part := range parts {
+					if part.Kind != partText {
+						return conversionResult{}, unsupported(ProtocolResponses, fmt.Sprintf("%s.content[%d]", path, partIndex), "Gemini systemInstruction supports text only")
+					}
+				}
 			}
 			converted, err := encodeGeminiParts(parts)
 			if err != nil {
@@ -185,15 +203,37 @@ func (c *responsesToGeminiConverter) ToUpstreamRequest(_ context.Context, input 
 				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "duplicate call_id %q", item.CallID)
 			}
 			callNames[item.CallID] = item.Name
-			appendGeminiContent(&target, "model", geminiPart{FunctionCall: &geminiFunctionCall{ID: item.CallID, Name: item.Name, Args: arguments}, ThoughtSignature: geminiThoughtSignatureBypass})
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", path, "a Gemini-compatible thought signature bypass was attached to the converted function call")
+			callIDsByName[item.Name] = append(callIDsByName[item.Name], item.CallID)
+			appendGeminiContent(&target, "model", geminiPart{FunctionCall: &geminiFunctionCall{ID: item.CallID, Name: item.Name, Args: arguments}})
+			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", path, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 		case "function_call_output":
-			name := callNames[item.CallID]
+			callID := item.CallID
+			if callID == "" && item.Name != "" {
+				for _, candidate := range callIDsByName[item.Name] {
+					if !consumedCallIDs[candidate] {
+						if callID != "" {
+							return conversionResult{}, unsupported(ProtocolResponses, path+".name", "multiple pending calls named %q make the output ambiguous without call_id", item.Name)
+						}
+						callID = candidate
+					}
+				}
+			}
+			name := callNames[callID]
 			if name == "" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".call_id", "Gemini functionResponse requires the corresponding function name")
 			}
+			if item.Name != "" && item.Name != name {
+				return conversionResult{}, invalid(ProtocolResponses, path+".name", "function output name %q does not match call name %q", item.Name, name)
+			}
+			if consumedCallIDs[callID] {
+				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "function call %q already has an output", callID)
+			}
+			consumedCallIDs[callID] = true
 			if !jsonValuePresent(item.Output) {
 				return conversionResult{}, invalid(ProtocolResponses, path+".output", "output is required")
+			}
+			if trimmed := bytes.TrimSpace(item.Output); len(trimmed) > 0 && trimmed[0] == '[' {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".output", "Responses multimodal function output lists require Gemini functionResponse.parts mapping")
 			}
 			var value any
 			text := rawString(item.Output)
@@ -204,7 +244,7 @@ func (c *responsesToGeminiConverter) ToUpstreamRequest(_ context.Context, input 
 			if !ok {
 				object = map[string]any{"output": value}
 			}
-			appendGeminiContent(&target, "user", geminiPart{FunctionResponse: &geminiFunctionResponse{ID: item.CallID, Name: name, Response: mustJSON(object)}})
+			appendGeminiContent(&target, "user", geminiPart{FunctionResponse: &geminiFunctionResponse{ID: callID, Name: name, Response: mustJSON(object)}})
 		case "reasoning":
 			return conversionResult{}, unsupported(ProtocolResponses, path, "reasoning items cannot be injected as signed Gemini thoughts")
 		default:
@@ -266,10 +306,7 @@ func (c *responsesToGeminiConverter) ToClientResponse(_ context.Context, input [
 				return conversionResult{}, err
 			}
 			if part.ThoughtSignature != "" {
-				if options.LossPolicy == rejectSemanticLoss {
-					return conversionResult{}, unsupported(ProtocolGenerateContent, path+".thoughtSignature", "Gemini function-call signatures cannot be represented by Responses")
-				}
-				diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_not_representable", path+".thoughtSignature", "Gemini function-call signature was omitted")
+				return conversionResult{}, unsupported(ProtocolGenerateContent, path+".thoughtSignature", "provider-issued Gemini function-call signatures cannot be represented by Responses and must not be dropped")
 			}
 			arguments, err := normalizeGeminiToolArguments(ProtocolGenerateContent, path+".functionCall.args", part.FunctionCall.Args)
 			if err != nil {
@@ -285,11 +322,14 @@ func (c *responsesToGeminiConverter) ToClientResponse(_ context.Context, input [
 			if err := flushMessage(); err != nil {
 				return conversionResult{}, err
 			}
+			if part.ThoughtSignature != "" {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, path+".thoughtSignature", "provider-issued Gemini thought signatures cannot be represented by Responses and must not be dropped")
+			}
 			if options.LossPolicy == rejectSemanticLoss {
 				return conversionResult{}, unsupported(ProtocolGenerateContent, path, "signed Gemini thought cannot be represented losslessly as Responses reasoning")
 			}
 			target.Output = append(target.Output, responsesItem{Type: "reasoning", ID: fmt.Sprintf("rs_%d", index), Summary: mustJSON([]responsesContentPart{{Type: "summary_text", Text: part.Text}}), Status: "completed"})
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_approximated", path, "Gemini thought text was emitted as a Responses reasoning summary; its signature was omitted")
+			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_approximated", path, "unsigned Gemini thought text was emitted as a Responses reasoning summary")
 		case part.FunctionResponse != nil:
 			return conversionResult{}, unsupported(ProtocolGenerateContent, path, "functionResponse is not a valid model output item")
 		default:
@@ -446,13 +486,10 @@ func (c *geminiToResponsesStreamConverter) Convert(ctx context.Context, frame st
 				frames = append(frames, c.startMessage()...)
 			}
 			c.messageText += part.Text
-			frames = append(frames, c.event("response.output_text.delta", map[string]any{"item_id": c.messageID, "output_index": c.messageOutputIndex, "content_index": 0, "delta": part.Text}))
+			frames = append(frames, c.event("response.output_text.delta", map[string]any{"item_id": c.messageID, "output_index": c.messageOutputIndex, "content_index": 0, "delta": part.Text, "logprobs": []any{}}))
 		case part.FunctionCall != nil:
 			if part.ThoughtSignature != "" {
-				if c.LossPolicy == rejectSemanticLoss {
-					return nil, diagnostics, unsupported(ProtocolGenerateContent, path+".thoughtSignature", "Gemini function-call signatures cannot be represented by Responses")
-				}
-				diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_not_representable", path+".thoughtSignature", "Gemini function-call signature was omitted")
+				return nil, diagnostics, unsupported(ProtocolGenerateContent, path+".thoughtSignature", "provider-issued Gemini function-call signatures cannot be represented by Responses and must not be dropped")
 			}
 			arguments, err := normalizeGeminiToolArguments(ProtocolGenerateContent, path+".functionCall.args", part.FunctionCall.Args)
 			if err != nil {
@@ -473,7 +510,7 @@ func (c *geminiToResponsesStreamConverter) Convert(ctx context.Context, frame st
 			frames = append(frames,
 				c.event("response.output_item.added", map[string]any{"output_index": outputIndex, "item": map[string]any{"id": item.ID, "type": item.Type, "call_id": item.CallID, "name": item.Name, "arguments": "", "status": "in_progress"}}),
 				c.event("response.function_call_arguments.delta", map[string]any{"item_id": item.ID, "output_index": outputIndex, "delta": string(arguments)}),
-				c.event("response.function_call_arguments.done", map[string]any{"item_id": item.ID, "output_index": outputIndex, "arguments": string(arguments)}),
+				c.event("response.function_call_arguments.done", map[string]any{"item_id": item.ID, "output_index": outputIndex, "name": item.Name, "arguments": string(arguments)}),
 				c.event("response.output_item.done", map[string]any{"output_index": outputIndex, "item": item}),
 			)
 			c.output = append(c.output, item)
@@ -573,7 +610,7 @@ func (c *geminiToResponsesStreamConverter) finishMessage() []streamFrame {
 	c.messageID = ""
 	c.messageText = ""
 	return []streamFrame{
-		c.event("response.output_text.done", map[string]any{"item_id": item.ID, "output_index": outputIndex, "content_index": 0, "text": content[0].Text}),
+		c.event("response.output_text.done", map[string]any{"item_id": item.ID, "output_index": outputIndex, "content_index": 0, "text": content[0].Text, "logprobs": []any{}}),
 		c.event("response.content_part.done", map[string]any{"item_id": item.ID, "output_index": outputIndex, "content_index": 0, "part": content[0]}),
 		c.event("response.output_item.done", map[string]any{"output_index": outputIndex, "item": item}),
 	}

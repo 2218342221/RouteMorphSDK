@@ -99,26 +99,32 @@ type nativeMessagesStartMessage struct {
 	Role         string               `json:"role"`
 	Model        string               `json:"model"`
 	Content      *[]json.RawMessage   `json:"content"`
+	Container    json.RawMessage      `json:"container"`
 	StopReason   json.RawMessage      `json:"stop_reason"`
 	StopSequence json.RawMessage      `json:"stop_sequence"`
+	StopDetails  json.RawMessage      `json:"stop_details"`
 	Usage        *nativeMessagesUsage `json:"usage"`
 }
 
 type nativeMessagesContentBlock struct {
-	Type        string            `json:"type"`
-	Text        json.RawMessage   `json:"text"`
-	Thinking    json.RawMessage   `json:"thinking"`
-	Signature   json.RawMessage   `json:"signature"`
-	Data        json.RawMessage   `json:"data"`
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Input       json.RawMessage   `json:"input"`
-	ToolUseID   string            `json:"tool_use_id"`
-	Content     json.RawMessage   `json:"content"`
-	IsError     bool              `json:"is_error"`
-	Citations   []json.RawMessage `json:"citations"`
-	Caller      json.RawMessage   `json:"caller"`
-	ToolsetName string            `json:"toolset_name"`
+	Type            string            `json:"type"`
+	Text            json.RawMessage   `json:"text"`
+	Thinking        json.RawMessage   `json:"thinking"`
+	Signature       json.RawMessage   `json:"signature"`
+	Data            json.RawMessage   `json:"data"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Input           json.RawMessage   `json:"input"`
+	ToolUseID       string            `json:"tool_use_id"`
+	Content         json.RawMessage   `json:"content"`
+	IsError         bool              `json:"is_error"`
+	Citations       []json.RawMessage `json:"citations"`
+	Caller          json.RawMessage   `json:"caller"`
+	ToolsetName     string            `json:"toolset_name"`
+	Title           json.RawMessage   `json:"title"`
+	Context         json.RawMessage   `json:"context"`
+	Source          json.RawMessage   `json:"source"`
+	Transformations json.RawMessage   `json:"transformations"`
 }
 
 type nativeMessagesDelta struct {
@@ -130,6 +136,8 @@ type nativeMessagesDelta struct {
 	StopReason   json.RawMessage `json:"stop_reason"`
 	StopSequence json.RawMessage `json:"stop_sequence"`
 	Citation     json.RawMessage `json:"citation"`
+	Container    json.RawMessage `json:"container"`
+	StopDetails  json.RawMessage `json:"stop_details"`
 }
 
 type nativeMessagesUsage struct {
@@ -137,7 +145,11 @@ type nativeMessagesUsage struct {
 	OutputTokens             json.RawMessage `json:"output_tokens"`
 	CacheCreationInputTokens json.RawMessage `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     json.RawMessage `json:"cache_read_input_tokens"`
+	CacheCreation            json.RawMessage `json:"cache_creation"`
+	InferenceGeo             json.RawMessage `json:"inference_geo"`
+	OutputTokensDetails      json.RawMessage `json:"output_tokens_details"`
 	ServerToolUse            json.RawMessage `json:"server_tool_use"`
+	ServiceTier              json.RawMessage `json:"service_tier"`
 }
 
 type nativeMessagesError struct {
@@ -159,10 +171,12 @@ type nativeResponsesEvent struct {
 	OutputIndex    *int            `json:"output_index"`
 	ContentIndex   *int            `json:"content_index"`
 	SummaryIndex   *int            `json:"summary_index"`
+	CommandIndex   *int            `json:"command_index"`
 	Delta          json.RawMessage `json:"delta"`
 	Text           json.RawMessage `json:"text"`
 	Refusal        json.RawMessage `json:"refusal"`
 	Arguments      json.RawMessage `json:"arguments"`
+	Input          json.RawMessage `json:"input"`
 	Response       json.RawMessage `json:"response"`
 	Item           json.RawMessage `json:"item"`
 	Part           json.RawMessage `json:"part"`
@@ -208,9 +222,15 @@ type nativeResponsesItem struct {
 	ID               string                        `json:"id"`
 	CallID           string                        `json:"call_id"`
 	Name             string                        `json:"name"`
-	Arguments        *string                       `json:"arguments"`
+	Arguments        json.RawMessage               `json:"arguments"`
+	Input            json.RawMessage               `json:"input"`
+	Output           json.RawMessage               `json:"output"`
+	Caller           json.RawMessage               `json:"caller"`
+	Action           json.RawMessage               `json:"action"`
+	Tools            json.RawMessage               `json:"tools"`
 	Summary          []*nativeResponsesContentPart `json:"summary"`
 	Status           string                        `json:"status"`
+	Async            *bool                         `json:"async"`
 	Phase            string                        `json:"phase"`
 	EncryptedContent string                        `json:"encrypted_content"`
 }
@@ -374,6 +394,17 @@ func validateOptionalJSONObject(protocol core.Protocol, path string, raw json.Ra
 	return nil
 }
 
+func validateOptionalNullableObject(protocol core.Protocol, path string, raw json.RawMessage) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if !rawJSONObject(trimmed) {
+		return core.Invalid(protocol, path, "must be an object or null")
+	}
+	return nil
+}
+
 func validateMessagesBlockPayload(protocol core.Protocol, block *nativeMessagesContentBlock) error {
 	validateString := func(path string, raw json.RawMessage, required bool) error {
 		if !required && len(bytes.TrimSpace(raw)) == 0 {
@@ -381,6 +412,19 @@ func validateMessagesBlockPayload(protocol core.Protocol, block *nativeMessagesC
 		}
 		_, err := requireJSONString(protocol, path, raw)
 		return err
+	}
+	for path, raw := range map[string]json.RawMessage{
+		"$.content_block.title": block.Title, "$.content_block.context": block.Context,
+	} {
+		if err := validateString(path, raw, false); err != nil {
+			return err
+		}
+	}
+	if rawJSONPresent(block.Source) && !rawJSONObject(block.Source) {
+		return core.Invalid(protocol, "$.content_block.source", "must be an object")
+	}
+	if rawJSONPresent(block.Transformations) && !rawJSONArray(block.Transformations) {
+		return core.Invalid(protocol, "$.content_block.transformations", "must be an array")
 	}
 	switch block.Type {
 	case "text":
@@ -452,8 +496,52 @@ func validateMessagesUsage(protocol core.Protocol, path string, usage *nativeMes
 			return core.UpstreamResponseError(protocol, path+"."+field, "token count must not be negative")
 		}
 	}
-	if len(bytes.TrimSpace(usage.ServerToolUse)) > 0 && !rawJSONObject(usage.ServerToolUse) {
-		return core.Invalid(protocol, path+".server_tool_use", "must be an object")
+	for field, raw := range map[string]json.RawMessage{
+		"cache_creation": usage.CacheCreation, "output_tokens_details": usage.OutputTokensDetails,
+		"server_tool_use": usage.ServerToolUse,
+	} {
+		if len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) && !rawJSONObject(raw) {
+			return core.Invalid(protocol, path+"."+field, "must be an object or null")
+		}
+	}
+	for field, raw := range map[string]json.RawMessage{
+		"inference_geo": usage.InferenceGeo, "service_tier": usage.ServiceTier,
+	} {
+		if len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			if _, err := requireJSONString(protocol, path+"."+field, raw); err != nil {
+				return err
+			}
+		}
+	}
+	for field, raw := range map[string]json.RawMessage{
+		"cache_creation": usage.CacheCreation, "output_tokens_details": usage.OutputTokensDetails,
+		"server_tool_use": usage.ServerToolUse,
+	} {
+		if !rawJSONObject(raw) {
+			continue
+		}
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &values); err != nil {
+			return core.Invalid(protocol, path+"."+field, "must be an object")
+		}
+		for name, valueRaw := range values {
+			var known bool
+			switch field {
+			case "cache_creation":
+				known = name == "ephemeral_1h_input_tokens" || name == "ephemeral_5m_input_tokens"
+			case "output_tokens_details":
+				known = name == "thinking_tokens"
+			case "server_tool_use":
+				known = name == "web_search_requests" || name == "web_fetch_requests"
+			}
+			if !known {
+				continue
+			}
+			var count int64
+			if json.Unmarshal(valueRaw, &count) != nil || count < 0 {
+				return core.Invalid(protocol, path+"."+field+"."+name, "must be a non-negative integer")
+			}
+		}
 	}
 	return nil
 }
@@ -474,13 +562,16 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 			}
 		}
 	}
-	for _, field := range []string{"sequence_number", "output_index", "content_index", "summary_index"} {
+	for _, field := range []string{"sequence_number", "output_index", "content_index", "summary_index", "command_index", "partial_image_index", "annotation_index"} {
 		if raw, exists := fields[field]; exists {
 			var value int64
 			if !rawJSONPresent(raw) || json.Unmarshal(raw, &value) != nil || value < 0 {
 				return core.Invalid(core.ProtocolResponses, "$."+field, "must be a non-negative integer")
 			}
 		}
+	}
+	if err := validateRequiredResponsesEventFields(eventType, fields); err != nil {
+		return err
 	}
 	switch eventType {
 	case "response.created", "response.completed", "response.incomplete", "response.failed", "response.cancelled":
@@ -491,13 +582,11 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 			return err
 		}
 	case "response.queued", "response.in_progress":
-		if rawJSONPresent(event.Response) {
-			if !rawJSONObject(event.Response) {
-				return core.Invalid(core.ProtocolResponses, "$.response", "response must be an object")
-			}
-			if err := validateKnownResponsesResponse(event.Response); err != nil {
-				return err
-			}
+		if !rawJSONObject(event.Response) {
+			return core.Invalid(core.ProtocolResponses, "$.response", "response must be an object")
+		}
+		if err := validateKnownResponsesResponse(event.Response); err != nil {
+			return err
 		}
 	case "response.output_item.added", "response.output_item.done":
 		if !rawJSONObject(event.Item) {
@@ -513,11 +602,26 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 		if err := validateKnownResponsesPart(event.Part); err != nil {
 			return err
 		}
-	case "response.output_text.delta", "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta":
+	case "response.output_text.delta":
 		if _, err := requireJSONString(core.ProtocolResponses, "$.delta", event.Delta); err != nil {
 			return err
 		}
-	case "response.output_text.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		if err := requireResponsesEventArray(fields, "logprobs"); err != nil {
+			return err
+		}
+	case "response.refusal.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta",
+		"response.audio.delta", "response.audio.transcript.delta", "response.code_interpreter_call_code.delta", "response.mcp_call_arguments.delta", "response.shell_call_command.delta":
+		if _, err := requireJSONString(core.ProtocolResponses, "$.delta", event.Delta); err != nil {
+			return err
+		}
+	case "response.output_text.done":
+		if _, err := requireJSONString(core.ProtocolResponses, "$.text", event.Text); err != nil {
+			return err
+		}
+		if err := requireResponsesEventArray(fields, "logprobs"); err != nil {
+			return err
+		}
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done":
 		if _, err := requireJSONString(core.ProtocolResponses, "$.text", event.Text); err != nil {
 			return err
 		}
@@ -529,7 +633,51 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 		if _, err := requireJSONString(core.ProtocolResponses, "$.arguments", event.Arguments); err != nil {
 			return err
 		}
+		if err := requireResponsesEventString(fields, "name", true); err != nil {
+			return err
+		}
+	case "response.custom_tool_call_input.done":
+		if _, err := requireJSONString(core.ProtocolResponses, "$.input", event.Input); err != nil {
+			return err
+		}
+	case "response.code_interpreter_call_code.done":
+		if err := requireResponsesEventString(fields, "code", false); err != nil {
+			return err
+		}
+	case "response.mcp_call_arguments.done":
+		if err := requireResponsesEventString(fields, "arguments", false); err != nil {
+			return err
+		}
+	case "response.shell_call_command.added", "response.shell_call_command.done":
+		if err := requireResponsesEventString(fields, "command", false); err != nil {
+			return err
+		}
+	case "response.shell_call_output_content.delta":
+		if err := requireResponsesEventObject(fields, "delta"); err != nil {
+			return err
+		}
+	case "response.shell_call_output_content.done":
+		if err := requireResponsesEventArray(fields, "output"); err != nil {
+			return err
+		}
+	case "response.image_generation_call.partial_image":
+		if err := requireResponsesEventString(fields, "partial_image_b64", false); err != nil {
+			return err
+		}
+	case "response.output_text.annotation.added":
+		if err := requireResponsesEventObject(fields, "annotation"); err != nil {
+			return err
+		}
+	case "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed":
+		if event.ItemID == "" {
+			return core.Invalid(core.ProtocolResponses, "$.item_id", "item id is required")
+		}
 	case "error":
+		for _, field := range []string{"code", "message", "param"} {
+			if err := requireResponsesEventString(fields, field, false); err != nil {
+				return err
+			}
+		}
 		if rawJSONPresent(event.Error) {
 			if !rawJSONObject(event.Error) {
 				return core.Invalid(core.ProtocolResponses, "$.error", "error must be an object")
@@ -539,6 +687,123 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+type nativeResponsesEventRequirements uint16
+
+const (
+	nativeResponsesRequireSequence nativeResponsesEventRequirements = 1 << iota
+	nativeResponsesRequireItemID
+	nativeResponsesRequireOutputIndex
+	nativeResponsesRequireContentIndex
+	nativeResponsesRequireSummaryIndex
+	nativeResponsesRequireCommandIndex
+	nativeResponsesRequirePartialImageIndex
+	nativeResponsesRequireAnnotationIndex
+)
+
+func knownResponsesEventRequirements(eventType string) (nativeResponsesEventRequirements, bool) {
+	const sequence = nativeResponsesRequireSequence
+	const itemOutput = sequence | nativeResponsesRequireItemID | nativeResponsesRequireOutputIndex
+	switch eventType {
+	case "response.audio.delta", "response.audio.done", "response.audio.transcript.delta", "response.audio.transcript.done",
+		"response.created", "response.queued", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.cancelled", "error":
+		return sequence, true
+	case "response.output_item.added", "response.output_item.done":
+		return sequence | nativeResponsesRequireOutputIndex, true
+	case "response.content_part.added", "response.content_part.done":
+		return itemOutput | nativeResponsesRequireContentIndex, true
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done":
+		return itemOutput | nativeResponsesRequireSummaryIndex, true
+	case "response.output_text.delta", "response.output_text.done", "response.refusal.delta", "response.refusal.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done":
+		return itemOutput | nativeResponsesRequireContentIndex, true
+	case "response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+		"response.code_interpreter_call_code.delta", "response.code_interpreter_call_code.done",
+		"response.code_interpreter_call.in_progress", "response.code_interpreter_call.interpreting", "response.code_interpreter_call.completed",
+		"response.file_search_call.in_progress", "response.file_search_call.searching", "response.file_search_call.completed",
+		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed",
+		"response.image_generation_call.in_progress", "response.image_generation_call.generating", "response.image_generation_call.completed",
+		"response.mcp_call_arguments.delta", "response.mcp_call_arguments.done",
+		"response.mcp_call.in_progress", "response.mcp_call.completed", "response.mcp_call.failed",
+		"response.mcp_list_tools.in_progress", "response.mcp_list_tools.completed", "response.mcp_list_tools.failed":
+		return itemOutput, true
+	case "response.image_generation_call.partial_image":
+		return itemOutput | nativeResponsesRequirePartialImageIndex, true
+	case "response.shell_call_command.added", "response.shell_call_command.delta", "response.shell_call_command.done":
+		return sequence | nativeResponsesRequireOutputIndex | nativeResponsesRequireCommandIndex, true
+	case "response.shell_call_output_content.delta", "response.shell_call_output_content.done":
+		return itemOutput | nativeResponsesRequireCommandIndex, true
+	case "response.output_text.annotation.added":
+		return itemOutput | nativeResponsesRequireContentIndex | nativeResponsesRequireAnnotationIndex, true
+	default:
+		return 0, false
+	}
+}
+
+func validateRequiredResponsesEventFields(eventType string, fields map[string]json.RawMessage) error {
+	requirements, known := knownResponsesEventRequirements(eventType)
+	if !known {
+		return nil
+	}
+	for _, field := range []struct {
+		name string
+		flag nativeResponsesEventRequirements
+	}{
+		{"sequence_number", nativeResponsesRequireSequence},
+		{"output_index", nativeResponsesRequireOutputIndex},
+		{"content_index", nativeResponsesRequireContentIndex},
+		{"summary_index", nativeResponsesRequireSummaryIndex},
+		{"command_index", nativeResponsesRequireCommandIndex},
+		{"partial_image_index", nativeResponsesRequirePartialImageIndex},
+		{"annotation_index", nativeResponsesRequireAnnotationIndex},
+	} {
+		if requirements&field.flag == 0 {
+			continue
+		}
+		raw, exists := fields[field.name]
+		var value int64
+		if !exists || !rawJSONPresent(raw) || json.Unmarshal(raw, &value) != nil || value < 0 {
+			return core.Invalid(core.ProtocolResponses, "$."+field.name, "required non-negative integer is missing or invalid")
+		}
+	}
+	if requirements&nativeResponsesRequireItemID != 0 {
+		return requireResponsesEventString(fields, "item_id", true)
+	}
+	return nil
+}
+
+func requireResponsesEventString(fields map[string]json.RawMessage, field string, nonEmpty bool) error {
+	raw, exists := fields[field]
+	if !exists {
+		return core.Invalid(core.ProtocolResponses, "$."+field, "required string is missing")
+	}
+	value, err := requireJSONString(core.ProtocolResponses, "$."+field, raw)
+	if err != nil {
+		return err
+	}
+	if nonEmpty && value == "" {
+		return core.Invalid(core.ProtocolResponses, "$."+field, "must not be empty")
+	}
+	return nil
+}
+
+func requireResponsesEventArray(fields map[string]json.RawMessage, field string) error {
+	raw, exists := fields[field]
+	if !exists || !rawJSONArray(raw) {
+		return core.Invalid(core.ProtocolResponses, "$."+field, "required array is missing or invalid")
+	}
+	return nil
+}
+
+func requireResponsesEventObject(fields map[string]json.RawMessage, field string) error {
+	raw, exists := fields[field]
+	if !exists || !rawJSONObject(raw) {
+		return core.Invalid(core.ProtocolResponses, "$."+field, "required object is missing or invalid")
 	}
 	return nil
 }
@@ -631,7 +896,37 @@ func validateKnownResponsesItem(raw json.RawMessage) error {
 			}
 		}
 	}
-	return validateOptionalNullableString(core.ProtocolResponses, "$.item.arguments", object["arguments"])
+	switch item.Type {
+	case "function_call":
+		if err := validateOptionalNullableString(core.ProtocolResponses, "$.item.arguments", object["arguments"]); err != nil {
+			return err
+		}
+	case "custom_tool_call":
+		if _, exists := object["input"]; exists {
+			if _, err := requireJSONString(core.ProtocolResponses, "$.item.input", object["input"]); err != nil {
+				return err
+			}
+		}
+	case "tool_search_call":
+		// Tool-search arguments are arbitrary JSON rather than the JSON-encoded
+		// string used by function calls.
+	}
+	if value, exists := object["caller"]; exists && rawJSONPresent(value) && !rawJSONObject(value) {
+		return core.Invalid(core.ProtocolResponses, "$.item.caller", "must be an object or null")
+	}
+	if value, exists := object["action"]; exists && !rawJSONObject(value) {
+		return core.Invalid(core.ProtocolResponses, "$.item.action", "must be an object")
+	}
+	if value, exists := object["tools"]; exists && !rawJSONArray(value) {
+		return core.Invalid(core.ProtocolResponses, "$.item.tools", "must be an array")
+	}
+	if value, exists := object["output"]; exists && rawJSONPresent(value) {
+		trimmed := bytes.TrimSpace(value)
+		if len(trimmed) == 0 || (trimmed[0] != '"' && !rawJSONArray(value)) {
+			return core.Invalid(core.ProtocolResponses, "$.item.output", "must be a string or content array")
+		}
+	}
+	return nil
 }
 
 func validateKnownResponsesPart(raw json.RawMessage) error {

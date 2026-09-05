@@ -30,7 +30,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		"temperature", "top_p", "stop", "stream", "parallel_tool_calls", "response_format",
 		"reasoning_effort", "metadata", "n", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "verbosity", "user", "service_tier", "store",
-		"prompt_cache_key", "prompt_cache_retention", "safety_identifier", "stream_options"); err != nil {
+		"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "moderation", "stream_options"); err != nil {
 		return conversionResult{}, err
 	}
 	var source chatRequest
@@ -59,8 +59,10 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		"$.service_tier":           rawJSONValuePresent(source.ServiceTier),
 		"$.store":                  rawJSONValuePresent(source.Store),
 		"$.prompt_cache_key":       rawJSONValuePresent(source.PromptCacheKey),
+		"$.prompt_cache_options":   rawJSONValuePresent(source.PromptCacheOptions),
 		"$.prompt_cache_retention": rawJSONValuePresent(source.PromptCacheRetention),
 		"$.safety_identifier":      rawJSONValuePresent(source.SafetyIdentifier),
+		"$.moderation":             rawJSONValuePresent(source.Moderation),
 	} {
 		if present {
 			return conversionResult{}, unsupported(ProtocolChat, path, "field has no Gemini equivalent")
@@ -80,6 +82,9 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		return conversionResult{}, err
 	}
 	for index, message := range source.Messages {
+		if rawJSONValuePresent(message.Annotations) {
+			return conversionResult{}, unsupported(ProtocolChat, fmt.Sprintf("$.messages[%d].annotations", index), "message annotations have no Gemini equivalent")
+		}
 		if rawJSONValuePresent(message.Audio) {
 			return conversionResult{}, unsupported(ProtocolChat, fmt.Sprintf("$.messages[%d].audio", index), "Chat assistant audio cannot be represented by Gemini input")
 		}
@@ -169,12 +174,12 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			if err != nil {
 				return conversionResult{}, err
 			}
-			parameters, err = normalizeGeminiSchema(parameters)
+			parameters, err = normalizeGeminiFunctionSchema(ProtocolChat, path+".function.parameters", parameters)
 			if err != nil {
 				return conversionResult{}, err
 			}
 			tool.FunctionDeclarations = append(tool.FunctionDeclarations, geminiFunctionDeclaration{
-				Name: item.Function.Name, Description: item.Function.Description, Parameters: parameters,
+				Name: item.Function.Name, Description: item.Function.Description, ParametersJSONSchema: parameters,
 			})
 		}
 		target.Tools = []geminiTool{tool}
@@ -196,6 +201,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 	}
 
 	callNames := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
 	sawOrdinaryContent := false
 	for index, message := range source.Messages {
 		path := fmt.Sprintf("$.messages[%d]", index)
@@ -207,7 +213,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			if message.Name != "" || message.ToolCallID != "" || len(message.ToolCalls) > 0 || message.Refusal != "" || message.ReasoningContent != "" {
 				return conversionResult{}, unsupported(ProtocolChat, path, "system/developer message metadata has no Gemini equivalent")
 			}
-			parts, err := chatContentToGeminiParts(message.Content, path+".content")
+			parts, err := chatContentToGeminiParts(message.Content, path+".content", message.Role)
 			if err != nil {
 				return conversionResult{}, err
 			}
@@ -233,6 +239,10 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			if name == "" {
 				return conversionResult{}, unsupported(ProtocolChat, path+".name", "Gemini functionResponse requires the corresponding function name")
 			}
+			if consumedCallIDs[message.ToolCallID] {
+				return conversionResult{}, invalid(ProtocolChat, path+".tool_call_id", "tool call %q already has an output", message.ToolCallID)
+			}
+			consumedCallIDs[message.ToolCallID] = true
 			response, wrapped, err := chatToolResultToGemini(message.Content, path+".content")
 			if err != nil {
 				return conversionResult{}, err
@@ -257,15 +267,14 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			}
 			var parts []geminiPart
 			if message.ReasoningContent != "" {
-				parts = append(parts, geminiPart{Text: message.ReasoningContent, Thought: true, ThoughtSignature: geminiThoughtSignatureBypass})
-				diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", path+".reasoning_content", "a Gemini-compatible thought signature bypass was attached to converted reasoning")
+				parts = append(parts, geminiPart{Text: message.ReasoningContent, Thought: true})
+				diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", path+".reasoning_content", "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 			}
-			content, err := chatContentToGeminiParts(message.Content, path+".content")
+			content, err := chatContentToGeminiParts(message.Content, path+".content", message.Role)
 			if err != nil {
 				return conversionResult{}, err
 			}
 			parts = append(parts, content...)
-			signatureAttached := message.ReasoningContent != ""
 			for callIndex, call := range message.ToolCalls {
 				callPath := fmt.Sprintf("%s.tool_calls[%d]", path, callIndex)
 				if call.Type != "" && call.Type != "function" {
@@ -282,11 +291,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 					return conversionResult{}, err
 				}
 				part := geminiPart{FunctionCall: &geminiFunctionCall{ID: call.ID, Name: call.Function.Name, Args: arguments}}
-				if !signatureAttached {
-					part.ThoughtSignature = geminiThoughtSignatureBypass
-					signatureAttached = true
-					diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", callPath, "a Gemini-compatible thought signature bypass was attached to the converted function call")
-				}
+				diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", callPath, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 				parts = append(parts, part)
 				callNames[call.ID] = call.Function.Name
 			}
@@ -310,7 +315,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 }
 
 func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent", "model", "serviceTier", "store"); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateGeminiNestedFields(input); err != nil {
@@ -325,6 +330,15 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 	}
 	if source.CachedContent != "" {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.cachedContent", "cached content state requires a native Gemini provider")
+	}
+	if source.Model != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.model", "body model selection cannot be preserved when routing to Chat")
+	}
+	if source.ServiceTier != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.serviceTier", "Gemini service-tier semantics are provider specific")
+	}
+	if source.Store != nil {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.store", "Gemini logging policy has no exact Chat equivalent")
 	}
 	if jsonValuePresent(source.SafetySettings) && !bytes.Equal(bytes.TrimSpace(source.SafetySettings), []byte("[]")) {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.safetySettings", "provider safety policy has no Chat equivalent")
@@ -341,8 +355,16 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 	declaredTools := make(map[string]struct{})
 	for toolIndex, item := range source.Tools {
 		path := fmt.Sprintf("$.tools[%d]", toolIndex)
-		if jsonValuePresent(item.CodeExecution) || jsonValuePresent(item.GoogleSearch) || jsonValuePresent(item.GoogleSearchRetrieval) || jsonValuePresent(item.URLContext) {
-			return conversionResult{}, unsupported(ProtocolGenerateContent, path, "built-in Gemini tools require a native Gemini provider")
+		for _, field := range []struct {
+			name string
+			raw  json.RawMessage
+		}{
+			{"codeExecution", item.CodeExecution}, {"googleSearch", item.GoogleSearch}, {"googleSearchRetrieval", item.GoogleSearchRetrieval},
+			{"urlContext", item.URLContext}, {"computerUse", item.ComputerUse}, {"fileSearch", item.FileSearch}, {"googleMaps", item.GoogleMaps}, {"mcpServers", item.MCPServers},
+		} {
+			if jsonValuePresent(field.raw) {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, path+"."+field.name, "built-in Gemini tools require a native Gemini provider")
+			}
 		}
 		for functionIndex, function := range item.FunctionDeclarations {
 			functionPath := fmt.Sprintf("%s.functionDeclarations[%d]", path, functionIndex)
@@ -353,11 +375,31 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 				return conversionResult{}, invalid(ProtocolGenerateContent, functionPath+".name", "duplicate function name %q", function.Name)
 			}
 			declaredTools[function.Name] = struct{}{}
-			parameters, err := chatGeminiSchemaToJSONSchema(function.Parameters, functionPath+".parameters")
+			if jsonValuePresent(function.Parameters) && jsonValuePresent(function.ParametersJSONSchema) {
+				return conversionResult{}, invalid(ProtocolGenerateContent, functionPath, "parameters and parametersJsonSchema are mutually exclusive")
+			}
+			if jsonValuePresent(function.Response) {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, functionPath+".response", "function response schemas have no Chat equivalent")
+			}
+			if jsonValuePresent(function.ResponseJSONSchema) {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, functionPath+".responseJsonSchema", "function response schemas have no Chat equivalent")
+			}
+			if function.Behavior != "" {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, functionPath+".behavior", "function behavior has no Chat equivalent")
+			}
+			parameters := function.ParametersJSONSchema
+			parameterPath := functionPath + ".parametersJsonSchema"
+			var err error
+			if jsonValuePresent(parameters) {
+				parameters, err = normalizeGeminiJSONSchema(ProtocolGenerateContent, parameterPath, parameters)
+			} else {
+				parameterPath = functionPath + ".parameters"
+				parameters, err = chatGeminiSchemaToJSONSchema(function.Parameters, parameterPath)
+			}
 			if err != nil {
 				return conversionResult{}, err
 			}
-			parameters, err = normalizeFunctionParameters(ProtocolGenerateContent, functionPath+".parameters", parameters)
+			parameters, err = normalizeFunctionParameters(ProtocolGenerateContent, parameterPath, parameters)
 			if err != nil {
 				return conversionResult{}, err
 			}
@@ -375,11 +417,14 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 		target.ToolChoice = encodeChatToolChoice(choice)
 	}
 	if source.SystemInstruction != nil {
-		if source.SystemInstruction.Role != "" && source.SystemInstruction.Role != "user" && source.SystemInstruction.Role != "system" {
+		if source.SystemInstruction.Role != "" && source.SystemInstruction.Role != "user" {
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.systemInstruction.role", "role %q cannot be represented by Chat", source.SystemInstruction.Role)
 		}
 		parts, _, err := geminiPartsToChat(source.SystemInstruction.Parts, "$.systemInstruction.parts", "system", options.LossPolicy, nil, &diagnostics)
 		if err != nil {
+			return conversionResult{}, err
+		}
+		if err := validateChatContentRole("system", parts, "$.systemInstruction.parts"); err != nil {
 			return conversionResult{}, err
 		}
 		content, err := encodeChatContent(parts)
@@ -394,6 +439,7 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 
 	callIDsByName := make(map[string][]string)
 	callNamesByID := make(map[string]string)
+	consumedCallIDs := make(map[string]bool)
 	generatedCallID := 0
 	for contentIndex, content := range source.Contents {
 		path := fmt.Sprintf("$.contents[%d]", contentIndex)
@@ -428,6 +474,9 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 				} else {
 					contentParts = append(contentParts, part)
 				}
+			}
+			if err := validateChatContentRole(messageRole, contentParts, path+".parts"); err != nil {
+				return err
 			}
 			message.Content, err = encodeChatContent(contentParts)
 			if err != nil {
@@ -469,6 +518,9 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 			}
 			callID := response.ID
 			if callID != "" {
+				if consumedCallIDs[callID] {
+					return conversionResult{}, invalid(ProtocolGenerateContent, partPath+".functionResponse.id", "function call %q already has a response", callID)
+				}
 				name := callNamesByID[callID]
 				if name == "" {
 					return conversionResult{}, unsupported(ProtocolGenerateContent, partPath+".functionResponse.id", "function response cannot be correlated with an earlier function call")
@@ -486,6 +538,10 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 				callIDsByName[response.Name] = ids[1:]
 				diagnostics = appendDiagnostic(diagnostics, "warning", "function_response_id_inferred", partPath+".functionResponse.id", "missing Gemini function response id was correlated by function name and order")
 			}
+			if consumedCallIDs[callID] {
+				return conversionResult{}, invalid(ProtocolGenerateContent, partPath+".functionResponse.id", "function call %q already has a response", callID)
+			}
+			consumedCallIDs[callID] = true
 			target.Messages = append(target.Messages, chatMessage{
 				Role: "tool", Name: response.Name, ToolCallID: callID,
 				Content: json.RawMessage(mustJSONString(string(response.Response))),

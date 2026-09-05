@@ -30,7 +30,6 @@ const (
 
 type toolChoice = core.ToolChoice
 type reasoningConfig = responseswire.ReasoningConfig
-type jsonSchemaFormat = core.JSONSchemaFormat
 type finishReason = core.FinishReason
 
 const (

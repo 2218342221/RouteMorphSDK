@@ -83,7 +83,7 @@ func finalizeBufferedRoute(ctx context.Context, from, to Protocol, options conve
 		return nil, diagnostics, err
 	}
 	diagnostics = append(diagnostics, mapped.Diagnostics...)
-	outputFrames, encodedDiagnostics, err := RenderNativeResponse(from, mapped.Body)
+	outputFrames, encodedDiagnostics, err := renderNativeResponseWithOptions(from, mapped.Body, options)
 	if err != nil {
 		return nil, diagnostics, err
 	}

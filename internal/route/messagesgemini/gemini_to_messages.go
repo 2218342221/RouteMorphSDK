@@ -9,7 +9,7 @@ import (
 )
 
 func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent"); err != nil {
+	if err := rejectUnknownTopLevel(ProtocolGenerateContent, input, "contents", "systemInstruction", "tools", "toolConfig", "generationConfig", "safetySettings", "cachedContent", "model", "serviceTier", "store"); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateGeminiNestedFields(input); err != nil {
@@ -24,6 +24,15 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 	}
 	if source.CachedContent != "" {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.cachedContent", "cached content state requires a native generateContent provider")
+	}
+	if source.Model != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.model", "body model selection cannot be preserved when routing to Messages")
+	}
+	if source.ServiceTier != "" {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.serviceTier", "Gemini service-tier semantics are provider specific")
+	}
+	if source.Store != nil {
+		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.store", "Gemini logging policy has no exact Messages equivalent")
 	}
 	if jsonValuePresent(source.SafetySettings) {
 		return conversionResult{}, unsupported(ProtocolGenerateContent, "$.safetySettings", "provider safety policy is not portable to Messages")
@@ -42,17 +51,22 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 		if target.MaxTokens <= 0 {
 			return conversionResult{}, invalid(ProtocolGenerateContent, "$.generationConfig.maxOutputTokens", "must be greater than zero")
 		}
-		target.Temperature, target.TopP = config.Temperature, config.TopP
+		target.Temperature, target.TopP, target.TopK = config.Temperature, config.TopP, config.TopK
 		target.StopSequences = append([]string(nil), config.StopSequences...)
 		if config.ThinkingConfig != nil {
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig", "Gemini thinkingConfig is not semantically equivalent to Messages thinking")
 		}
-		schema := config.ResponseJSONSchema
-		if !jsonValuePresent(schema) {
-			schema = config.ResponseSchema
-		}
-		if jsonValuePresent(schema) {
-			converted, err := messagesGeminiSchemaToJSONSchema(schema, "$.generationConfig.responseJsonSchema")
+		if jsonValuePresent(config.ResponseJSONSchema) {
+			converted, err := normalizeGeminiJSONSchema(ProtocolGenerateContent, "$.generationConfig.responseJsonSchema", config.ResponseJSONSchema)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			target.OutputConfig = &messagesOutputConfig{Format: &struct {
+				Type   string          `json:"type"`
+				Schema json.RawMessage `json:"schema"`
+			}{Type: "json_schema", Schema: converted}}
+		} else if jsonValuePresent(config.ResponseSchema) {
+			converted, err := messagesGeminiSchemaToJSONSchema(config.ResponseSchema, "$.generationConfig.responseSchema")
 			if err != nil {
 				return conversionResult{}, err
 			}
@@ -88,11 +102,19 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 		for toolIndex, tool := range source.Tools {
 			for functionIndex, function := range tool.FunctionDeclarations {
 				path := fmt.Sprintf("$.tools[%d].functionDeclarations[%d]", toolIndex, functionIndex)
-				schema, err := messagesGeminiSchemaToJSONSchema(function.Parameters, path+".parameters")
+				schema := function.ParametersJSONSchema
+				schemaPath := path + ".parametersJsonSchema"
+				var err error
+				if jsonValuePresent(schema) {
+					schema, err = normalizeGeminiJSONSchema(ProtocolGenerateContent, schemaPath, schema)
+				} else {
+					schemaPath = path + ".parameters"
+					schema, err = messagesGeminiSchemaToJSONSchema(function.Parameters, schemaPath)
+				}
 				if err != nil {
 					return conversionResult{}, err
 				}
-				schema, err = normalizeMessagesInputSchema(schema, path+".parameters")
+				schema, err = normalizeMessagesInputSchema(schema, schemaPath)
 				if err != nil {
 					return conversionResult{}, err
 				}
@@ -164,14 +186,19 @@ func (c *geminiToMessagesConverter) ToClientResponse(_ context.Context, input []
 	if err := validateMessagesResponse(source); err != nil {
 		return conversionResult{}, err
 	}
+	responseDiagnostics, err := messagesResponseExtensionDiagnostics(source, options.LossPolicy)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	blocks, err := decodeMessagesBlocks(source.Content, "$.content")
 	if err != nil {
 		return conversionResult{}, err
 	}
-	parts, diagnostics, err := messagesBlocksToGemini(blocks, "assistant", "$.content", make(map[string]string))
+	parts, diagnostics, err := messagesBlocksToGemini(blocks, "assistant", "$.content", make(map[string]string), nil)
 	if err != nil {
 		return conversionResult{}, err
 	}
+	diagnostics = append(responseDiagnostics, diagnostics...)
 	finish, err := parseMessagesFinish(source.StopReason)
 	if err != nil {
 		return conversionResult{}, err
@@ -205,10 +232,40 @@ func (c *geminiToMessagesConverter) ToClientResponse(_ context.Context, input []
 	// cache creation from input_tokens. Recombine all three for Gemini billing.
 	target.UsageMetadata.PromptTokenCount = source.Usage.InputTokens + source.Usage.CacheReadInputTokens + source.Usage.CacheCreationInputTokens
 	target.UsageMetadata.CandidatesTokenCount = source.Usage.OutputTokens
-	target.UsageMetadata.TotalTokenCount = target.UsageMetadata.PromptTokenCount + target.UsageMetadata.CandidatesTokenCount
+	if source.Usage.OutputTokensDetails != nil {
+		target.UsageMetadata.ThoughtsTokenCount = source.Usage.OutputTokensDetails.ThinkingTokens
+		target.UsageMetadata.CandidatesTokenCount -= source.Usage.OutputTokensDetails.ThinkingTokens
+	}
+	target.UsageMetadata.TotalTokenCount = target.UsageMetadata.PromptTokenCount + target.UsageMetadata.CandidatesTokenCount + target.UsageMetadata.ThoughtsTokenCount
 	target.UsageMetadata.CachedContentTokenCount = source.Usage.CacheReadInputTokens
 	body, err := marshal(ProtocolGenerateContent, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
+}
+
+func messagesResponseExtensionDiagnostics(source messagesResponse, policy lossPolicy) ([]Diagnostic, error) {
+	fields := []struct {
+		path    string
+		code    string
+		present bool
+		message string
+	}{
+		{"$.stop_details", "messages_stop_details_not_representable", jsonValuePresent(source.StopDetails), "Messages stop details were omitted"},
+		{"$.container", "messages_response_container_not_representable", jsonValuePresent(source.Container), "Messages response container state was omitted"},
+		{"$.usage.cache_creation", "messages_cache_creation_breakdown_not_representable", source.Usage.CacheCreation != nil, "Messages cache-creation token breakdown was omitted"},
+		{"$.usage.inference_geo", "messages_inference_geo_not_representable", source.Usage.InferenceGeo != "", "Messages inference geography was omitted"},
+		{"$.usage.service_tier", "messages_usage_service_tier_not_representable", source.Usage.ServiceTier != "", "Messages usage service tier was omitted"},
+	}
+	var diagnostics []Diagnostic
+	for _, field := range fields {
+		if !field.present {
+			continue
+		}
+		if policy == rejectSemanticLoss {
+			return nil, unsupported(ProtocolMessages, field.path, "field has no Gemini response equivalent")
+		}
+		diagnostics = appendDiagnostic(diagnostics, "warning", field.code, field.path, field.message)
+	}
+	return diagnostics, nil
 }
 
 func (c *geminiToMessagesConverter) NewClientStream(_ context.Context, options conversionOptions) (responseStreamConverter, error) {
@@ -237,7 +294,7 @@ func decodeMessagesBlocks(raw json.RawMessage, path string) ([]messagesBlock, er
 	return blocks, nil
 }
 
-func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames map[string]string) ([]geminiPart, []Diagnostic, error) {
+func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames map[string]string, consumedCallIDs map[string]bool) ([]geminiPart, []Diagnostic, error) {
 	parts := make([]geminiPart, 0, len(blocks))
 	var diagnostics []Diagnostic
 	for index, block := range blocks {
@@ -249,24 +306,58 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 		case "text":
 			parts = append(parts, geminiPart{Text: block.Text})
 		case "image", "document":
-			if role == "assistant" {
-				// Both wire formats can carry media-shaped parts, so preserve it.
-				// Provider/model modality support remains an upstream concern.
+			if role != "user" {
+				return nil, diagnostics, unsupported(ProtocolMessages, blockPath, "Messages multimodal content is only portable in user messages")
 			}
 			if block.Source == nil {
 				return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source", "source is required")
 			}
 			switch block.Source.Type {
 			case "base64":
+				if block.Source.URL != "" || block.Source.FileID != "" || jsonValuePresent(block.Source.Content) {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source", "base64 source cannot contain url, file_id, or content")
+				}
 				if block.Source.MediaType == "" || block.Source.Data == "" {
 					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source", "media_type and data are required")
 				}
+				if !validBase64(block.Source.Data) {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source.data", "must be valid base64")
+				}
+				if block.Type == "image" && !validMessagesImageMediaType(block.Source.MediaType) {
+					return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.media_type", "Messages images require JPEG, PNG, GIF, or WebP")
+				}
+				if block.Type == "document" && block.Source.MediaType != "application/pdf" {
+					return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.media_type", "only PDF documents are portable to Gemini")
+				}
 				parts = append(parts, geminiPart{InlineData: &geminiBlob{MIMEType: block.Source.MediaType, Data: block.Source.Data}})
 			case "url":
+				if block.Source.Data != "" || block.Source.MediaType != "" || block.Source.FileID != "" || jsonValuePresent(block.Source.Content) {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source", "URL source cannot contain data, media_type, file_id, or content")
+				}
 				if block.Source.URL == "" {
 					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source.url", "URL is required")
 				}
-				parts = append(parts, geminiPart{FileData: &geminiFileData{MIMEType: block.Source.MediaType, FileURI: block.Source.URL}})
+				if !geminiFileURI(block.Source.URL) {
+					return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.url", "Gemini fileData requires a Gemini Files or Google Cloud Storage URI")
+				}
+				mimeType := "application/pdf"
+				if block.Type == "image" {
+					mimeType = mimeTypeFromURL(block.Source.URL)
+					if !validMessagesImageMediaType(mimeType) {
+						return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.url", "Gemini image fileData requires a URL whose JPEG, PNG, GIF, or WebP MIME type can be determined")
+					}
+				} else if inferred := mimeTypeFromURL(block.Source.URL); inferred != "" && inferred != mimeType {
+					return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.url", "Messages URL documents must identify PDF content")
+				}
+				parts = append(parts, geminiPart{FileData: &geminiFileData{MIMEType: mimeType, FileURI: block.Source.URL}})
+			case "file":
+				if block.Source.Data != "" || block.Source.URL != "" || block.Source.MediaType != "" || jsonValuePresent(block.Source.Content) {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source", "file source cannot contain data, url, media_type, or content")
+				}
+				if block.Source.FileID == "" {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".source.file_id", "file_id is required")
+				}
+				return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.file_id", "Messages file IDs are provider scoped and cannot be sent to Gemini")
 			default:
 				return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".source.type", "source type %q is not portable", block.Source.Type)
 			}
@@ -287,8 +378,8 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 			if err != nil {
 				return nil, diagnostics, err
 			}
-			parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{ID: block.ID, Name: block.Name, Args: arguments}, ThoughtSignature: geminiThoughtSignatureBypass})
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_added", blockPath, "a Gemini-compatible thought signature bypass was attached to the external function call")
+			parts = append(parts, geminiPart{FunctionCall: &geminiFunctionCall{ID: block.ID, Name: block.Name, Args: arguments}})
+			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_unavailable", blockPath, "the source protocol cannot provide a provider-issued Gemini thoughtSignature; Gemini 3 may reject replayed function-call history")
 		case "tool_result":
 			if role != "user" {
 				return nil, diagnostics, invalid(ProtocolMessages, blockPath, "tool_result blocks require the user role")
@@ -305,6 +396,12 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 			}
 			if name == "" {
 				return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".tool_use_id", "Gemini functionResponse requires the corresponding function name")
+			}
+			if consumedCallIDs != nil {
+				if consumedCallIDs[block.ToolUseID] {
+					return nil, diagnostics, invalid(ProtocolMessages, blockPath+".tool_use_id", "tool call %q already has an output", block.ToolUseID)
+				}
+				consumedCallIDs[block.ToolUseID] = true
 			}
 			response, err := messagesToolResultToGemini(block.Content, blockPath+".content")
 			if err != nil {
@@ -408,10 +505,7 @@ func geminiPartsToMessages(parts []geminiPart, role, path string, tracker *gemin
 			return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath, "Gemini thoughts and signatures are not semantically equivalent to Anthropic thinking blocks")
 		}
 		if part.ThoughtSignature != "" {
-			if part.ThoughtSignature != geminiThoughtSignatureBypass {
-				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".thoughtSignature", "Gemini thought signatures cannot be represented by Messages")
-			}
-			diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_thought_signature_bypass_removed", partPath+".thoughtSignature", "the known external-call compatibility marker was removed")
+			return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".thoughtSignature", "provider-issued Gemini thought signatures cannot be represented by Messages and must not be dropped")
 		}
 		switch {
 		case part.FunctionCall != nil:
@@ -469,14 +563,21 @@ func geminiPartsToMessages(parts []geminiPart, role, path string, tracker *gemin
 			}
 			blockType := "document"
 			if strings.HasPrefix(part.InlineData.MIMEType, "image/") {
+				if !validMessagesImageMediaType(part.InlineData.MIMEType) {
+					return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "Messages supports only JPEG, PNG, GIF, or WebP images")
+				}
 				blockType = "image"
+			} else if part.InlineData.MIMEType != "application/pdf" {
+				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "Messages documents support only application/pdf")
 			}
 			block := messagesBlock{Type: blockType}
 			block.Source = &struct {
-				Type      string `json:"type"`
-				MediaType string `json:"media_type,omitempty"`
-				Data      string `json:"data,omitempty"`
-				URL       string `json:"url,omitempty"`
+				Type      string          `json:"type"`
+				MediaType string          `json:"media_type,omitempty"`
+				Data      string          `json:"data,omitempty"`
+				URL       string          `json:"url,omitempty"`
+				FileID    string          `json:"file_id,omitempty"`
+				Content   json.RawMessage `json:"content,omitempty"`
 			}{Type: "base64", MediaType: part.InlineData.MIMEType, Data: part.InlineData.Data}
 			blocks = append(blocks, block)
 		case part.FileData != nil:
@@ -486,17 +587,27 @@ func geminiPartsToMessages(parts []geminiPart, role, path string, tracker *gemin
 			if strings.HasPrefix(part.FileData.MIMEType, "audio/") {
 				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".fileData", "Messages has no portable audio content block")
 			}
+			if !portableGeminiFileURI(part.FileData.FileURI) {
+				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".fileData.fileUri", "provider-scoped Gemini file URIs cannot be represented as Messages URLs")
+			}
 			blockType := "document"
 			if strings.HasPrefix(part.FileData.MIMEType, "image/") {
+				if !validMessagesImageMediaType(part.FileData.MIMEType) {
+					return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".fileData.mimeType", "Messages supports only JPEG, PNG, GIF, or WebP images")
+				}
 				blockType = "image"
+			} else if part.FileData.MIMEType != "application/pdf" {
+				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".fileData.mimeType", "Messages documents support only application/pdf")
 			}
 			block := messagesBlock{Type: blockType}
 			block.Source = &struct {
-				Type      string `json:"type"`
-				MediaType string `json:"media_type,omitempty"`
-				Data      string `json:"data,omitempty"`
-				URL       string `json:"url,omitempty"`
-			}{Type: "url", MediaType: part.FileData.MIMEType, URL: part.FileData.FileURI}
+				Type      string          `json:"type"`
+				MediaType string          `json:"media_type,omitempty"`
+				Data      string          `json:"data,omitempty"`
+				URL       string          `json:"url,omitempty"`
+				FileID    string          `json:"file_id,omitempty"`
+				Content   json.RawMessage `json:"content,omitempty"`
+			}{Type: "url", URL: part.FileData.FileURI}
 			blocks = append(blocks, block)
 		case part.Text != "":
 			blocks = append(blocks, messagesBlock{Type: "text", Text: part.Text})

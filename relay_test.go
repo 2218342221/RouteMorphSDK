@@ -481,7 +481,7 @@ func TestAdapterMetadataOverwritesSpoofedDiagnosticCount(t *testing.T) {
 func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: not-json\n\n")
+		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"late\",\"logprobs\":[]}\n\n")
 	}))
 	defer upstream.Close()
 	adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "")
@@ -491,7 +491,7 @@ func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	}
 	body, readErr := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if readErr == nil || !bytes.Contains(body, []byte("stream_conversion_error")) || !bytes.Contains(body, []byte("[DONE]")) {
+	if readErr == nil || !bytes.Contains(body, []byte("stream_validation_error")) || !bytes.Contains(body, []byte("response.created must be the first")) || !bytes.Contains(body, []byte("[DONE]")) {
 		t.Fatalf("body=%s err=%v", body, readErr)
 	}
 	var conversion *ConversionError
@@ -737,7 +737,7 @@ func TestGatewayAdapterModelOverrideRejectsNullNestedStreamObjects(t *testing.T)
 		{
 			name:     "responses",
 			protocol: ProtocolResponses,
-			payload:  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":null}\n\n",
+			payload:  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":0,\"response\":null}\n\n",
 		},
 		{
 			name:     "messages",

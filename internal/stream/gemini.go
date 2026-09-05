@@ -73,6 +73,9 @@ func validateGeminiResponseEnvelope(source *geminiResponse, policy lossPolicy) (
 	}
 	var diagnostics []Diagnostic
 	candidate := source.Candidates[0]
+	if candidate.Content.Role != "" && candidate.Content.Role != "model" {
+		return nil, upstreamResponseError(ProtocolGenerateContent, "$.candidates[0].content.role", "expected model role, got %q", candidate.Content.Role)
+	}
 	if candidate.AvgLogprobs != nil || jsonValuePresent(candidate.LogprobsResult) {
 		if policy == rejectSemanticLoss {
 			return nil, unsupported(ProtocolGenerateContent, "$.candidates[0].logprobsResult", "Gemini token ids and average log probability have no lossless cross-protocol representation")
@@ -86,6 +89,7 @@ func validateGeminiResponseEnvelope(source *geminiResponse, policy lossPolicy) (
 		{"$.candidates[0].citationMetadata", candidate.CitationMetadata},
 		{"$.candidates[0].groundingMetadata", candidate.GroundingMetadata},
 		{"$.candidates[0].urlContextMetadata", candidate.URLContextMetadata},
+		{"$.candidates[0].groundingAttributions", candidate.GroundingAttributions},
 	} {
 		if !jsonValuePresent(field.raw) {
 			continue
@@ -101,7 +105,19 @@ func validateGeminiResponseEnvelope(source *geminiResponse, policy lossPolicy) (
 	if jsonValuePresent(source.PromptFeedback) {
 		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_prompt_feedback_not_representable", "$.promptFeedback", "Gemini prompt feedback is not represented by the target protocol")
 	}
-	if jsonValuePresent(source.UsageMetadata.PromptTokensDetails) || jsonValuePresent(source.UsageMetadata.ToolUsePromptTokensDetails) || jsonValuePresent(source.UsageMetadata.CandidatesTokensDetails) {
+	if candidate.TokenCount != nil {
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_candidate_token_count_not_representable", "$.candidates[0].tokenCount", "per-candidate Gemini token count is not represented by the target protocol")
+	}
+	if candidate.FinishMessage != "" {
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_finish_message_not_representable", "$.candidates[0].finishMessage", "Gemini finish message is not represented by the target protocol")
+	}
+	if jsonValuePresent(source.ModelStatus) {
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_model_status_not_representable", "$.modelStatus", "Gemini model status is not represented by the target protocol")
+	}
+	if source.UsageMetadata.ServiceTier != "" {
+		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_usage_service_tier_not_representable", "$.usageMetadata.serviceTier", "Gemini usage service tier is not represented by the target protocol")
+	}
+	if jsonValuePresent(source.UsageMetadata.PromptTokensDetails) || jsonValuePresent(source.UsageMetadata.ToolUsePromptTokensDetails) || jsonValuePresent(source.UsageMetadata.CandidatesTokensDetails) || jsonValuePresent(source.UsageMetadata.CacheTokensDetails) {
 		diagnostics = appendDiagnostic(diagnostics, "warning", "gemini_modality_usage_not_representable", "$.usageMetadata", "per-modality Gemini token details are not represented by the target protocol")
 	}
 	return diagnostics, nil
@@ -126,9 +142,9 @@ func parseGeminiFinish(value string) (finishReason, error) {
 		return "", upstreamResponseError(ProtocolGenerateContent, "$.candidates[0].finishReason", "finish reason is missing")
 	case "MAX_TOKENS":
 		return finishLength, nil
-	case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION", "LANGUAGE", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION":
+	case "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "RECITATION", "LANGUAGE", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION", "ESCALATION", "PUP_LIMITED_DISABLED":
 		return finishContentFilter, nil
-	case "MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "OTHER":
+	case "MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "OTHER":
 		return "", upstreamResponseError(ProtocolGenerateContent, "$.candidates[0].finishReason", "generation failed with %q", value)
 	case "STOP":
 		return finishStop, nil
