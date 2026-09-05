@@ -10,6 +10,11 @@ here.
 
 ### Added
 
+- Added `Adapter.HTTPClient` for injecting RouteMorph protocol conversion into
+  the official OpenAI, Anthropic, and Gemini Go SDKs, with fail-closed endpoint
+  routing and HTTP transport contract tests.
+- Added a nested `examples/provider-sdks` module with compiling examples and a
+  local end-to-end interoperability test for all three official SDKs.
 - Updated protocol schemas and conversion coverage for OpenAI Go SDK v3.56.0
   (`f5b985771236464300abc9395c1c4abda0d65c53`),
   Anthropic Go SDK v1.70.1, and Gemini Go SDK v1.71.0 / Discovery revision
@@ -30,6 +35,9 @@ here.
 
 ### Changed
 
+- Gemini stream failures now close with the typed read error without emitting a
+  JSON error payload that the official Gemini SDK interprets as an empty
+  successful response.
 - Preserve newly compatible prompt-cache, moderation, citation, schema,
   service-tier, usage, and Anthropic/Gemini fields where semantics match.
 - Treat Responses Create message content as text/image/file only; reject

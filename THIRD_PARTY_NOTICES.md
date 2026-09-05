@@ -4,6 +4,11 @@ RouteMorphSDK's Go module uses the Go standard library and has no third-party
 module dependencies at the time of this notice. The release tree does not
 vendor or embed the source of the compatibility reference named below.
 
+The separate `examples/provider-sdks` nested module depends on the official
+OpenAI, Anthropic, and Google GenAI Go SDKs solely to compile and test the
+documented HTTP-client injection examples. Those dependencies are not part of
+the RouteMorphSDK module dependency graph and are not vendored.
+
 ## Protocol compatibility research
 
 During protocol compatibility research, behavior and public wire shapes were
@@ -25,4 +30,3 @@ provider behavior.
 
 Provider and product names are trademarks of their respective owners. Their use
 describes protocol compatibility and does not imply endorsement.
-

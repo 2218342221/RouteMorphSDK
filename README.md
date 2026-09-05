@@ -39,6 +39,8 @@ The public API is intentionally small:
 
 - four constructors select the upstream protocol;
 - four methods on `*Adapter` select the ingress/client protocol;
+- `Adapter.HTTPClient` exposes the same routes as a standard `*http.Client` for
+  injection into official provider SDKs;
 - `Request` and `Response` are public-owned HTTP boundary types;
 - `InspectRequest` and `PrepareRequest` expose the model and streaming flag for
   provider selection without exposing internal protocol DTOs;
@@ -79,6 +81,46 @@ defer response.Body.Close()
 _, err = io.Copy(os.Stdout, response.Body)
 return err
 ```
+
+## Provider SDK injection
+
+Official provider SDKs can use the same conversion path without a local HTTP
+gateway. Inject the client returned by `Adapter.HTTPClient`; the provider SDK
+continues to own typed request and response objects while RouteMorph handles
+the wire conversion:
+
+```go
+adapter, err := routemorph.NewAnthropicMessagesAdapter(
+    "https://api.anthropic.com",
+    os.Getenv("ANTHROPIC_API_KEY"),
+    routemorph.WithModel("your-anthropic-model"),
+)
+if err != nil {
+    return err
+}
+
+client := openai.NewClient(
+    option.WithBaseURL("https://routemorph.invalid/v1"),
+    option.WithAPIKey("intercepted-by-routemorph"),
+    option.WithHTTPClient(adapter.HTTPClient()),
+    option.WithMaxRetries(0),
+)
+completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+    Model:    "client-model",
+    Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("Hello")},
+})
+```
+
+The bridge recognizes OpenAI Chat Completions and Responses, Anthropic
+Messages, and Gemini Developer API `generateContent`/`streamGenerateContent`
+requests. It fails closed with `ErrUnsupported` for other SDK endpoints instead
+of sending them to the network. The adapter's upstream credential replaces any
+credential added by the ingress SDK.
+
+See [`examples/provider-sdks`](examples/provider-sdks) for compiling OpenAI,
+Anthropic, and Gemini examples and a local end-to-end test using all three
+official SDKs. The examples are a nested module so this main module keeps its
+standard-library-only dependency contract.
 
 For an HTTP handler, `Response.WriteTo` relays the status, headers, body, stream
 flushes, and trailers, and closes the response body:
@@ -202,8 +244,10 @@ type Response struct {
 - Redirects are not followed and return a 502 client-protocol response.
 - Invalid input, unsupported semantic conversion, transport failure, and
   invalid successful upstream output return a Go error.
-- A conversion failure after streaming begins emits the client protocol's error
-  event and is also returned by `Body.Read` or `WriteTo`.
+- A conversion failure after streaming begins is returned by `Body.Read` or
+  `WriteTo`. Chat, Responses, and Messages also receive their protocol error
+  event; Gemini has no SDK-recognized in-band error event, so its stream closes
+  with the read error without emitting a fake response chunk.
 - `Response.Meta.Diagnostics()` is concurrency-safe. Stream diagnostics are
   complete after Body reaches EOF.
 
@@ -301,6 +345,9 @@ whether its callers may set even these allowlisted values.
 - [`examples/minimal-gateway`](examples/minimal-gateway) is a runnable minimal
   conversion service. It exposes all four client endpoints and can target any
   one of the four upstream protocols.
+- [`examples/provider-sdks`](examples/provider-sdks) injects
+  `Adapter.HTTPClient()` into the official OpenAI, Anthropic, and Gemini Go
+  SDKs without running a local gateway.
 
 ```bash
 export OPENAI_API_KEY='...'
@@ -311,11 +358,22 @@ UPSTREAM_PROTOCOL=responses \
 UPSTREAM_BASE_URL=https://api.openai.com/v1 \
 UPSTREAM_API_KEY="$OPENAI_API_KEY" \
 go run ./examples/minimal-gateway
+
+# The provider SDK examples are an independent module.
+cd examples/provider-sdks
+UPSTREAM_PROTOCOL=responses \
+UPSTREAM_BASE_URL=https://api.openai.com/v1 \
+UPSTREAM_API_KEY="$OPENAI_API_KEY" \
+UPSTREAM_MODEL='your-upstream-model' \
+go run ./openai
 ```
 
 The direct example accepts `OPENAI_BASE_URL`. The gateway accepts
 `UPSTREAM_PROTOCOL`, `UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`, `LISTEN_ADDR`, and
 optional `UPSTREAM_MODEL`; see its directory README for details.
+The provider SDK examples use the same `UPSTREAM_*` settings and additionally
+accept `CLIENT_MODEL`; see their README for supported SDK operations and
+credential behavior.
 
 ## Development
 

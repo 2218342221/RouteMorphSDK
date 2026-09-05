@@ -21,6 +21,7 @@ type adapterAPI interface {
 	OpenAIResponses(context.Context, *routemorph.Request) (*routemorph.Response, error)
 	AnthropicMessages(context.Context, *routemorph.Request) (*routemorph.Response, error)
 	GeminiGenerateContent(context.Context, *routemorph.Request) (*routemorph.Response, error)
+	HTTPClient() *http.Client
 }
 
 var (

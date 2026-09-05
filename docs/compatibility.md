@@ -449,6 +449,10 @@ and candidate/choice indexes across chunks. Buffered Chat additionally validates
 function-call delta identity and renders `stream_options.include_usage` using
 the official final usage-only chunk shape. Anthropic content-block indexes and
 tool-input JSON deltas are presence- and lifecycle-checked before conversion.
+Chat, Responses, and Messages receive a protocol-native error event when a
+conversion fails after streaming starts. Gemini has no error frame recognized
+by the official Go SDK, so its stream closes with the typed read error and does
+not emit an empty success-shaped chunk.
 
 ## Usage accounting
 

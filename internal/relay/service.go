@@ -336,20 +336,26 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 	}
 	fail := func(code string, streamErr error) {
 		response.Meta.diagnostics.add(core.Diagnostic{Severity: "error", Code: code, Path: "$", Message: streamErr.Error()})
-		frame, encodeErr := target.EncodeStreamError(core.ProtocolError{
-			Type: "upstream_error", Code: code, Message: streamErr.Error(), RequestID: requestID, StatusCode: http.StatusBadGateway,
-		})
-		if encodeErr == nil {
-			frames := []core.Frame{frame}
-			if ingress == core.ProtocolChat {
-				frames = append(frames, core.Frame{Data: []byte("[DONE]"), Done: true})
-			}
-			errorContext := context.Background()
-			for _, errorFrame := range frames {
-				if encoder.Write(errorContext, errorFrame) != nil {
-					break
+		// Gemini's streaming API has no SDK-recognized in-band error event.
+		// A data frame containing its ordinary JSON error envelope is decoded by
+		// google.golang.org/genai as an empty successful response. Preserve the
+		// failure solely as the body read error instead of fabricating a chunk.
+		if ingress != core.ProtocolGenerateContent {
+			frame, encodeErr := target.EncodeStreamError(core.ProtocolError{
+				Type: "upstream_error", Code: code, Message: streamErr.Error(), RequestID: requestID, StatusCode: http.StatusBadGateway,
+			})
+			if encodeErr == nil {
+				frames := []core.Frame{frame}
+				if ingress == core.ProtocolChat {
+					frames = append(frames, core.Frame{Data: []byte("[DONE]"), Done: true})
 				}
-				_ = encoder.Flush()
+				errorContext := context.Background()
+				for _, errorFrame := range frames {
+					if encoder.Write(errorContext, errorFrame) != nil {
+						break
+					}
+					_ = encoder.Flush()
+				}
 			}
 		}
 		finalizeAdapterTrailers(response, upstream.Trailer)

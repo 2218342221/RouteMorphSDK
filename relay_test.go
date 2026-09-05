@@ -509,6 +509,27 @@ func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	}
 }
 
+func TestGatewayAdapterGeminiStreamFailureDoesNotEmitEmptySuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"late\",\"logprobs\":[]}\n\n")
+	}))
+	defer upstream.Close()
+	adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "")
+	response, err := adapter.GeminiGenerateContent(context.Background(), adapterRequest(ProtocolGenerateContent, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if len(body) != 0 || !errors.Is(readErr, ErrUpstreamResponse) || !errors.Is(readErr, ErrInvalidPayload) {
+		t.Fatalf("body=%q error=%v, want no Gemini success chunk and typed upstream error", body, readErr)
+	}
+	if len(response.Meta.Diagnostics()) == 0 {
+		t.Fatal("stream diagnostic was not retained")
+	}
+}
+
 func TestGatewayAdapterClosingStreamCancelsUpstream(t *testing.T) {
 	cancelled := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

@@ -31,7 +31,8 @@ make check
 ```
 
 The command checks formatting, runs `go vet`, executes normal and race-enabled
-tests, and builds every package and example with `GOWORK=off`.
+tests, builds the main module, and tests the separate official-provider-SDK
+example module with `GOWORK=off`.
 
 Focused fuzzing is also encouraged for parser or conversion changes:
 
