@@ -8,22 +8,25 @@ import (
 )
 
 var (
-	decodeJSON            = routekit.DecodeJSON
-	marshal               = routekit.Marshal
-	mustJSON              = routekit.MustJSON
-	normalizeArguments    = routekit.NormalizeArguments
-	rawString             = routekit.RawString
-	textParts             = routekit.TextParts
-	dataURL               = routekit.DataURL
-	parseDataURL          = routekit.ParseDataURL
-	parseFileData         = routekit.ParseFileData
-	openAIFileData        = routekit.OpenAIFileData
-	validBase64           = routekit.ValidBase64
-	validImageMIMEType    = routekit.ValidOpenAIImageMIMEType
-	validHTTPURL          = routekit.ValidHTTPURL
-	mimeTypeFromURL       = routekit.MIMETypeFromURL
-	appendDiagnostic      = routekit.AppendDiagnostic
-	rejectUnknownTopLevel = routekit.RejectUnknownTopLevel
+	decodeJSON                         = routekit.DecodeJSON
+	marshal                            = routekit.Marshal
+	mustJSON                           = routekit.MustJSON
+	normalizeArguments                 = routekit.NormalizeArguments
+	rawString                          = routekit.RawString
+	textParts                          = routekit.TextParts
+	dataURL                            = routekit.DataURL
+	parseDataURL                       = routekit.ParseDataURL
+	parseFileData                      = routekit.ParseFileData
+	openAIFileData                     = routekit.OpenAIFileData
+	validBase64                        = routekit.ValidBase64
+	validImageMIMEType                 = routekit.ValidOpenAIImageMIMEType
+	validHTTPURL                       = routekit.ValidHTTPURL
+	mimeTypeFromURL                    = routekit.MIMETypeFromURL
+	appendDiagnostic                   = routekit.AppendDiagnostic
+	rejectUnknownTopLevel              = routekit.RejectUnknownTopLevel
+	validateMessagesOutputConfigFields = routekit.ValidateMessagesOutputConfigFields
+	validateMessagesThinkingFields     = routekit.ValidateMessagesThinkingFields
+	validateMessagesContentBlockFields = routekit.ValidateMessagesContentBlockFields
 )
 
 func rejectUnknownCrossTopLevel(protocol Protocol, data []byte) error {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"strings"
 
 	core "github.com/2218342221/RouteMorphSDK/internal/core"
@@ -237,6 +238,7 @@ type nativeResponsesItemState struct {
 	id          string
 	itemType    string
 	done        bool
+	doneItem    json.RawMessage
 	content     map[int]*nativeResponsesPartState
 	summary     map[int]*nativeResponsesPartState
 	streams     map[string]bool
@@ -388,6 +390,11 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 	if err := v.validateResponsesLifecycleEvent(eventType, &event); err != nil {
 		return err
 	}
+	if eventType == "response.output_item.done" {
+		if err := validateCompleteResponsesItem(event.Item); err != nil {
+			return err
+		}
+	}
 
 	switch eventType {
 	case "error":
@@ -419,6 +426,9 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 		}
 		if eventType == "response.completed" || eventType == "response.incomplete" {
 			if err := v.wire.ValidateResponse(ctx, raw); err != nil {
+				return err
+			}
+			if err := v.validateResponsesTerminalOutput(raw); err != nil {
 				return err
 			}
 		} else {
@@ -595,7 +605,54 @@ func (v *nativeStreamValidator) finishResponsesItem(event *nativeResponsesEvent)
 		}
 	}
 	item.done = true
+	item.doneItem = append(json.RawMessage(nil), event.Item...)
 	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesTerminalOutput(raw json.RawMessage) error {
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return core.Invalid(v.protocol, "$.response", "invalid terminal response object")
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(response["output"], &output); err != nil || output == nil {
+		return core.Invalid(v.protocol, "$.response.output", "terminal response output array is required")
+	}
+	if len(output) != len(v.responsesItems) {
+		return core.Invalid(v.protocol, "$.response.output", "terminal output has %d items, but the stream completed %d items", len(output), len(v.responsesItems))
+	}
+	for index, rawItem := range output {
+		streamed, exists := v.responsesItems[index]
+		if !exists {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d was not emitted by output_item events", index)
+		}
+		identity, err := decodeResponsesItemIdentity(v.protocol, rawItem)
+		if err != nil {
+			return err
+		}
+		if identity.id != streamed.id || identity.itemType != streamed.itemType {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d identity %q/%q does not match streamed item %q/%q", index, identity.id, identity.itemType, streamed.id, streamed.itemType)
+		}
+		if !responsesJSONEqual(rawItem, streamed.doneItem) {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d does not match its output_item.done payload", index)
+		}
+	}
+	return nil
+}
+
+func responsesJSONEqual(left, right json.RawMessage) bool {
+	decode := func(raw json.RawMessage) (any, bool) {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		return value, true
+	}
+	leftValue, leftOK := decode(left)
+	rightValue, rightOK := decode(right)
+	return leftOK && rightOK && reflect.DeepEqual(leftValue, rightValue)
 }
 
 type responsesItemIdentity struct {

@@ -46,11 +46,19 @@ func upstreamResponseError(protocol Protocol, path, format string, args ...any) 
 }
 
 var (
-	rawObject             = routekit.RawObject
-	rawJSONValuePresent   = routekit.ValuePresent
-	jsonValuePresent      = routekit.NonNullValue
-	mustJSONString        = routekit.MustJSONString
-	resolveExchangeStream = routekit.ResolveExchangeStream
+	rawObject                         = routekit.RawObject
+	rawJSONValuePresent               = routekit.ValuePresent
+	jsonValuePresent                  = routekit.NonNullValue
+	mustJSONString                    = routekit.MustJSONString
+	resolveExchangeStream             = routekit.ResolveExchangeStream
+	rejectUnknownResponsesObject      = routekit.RejectUnknownObjectFields
+	validateResponsesContentArray     = routekit.ValidateResponsesContentArray
+	validateResponsesInputItems       = routekit.ValidateResponsesInputItems
+	validateResponsesOutputItems      = routekit.ValidateResponsesOutputItems
+	validateResponsesReasoningConfig  = routekit.ValidateResponsesReasoningConfig
+	validateResponsesTextConfigFields = routekit.ValidateResponsesTextConfigFields
+	validateResponsesToolOutput       = routekit.ValidateResponsesToolOutput
+	validateResponsesToolsShape       = routekit.ValidateResponsesTools
 )
 
 func consumeStreamPrefix(emitted, complete, path string) (suffix, remaining string, err error) {

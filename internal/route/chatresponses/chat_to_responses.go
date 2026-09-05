@@ -15,12 +15,18 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 	if err := rejectUnknownTopLevel(ProtocolChat, input, "model", "messages", "tools", "tool_choice", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "stream", "parallel_tool_calls", "response_format", "reasoning_effort", "metadata", "n", "logprobs", "top_logprobs", "verbosity", "user", "service_tier", "store", "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "moderation", "stream_options", "web_search_options"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateChatMessageContentFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source chatRequest
 	if err := decodeJSON(ProtocolChat, input, &source); err != nil {
 		return conversionResult{}, err
 	}
 	if source.Model == "" || len(source.Messages) == 0 {
 		return conversionResult{}, invalid(ProtocolChat, "$.messages", "model and at least one message are required")
+	}
+	if err := validateChatToolDeclarationNames(source.Tools); err != nil {
+		return conversionResult{}, err
 	}
 	if err := validateOpenAIReasoningEffort(ProtocolChat, "$.reasoning_effort", source.ReasoningEffort); err != nil {
 		return conversionResult{}, err
@@ -88,9 +94,6 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 	if err != nil {
 		return conversionResult{}, err
 	}
-	if choice.Mode != "" {
-		target.ToolChoice = encodeResponsesToolChoice(choice)
-	}
 	format, err := decodeChatResponseFormat(source.ResponseFormat)
 	if err != nil {
 		return conversionResult{}, err
@@ -115,8 +118,12 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 		}
 		target.Text = mustJSON(text)
 	}
+	seenToolNames := make(map[string]struct{}, len(source.Tools))
 	for index, tool := range source.Tools {
 		path := fmt.Sprintf("$.tools[%d]", index)
+		if tool.Type == "" {
+			return conversionResult{}, invalid(ProtocolChat, path+".type", "tool type is required")
+		}
 		switch tool.Type {
 		case "function":
 			if tool.Custom != nil {
@@ -125,6 +132,11 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 			if tool.Function.Name == "" {
 				return conversionResult{}, invalid(ProtocolChat, path+".function.name", "name is required")
 			}
+			key := "function\x00" + tool.Function.Name
+			if _, duplicate := seenToolNames[key]; duplicate {
+				return conversionResult{}, invalid(ProtocolChat, path+".function.name", "duplicate function name %q", tool.Function.Name)
+			}
+			seenToolNames[key] = struct{}{}
 			parameters, err := normalizeFunctionParameters(ProtocolChat, path+".function.parameters", tool.Function.Parameters)
 			if err != nil {
 				return conversionResult{}, err
@@ -142,6 +154,11 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 			if tool.Custom == nil || tool.Custom.Name == "" {
 				return conversionResult{}, invalid(ProtocolChat, path+".custom.name", "name is required")
 			}
+			key := "custom\x00" + tool.Custom.Name
+			if _, duplicate := seenToolNames[key]; duplicate {
+				return conversionResult{}, invalid(ProtocolChat, path+".custom.name", "duplicate custom tool name %q", tool.Custom.Name)
+			}
+			seenToolNames[key] = struct{}{}
 			if tool.Function.Name != "" || tool.Function.Description != "" || nonNullJSON(tool.Function.Parameters) || tool.Function.Strict != nil {
 				return conversionResult{}, invalid(ProtocolChat, path+".function", "is not valid for a custom tool")
 			}
@@ -164,6 +181,12 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 		}
 		target.Tools = append(target.Tools, *webSearch)
 	}
+	if err := validateToolChoiceReferences(ProtocolChat, choice, target.Tools); err != nil {
+		return conversionResult{}, err
+	}
+	if choice.Mode != "" {
+		target.ToolChoice = encodeResponsesToolChoice(choice)
+	}
 	items := make([]responsesItem, 0, len(source.Messages))
 	callKinds := make(map[string]string)
 	consumedCallIDs := make(map[string]bool)
@@ -177,6 +200,18 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 		}
 		if rawJSONValuePresent(message.FunctionCall) {
 			return conversionResult{}, unsupported(ProtocolChat, path+".function_call", "deprecated function_call cannot be represented without semantic loss")
+		}
+		if message.Role != "assistant" && len(message.ToolCalls) > 0 {
+			return conversionResult{}, invalid(ProtocolChat, path+".tool_calls", "tool_calls are only valid on assistant messages")
+		}
+		if message.Role != "assistant" && message.Refusal != "" {
+			return conversionResult{}, invalid(ProtocolChat, path+".refusal", "refusal is only valid on assistant messages")
+		}
+		if message.Role != "assistant" && message.ReasoningContent != "" {
+			return conversionResult{}, invalid(ProtocolChat, path+".reasoning_content", "reasoning_content is only valid on assistant messages")
+		}
+		if message.Role != "tool" && message.ToolCallID != "" {
+			return conversionResult{}, invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is only valid on tool messages")
 		}
 		if message.Name != "" {
 			return conversionResult{}, unsupported(ProtocolChat, path+".name", "Responses messages cannot preserve Chat message names")
@@ -286,6 +321,9 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 	if err := validateResponsesTerminal(source); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateResponsesOutputItems(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
 	var target chatResponse
 	target.ID, target.Object, target.Created, target.Model = source.ID, "chat.completion", source.CreatedAt, source.Model
 	target.Metadata, target.ServiceTier = source.Metadata, source.ServiceTier
@@ -320,6 +358,7 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 		return conversionResult{}, err
 	}
 	finish := finishStop
+	seenToolCallIDs := make(map[string]string)
 	for index, item := range source.Output {
 		path := fmt.Sprintf("$.output[%d]", index)
 		switch item.Type {
@@ -340,7 +379,11 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 			}
 		case "function_call":
 			sawPortableOutput = true
-			if item.Status != "completed" {
+			if previous, duplicate := seenToolCallIDs[item.CallID]; duplicate {
+				return conversionResult{}, upstreamResponseError(ProtocolResponses, path+".call_id", "duplicate tool call id %q (already used by %s call)", item.CallID, previous)
+			}
+			seenToolCallIDs[item.CallID] = "function"
+			if item.Status != "" && item.Status != "completed" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Chat cannot preserve function_call status %q", item.Status)
 			}
 			arguments, err := normalizeOpenAIToolArguments(ProtocolResponses, path+".arguments", item.Arguments)
@@ -357,7 +400,11 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 			}
 		case "custom_tool_call":
 			sawPortableOutput = true
-			if item.Status != "completed" {
+			if previous, duplicate := seenToolCallIDs[item.CallID]; duplicate {
+				return conversionResult{}, upstreamResponseError(ProtocolResponses, path+".call_id", "duplicate tool call id %q (already used by %s call)", item.CallID, previous)
+			}
+			seenToolCallIDs[item.CallID] = "custom"
+			if item.Status != "" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Chat cannot preserve custom_tool_call status %q", item.Status)
 			}
 			input, err := customInput(item.Input, ProtocolResponses, path+".input")
@@ -375,16 +422,22 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_web_search_call_not_representable", path, "Chat preserves cited answer text but has no web-search lifecycle output item")
 		case "reasoning":
 			sawPortableOutput = true
-			parts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
+			summaryParts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			message.ReasoningContent += joinText(parts)
-			parts, err = decodeResponsesContentRaw(item.Content, path+".content", false)
+			contentParts, err := decodeResponsesContentRaw(item.Content, path+".content", false)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			message.ReasoningContent += joinText(parts)
+			if len(summaryParts) > 0 {
+				if options.LossPolicy == rejectSemanticLoss {
+					return conversionResult{}, unsupported(ProtocolResponses, path+".summary", "Chat reasoning_content represents raw reasoning text, not a Responses reasoning summary")
+				}
+				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_mapped_to_reasoning_content", path+".summary", "Responses reasoning summary was appended to Chat reasoning_content; summary and raw-reasoning boundaries are not representable")
+				message.ReasoningContent += joinText(summaryParts)
+			}
+			message.ReasoningContent += joinText(contentParts)
 		default:
 			return conversionResult{}, unsupported(ProtocolResponses, path+".type", "output item %q cannot be represented by Chat", item.Type)
 		}

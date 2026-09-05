@@ -82,8 +82,16 @@ func TestOpenAIReasoningEffortToMessagesUsesAnthropicIntersection(t *testing.T) 
 	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
 		t.Run("accepted_"+effort, func(t *testing.T) {
 			chatBody := fmt.Sprintf(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"reasoning_effort":%q}`, effort)
-			if _, err := chatRoute.ToUpstreamRequest(context.Background(), []byte(chatBody), conversionOptions{}); err != nil {
+			result, err := chatRoute.ToUpstreamRequest(context.Background(), []byte(chatBody), conversionOptions{})
+			if err != nil {
 				t.Fatalf("Chat -> Messages: %v", err)
+			}
+			var converted messagesRequest
+			if err := json.Unmarshal(result.Body, &converted); err != nil {
+				t.Fatal(err)
+			}
+			if converted.Thinking != nil || converted.OutputConfig == nil || converted.OutputConfig.Effort != effort {
+				t.Fatalf("Chat -> Messages invented thinking or lost effort: %s", result.Body)
 			}
 			responsesBody := fmt.Sprintf(`{"model":"gpt","input":"hi","reasoning":{"effort":%q}}`, effort)
 			if _, err := responsesRoute.ToUpstreamRequest(context.Background(), []byte(responsesBody), conversionOptions{LossPolicy: allowDocumentedLoss}); err != nil {
@@ -340,7 +348,7 @@ func TestAnthropicAndOpenAIUsageUseTheirNativeCacheAccounting(t *testing.T) {
 
 	toMessages := newResponsesMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolResponses})
 	back, err := toMessages.ToClientResponse(context.Background(), []byte(`{
-		"id":"resp_1","object":"response","model":"gpt","status":"completed","output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],
+		"id":"resp_1","object":"response","model":"gpt","status":"completed","output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
 		"usage":{"input_tokens":13,"output_tokens":5,"total_tokens":18,"input_tokens_details":{"cached_tokens":3}}
 	}`), conversionOptions{})
 	if err != nil {

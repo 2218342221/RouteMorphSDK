@@ -10,6 +10,15 @@ func (c *messagesToChatConverter) ToUpstreamRequest(_ context.Context, input []b
 	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateMessagesOutputConfigFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesThinkingFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesContentBlockFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
 	body, diagnostics, err := mapMessagesRequestToChat(input, options)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
 }
@@ -21,6 +30,9 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 	}
 	if source.Model == "" || len(source.Messages) == 0 {
 		return nil, nil, invalid(ProtocolChat, "$", "model and at least one message are required")
+	}
+	if err := validateChatToolDeclarationNames(source.Tools); err != nil {
+		return nil, nil, err
 	}
 	if source.N != nil && *source.N != 1 {
 		return nil, nil, unsupported(ProtocolChat, "$.n", "cross-protocol conversion supports exactly one choice")
@@ -73,6 +85,10 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 	if err != nil {
 		return nil, diagnostics, err
 	}
+	choice, err = normalizeChatChoiceForMessages(choice, source.Tools)
+	if err != nil {
+		return nil, diagnostics, err
+	}
 	if choice.Mode != "" || source.ParallelToolCalls != nil {
 		target.ToolChoice = encodeMessagesToolChoice(choice, source.ParallelToolCalls)
 	}
@@ -83,7 +99,6 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 	if source.ReasoningEffort != "" || format != nil {
 		target.OutputConfig = &messagesOutputConfig{}
 		if source.ReasoningEffort != "" {
-			target.Thinking = &messagesThinking{Type: "adaptive"}
 			target.OutputConfig.Effort = source.ReasoningEffort
 		}
 		if format != nil {
@@ -93,10 +108,21 @@ func mapChatRequestToMessages(input []byte, options conversionOptions) ([]byte, 
 			}{Type: "json_schema", Schema: format.Schema}
 		}
 	}
+	seenToolNames := make(map[string]struct{}, len(source.Tools))
 	for index, tool := range source.Tools {
-		if tool.Type != "function" || tool.Function.Name == "" {
-			return nil, diagnostics, invalid(ProtocolChat, fmt.Sprintf("$.tools[%d]", index), "function tool with a name is required")
+		if tool.Type == "" {
+			return nil, diagnostics, invalid(ProtocolChat, fmt.Sprintf("$.tools[%d].type", index), "tool type is required")
 		}
+		if tool.Type != "function" {
+			return nil, diagnostics, unsupported(ProtocolChat, fmt.Sprintf("$.tools[%d].type", index), "tool type %q has no Messages equivalent", tool.Type)
+		}
+		if tool.Function.Name == "" {
+			return nil, diagnostics, invalid(ProtocolChat, fmt.Sprintf("$.tools[%d].function.name", index), "name is required")
+		}
+		if _, duplicate := seenToolNames[tool.Function.Name]; duplicate {
+			return nil, diagnostics, invalid(ProtocolChat, fmt.Sprintf("$.tools[%d].function.name", index), "duplicate function name %q", tool.Function.Name)
+		}
+		seenToolNames[tool.Function.Name] = struct{}{}
 		schema, err := normalizeMessagesInputSchema(tool.Function.Parameters, fmt.Sprintf("$.tools[%d].function.parameters", index))
 		if err != nil {
 			return nil, diagnostics, err
@@ -231,6 +257,9 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := validateMessagesChoice(ProtocolMessages, choice, source.Tools); err != nil {
+		return nil, nil, err
+	}
 	target.ParallelToolCalls = parallel
 	if choice.Mode != "" {
 		target.ToolChoice = encodeChatToolChoice(choice)
@@ -251,6 +280,7 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 			target.ResponseFormat = mustJSON(map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "response", "schema": source.OutputConfig.Format.Schema}})
 		}
 	}
+	seenToolNames := make(map[string]struct{}, len(source.Tools))
 	for index, tool := range source.Tools {
 		path := fmt.Sprintf("$.tools[%d]", index)
 		if jsonValuePresent(tool.CacheControl) {
@@ -274,6 +304,10 @@ func mapMessagesRequestToChat(input []byte, options conversionOptions) ([]byte, 
 		if tool.Name == "" {
 			return nil, diagnostics, invalid(ProtocolMessages, fmt.Sprintf("$.tools[%d].name", index), "name is required")
 		}
+		if _, duplicate := seenToolNames[tool.Name]; duplicate {
+			return nil, diagnostics, invalid(ProtocolMessages, path+".name", "duplicate function name %q", tool.Name)
+		}
+		seenToolNames[tool.Name] = struct{}{}
 		parameters, err := normalizeFunctionParameters(ProtocolChat, fmt.Sprintf("$.tools[%d].input_schema", index), tool.InputSchema)
 		if err != nil {
 			return nil, diagnostics, err
@@ -445,7 +479,7 @@ func (c *messagesToChatConverter) ToClientResponse(_ context.Context, input []by
 	if err != nil {
 		return conversionResult{}, err
 	}
-	message, err := decodeChatMessage(source.Choices[0].Message, 0)
+	message, err := decodeChatMessageAtPath(source.Choices[0].Message, "$.choices[0].message")
 	if err != nil {
 		return conversionResult{}, err
 	}
@@ -505,6 +539,9 @@ func validateChatToMessagesRequest(input []byte, policy lossPolicy) ([]Diagnosti
 	sawConversation := false
 	for messageIndex, message := range source.Messages {
 		path := fmt.Sprintf("$.messages[%d]", messageIndex)
+		if err := validateChatMessageMetadata(message, path); err != nil {
+			return nil, err
+		}
 		if rawJSONValuePresent(message.Audio) {
 			return nil, unsupported(ProtocolChat, path+".audio", "Chat assistant audio cannot be represented by Messages input")
 		}

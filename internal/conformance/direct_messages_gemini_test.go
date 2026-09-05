@@ -52,7 +52,7 @@ func TestDirectMessagesToGeminiRequestPreservesPortableSemantics(t *testing.T) {
 		t.Fatalf("functionCall = %#v", call)
 	}
 	response := target.Contents[2].Parts[0].FunctionResponse
-	if response == nil || response.ID != "call_1" || response.Name != "weather" || string(response.Response) != `{"temp":20}` {
+	if response == nil || response.ID != "call_1" || response.Name != "weather" || string(response.Response) != `{"output":"{\"temp\":20}"}` {
 		t.Fatalf("functionResponse = %#v", response)
 	}
 	if !hasMessagesGeminiDiagnostic(result.Diagnostics, "gemini_thought_signature_unavailable") {
@@ -94,7 +94,7 @@ func TestDirectGeminiToMessagesRequestPreservesPortableSemantics(t *testing.T) {
 		Type string `json:"type"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(target.ToolChoice, &choice); err != nil || choice.Type != "tool" || choice.Name != "weather" {
+	if err := json.Unmarshal(target.ToolChoice, &choice); err != nil || choice.Type != "any" || choice.Name != "" {
 		t.Fatalf("tool_choice = %s", target.ToolChoice)
 	}
 	if len(target.Messages) != 3 {

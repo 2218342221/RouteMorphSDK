@@ -276,14 +276,14 @@ func TestChatToResponsesStreamIsIncrementalAndComplete(t *testing.T) {
 			functionDoneHasName = event.Name == "ping"
 		}
 	}
-	for _, want := range []string{"response.reasoning_summary_part.added", "response.reasoning_summary_text.delta", "response.reasoning_summary_part.done", "response.output_text.delta", "response.function_call_arguments.done", "response.completed", `"name":"ping"`, `"arguments":"{}"`, `"total_tokens":5`, `"model":"public"`} {
+	for _, want := range []string{"response.content_part.added", "response.reasoning_text.delta", "response.content_part.done", "response.output_text.delta", "response.function_call_arguments.done", "response.completed", `"name":"ping"`, `"arguments":"{}"`, `"total_tokens":5`, `"model":"public"`} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("stream missing %q: %s", want, joined)
 		}
 	}
-	if !(eventPositions["response.reasoning_summary_part.added"] < eventPositions["response.reasoning_summary_text.delta"] &&
-		eventPositions["response.reasoning_summary_text.delta"] < eventPositions["response.reasoning_summary_text.done"] &&
-		eventPositions["response.reasoning_summary_text.done"] < eventPositions["response.reasoning_summary_part.done"]) {
+	if !(eventPositions["response.content_part.added"] < eventPositions["response.reasoning_text.delta"] &&
+		eventPositions["response.reasoning_text.delta"] < eventPositions["response.reasoning_text.done"] &&
+		eventPositions["response.reasoning_text.done"] < eventPositions["response.content_part.done"]) {
 		t.Fatalf("reasoning event lifecycle is out of order: %#v", eventPositions)
 	}
 	if !functionDoneHasName {
@@ -374,6 +374,43 @@ func TestDeprecatedChatFunctionCallFailsClosed(t *testing.T) {
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("stream error=%v, want ErrUnsupported", err)
 	}
+}
+
+func TestChatResponsesResponsesRejectDuplicateCrossKindToolCallIDs(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	tests := []struct {
+		name string
+		plan testRoutePlan
+		body string
+	}{
+		{
+			name: "Responses provider output",
+			plan: mustTestPlan(t, harness, ProtocolChat, ProtocolResponses),
+			body: `{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"f","arguments":"{}","status":"completed"},{"type":"custom_tool_call","id":"ctc_1","call_id":"call_1","name":"c","input":"x"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`,
+		},
+		{
+			name: "Chat provider output",
+			plan: mustTestPlan(t, harness, ProtocolResponses, ProtocolChat),
+			body: `{"id":"chat_1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}},{"id":"call_1","type":"custom","custom":{"name":"c","input":"x"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := harness.ToClientResponse(context.Background(), test.plan, []byte(test.body), conversionOptions{})
+			if !errors.Is(err, ErrUpstreamResponse) || !strings.Contains(err.Error(), "duplicate tool call id") {
+				t.Fatalf("error = %v, want duplicate tool call id ErrUpstreamResponse", err)
+			}
+		})
+	}
+}
+
+func mustTestPlan(t *testing.T, harness *testRouterHarness, client, upstream Protocol) testRoutePlan {
+	t.Helper()
+	plan, err := harness.catalog().Plan(client, upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
 
 func TestOpenAIFunctionStrictDefaultsArePreserved(t *testing.T) {

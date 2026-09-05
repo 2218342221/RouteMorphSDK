@@ -60,7 +60,7 @@ func TestDirectChatToGeminiRichRequest(t *testing.T) {
 		t.Fatalf("functionCall = %#v", callParts[1])
 	}
 	response := got.Contents[2].Parts[0].FunctionResponse
-	if response == nil || response.ID != "call_1" || response.Name != "get_weather" || string(response.Response) != `{"temperature":15}` {
+	if response == nil || response.ID != "call_1" || response.Name != "get_weather" || string(response.Response) != `{"output":"{\"temperature\":15}"}` {
 		t.Fatalf("functionResponse = %#v", response)
 	}
 }

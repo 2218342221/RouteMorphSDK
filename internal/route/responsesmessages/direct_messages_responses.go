@@ -16,6 +16,15 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateMessagesOutputConfigFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesThinkingFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesContentBlockFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source messagesRequest
 	if err := decodeJSON(ProtocolMessages, input, &source); err != nil {
 		return conversionResult{}, err
@@ -76,20 +85,12 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		target.Model = options.Exchange.UpstreamModel
 	}
 	var diagnostics []Diagnostic
-	hasReasoningPolicy := source.Thinking != nil && source.Thinking.Type != "disabled"
-	reasoningPolicyPath := "$.thinking"
-	if source.OutputConfig != nil && source.OutputConfig.Effort != "" {
-		hasReasoningPolicy = true
-		if source.Thinking == nil || source.Thinking.Type == "disabled" {
-			reasoningPolicyPath = "$.output_config.effort"
-		}
-	}
-	if hasReasoningPolicy {
+	if source.Thinking != nil && source.Thinking.Type != "disabled" {
 		if options.LossPolicy == rejectSemanticLoss {
-			return conversionResult{}, unsupported(ProtocolMessages, reasoningPolicyPath, "Messages thinking and effort configuration is not semantically equivalent to Responses reasoning")
+			return conversionResult{}, unsupported(ProtocolMessages, "$.thinking", "Messages thinking configuration is not semantically equivalent to Responses reasoning")
 		}
 		target.Reasoning = &reasoningConfig{Effort: "medium"}
-		diagnostics = appendDiagnostic(diagnostics, "warning", "thinking_policy_approximated", reasoningPolicyPath, "Messages thinking and effort policy was approximated as Responses reasoning")
+		diagnostics = appendDiagnostic(diagnostics, "warning", "thinking_policy_approximated", "$.thinking", "Messages thinking policy was approximated as Responses reasoning")
 		if source.Thinking != nil && source.Thinking.Display != "" {
 			diagnostics = appendDiagnostic(diagnostics, "warning", "thinking_display_not_representable", "$.thinking.display", "Messages thinking display policy was omitted")
 		}
@@ -115,10 +116,14 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 	if err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateMessagesChoiceDeclarations(choice, source.Tools); err != nil {
+		return conversionResult{}, err
+	}
 	if choice.Mode != "" {
 		target.ToolChoice = encodeResponsesToolChoice(choice)
 	}
 	target.ParallelToolCalls = parallelToolCalls
+	seenToolNames := make(map[string]struct{}, len(source.Tools))
 	for index, tool := range source.Tools {
 		path := fmt.Sprintf("$.tools[%d]", index)
 		if len(tool.CacheControl) > 0 && string(tool.CacheControl) != "null" {
@@ -142,6 +147,10 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		if tool.Name == "" {
 			return conversionResult{}, invalid(ProtocolMessages, fmt.Sprintf("$.tools[%d].name", index), "name is required")
 		}
+		if _, duplicate := seenToolNames[tool.Name]; duplicate {
+			return conversionResult{}, invalid(ProtocolMessages, path+".name", "duplicate function name %q", tool.Name)
+		}
+		seenToolNames[tool.Name] = struct{}{}
 		schema, err := normalizeMessagesInputSchema(tool.InputSchema, fmt.Sprintf("$.tools[%d].input_schema", index))
 		if err != nil {
 			return conversionResult{}, err
@@ -285,6 +294,9 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 	if err := validateResponsesTerminal(source); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateResponsesOutputItems(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
 	diagnostics, err := responsesResponseExtensionDiagnostics(source, options.LossPolicy, "$")
 	if err != nil {
 		return conversionResult{}, err
@@ -323,7 +335,7 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 				blocks = append(blocks, converted...)
 			}
 		case "function_call":
-			if item.Status != "completed" {
+			if item.Status != "" && item.Status != "completed" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Messages cannot preserve function_call status %q", item.Status)
 			}
 			arguments, err := normalizeArguments(ProtocolResponses, path+".arguments", item.Arguments)

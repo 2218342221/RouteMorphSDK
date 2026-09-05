@@ -8,12 +8,13 @@ import (
 )
 
 type responsesItem = responseswire.Item
+type responsesContentPart = responseswire.ContentPart
 
 func validateResponsesItems(items []responsesItem, path string) error {
 	for index, item := range items {
 		itemPath := fmt.Sprintf("%s[%d]", path, index)
-		if len(item.EncryptedContent) > 0 && string(item.EncryptedContent) != "null" && item.Type != "reasoning" {
-			return upstreamResponseError(ProtocolResponses, itemPath+".encrypted_content", "encrypted_content is only valid on reasoning items")
+		if len(item.EncryptedContent) > 0 && string(item.EncryptedContent) != "null" && item.Type != "reasoning" && item.Type != "compaction" {
+			return upstreamResponseError(ProtocolResponses, itemPath+".encrypted_content", "encrypted_content is only valid on reasoning or compaction items")
 		}
 		switch item.Type {
 		case "message", "":
@@ -28,8 +29,12 @@ func validateResponsesItems(items []responsesItem, path string) error {
 				return invalid(ProtocolResponses, itemPath, "function_call requires call_id and name")
 			}
 		case "function_call_output":
-			if item.CallID == "" {
-				return invalid(ProtocolResponses, itemPath+".call_id", "call_id is required")
+			if path == "$.output" && (item.ID == "" || item.Status == "" || !jsonValuePresent(item.Output)) {
+				return upstreamResponseError(ProtocolResponses, itemPath, "function_call_output requires id, status, and output")
+			}
+		case "custom_tool_call_output":
+			if path == "$.output" && (item.ID == "" || item.CallID == "" || item.Status == "" || !jsonValuePresent(item.Output)) {
+				return upstreamResponseError(ProtocolResponses, itemPath, "custom_tool_call_output requires id, call_id, status, and output")
 			}
 		}
 	}
@@ -54,7 +59,7 @@ func validateResponsesTerminal(source responsesResponse) error {
 	if source.Status != "completed" && source.Status != "incomplete" {
 		return upstreamResponseError(ProtocolResponses, "$.status", "unexpected terminal status %q", source.Status)
 	}
-	if source.Status == "incomplete" && source.IncompleteDetails != nil && source.IncompleteDetails.Reason != "" && source.IncompleteDetails.Reason != "max_output_tokens" && source.IncompleteDetails.Reason != "content_filter" {
+	if source.Status == "incomplete" && source.IncompleteDetails != nil && source.IncompleteDetails.Reason != "" && source.IncompleteDetails.Reason != "max_output_tokens" && source.IncompleteDetails.Reason != "max_messages" && source.IncompleteDetails.Reason != "content_filter" && source.IncompleteDetails.Reason != "steered" {
 		return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "unsupported incomplete reason %q", source.IncompleteDetails.Reason)
 	}
 	return validateResponsesItems(source.Output, "$.output")

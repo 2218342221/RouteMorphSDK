@@ -134,7 +134,7 @@ func TestValidatingResponsesAllowsCompatibleLifecycleEvents(t *testing.T) {
 			"event: response.refusal.done\ndata: {\"type\":\"response.refusal.done\",\"sequence_number\":6,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"refusal\":\"no\"}\n\n" +
 			"event: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":7,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"refusal\",\"refusal\":\"no\"}}\n\n" +
 			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":8,\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"no\"}]}}\n\n" +
-			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"no\"}]}]}}\n\n",
 	)
 	body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
 	got, err := readWithBuffer(body, 5)
@@ -152,11 +152,13 @@ func TestValidatingResponsesPreservesCustomAndToolSearchEvents(t *testing.T) {
 		"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n" +
 			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"in_progress\"}}\n\n" +
 			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"completed\"}}\n\n" +
-			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":3,\"output_index\":1,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"\"}}\n\n" +
-			"event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"sequence_number\":4,\"output_index\":1,\"item_id\":\"ctc_1\",\"delta\":\"echo hi\"}\n\n" +
-			"event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"sequence_number\":5,\"output_index\":1,\"item_id\":\"ctc_1\",\"input\":\"echo hi\"}\n\n" +
-			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":6,\"output_index\":1,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}}\n\n" +
-			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":7,\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"completed\"},{\"id\":\"tso_1\",\"type\":\"tool_search_output\",\"call_id\":\"call_1\",\"execution\":\"server\",\"status\":\"completed\",\"tools\":[]},{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}]}}\n\n",
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":3,\"output_index\":1,\"item\":{\"id\":\"tso_1\",\"type\":\"tool_search_output\",\"call_id\":\"call_1\",\"execution\":\"server\",\"status\":\"in_progress\",\"tools\":[]}}\n\n" +
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":4,\"output_index\":1,\"item\":{\"id\":\"tso_1\",\"type\":\"tool_search_output\",\"call_id\":\"call_1\",\"execution\":\"server\",\"status\":\"completed\",\"tools\":[]}}\n\n" +
+			"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":5,\"output_index\":2,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"\"}}\n\n" +
+			"event: response.custom_tool_call_input.delta\ndata: {\"type\":\"response.custom_tool_call_input.delta\",\"sequence_number\":6,\"output_index\":2,\"item_id\":\"ctc_1\",\"delta\":\"echo hi\"}\n\n" +
+			"event: response.custom_tool_call_input.done\ndata: {\"type\":\"response.custom_tool_call_input.done\",\"sequence_number\":7,\"output_index\":2,\"item_id\":\"ctc_1\",\"input\":\"echo hi\"}\n\n" +
+			"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":8,\"output_index\":2,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}}\n\n" +
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":9,\"response\":{\"status\":\"completed\",\"output\":[{\"id\":\"ts_1\",\"type\":\"tool_search_call\",\"call_id\":\"call_1\",\"arguments\":{\"query\":\"weather\"},\"execution\":\"server\",\"status\":\"completed\"},{\"id\":\"tso_1\",\"type\":\"tool_search_output\",\"call_id\":\"call_1\",\"execution\":\"server\",\"status\":\"completed\",\"tools\":[]},{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"call_2\",\"name\":\"shell\",\"input\":\"echo hi\"}]}}\n\n",
 	)
 	body := newValidatingSSEBody(context.Background(), io.NopCloser(bytes.NewReader(payload)), core.ProtocolResponses, codec.New(core.ProtocolResponses), int64(len(payload)))
 	got, err := readWithBuffer(body, 11)
@@ -368,6 +370,29 @@ func TestValidatingSSEBodyRejectsMalformedKnownFields(t *testing.T) {
 				t.Fatalf("error=%v, want typed malformed upstream error", err)
 			}
 		})
+	}
+}
+
+func TestValidatingSSEBodyDoesNotExposeMalformedResponsesItemAdded(t *testing.T) {
+	t.Parallel()
+	created := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"status\":\"in_progress\",\"output\":[]}}\n\n"
+	malformed := "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"fc_1\",\"type\":\"function_call\",\"async\":\"yes\"}}\n\n"
+	body := newValidatingSSEBody(
+		context.Background(),
+		io.NopCloser(strings.NewReader(created+malformed)),
+		core.ProtocolResponses,
+		codec.New(core.ProtocolResponses),
+		int64(len(created+malformed)),
+	)
+	got, err := io.ReadAll(body)
+	if !errors.Is(err, core.ErrUpstreamResponse) {
+		t.Fatalf("error = %v, want ErrUpstreamResponse", err)
+	}
+	if string(got) != created {
+		t.Fatalf("visible bytes = %q, want only validated created frame %q", got, created)
+	}
+	if strings.Contains(string(got), "response.output_item.added") {
+		t.Fatalf("malformed added frame was exposed: %q", got)
 	}
 }
 

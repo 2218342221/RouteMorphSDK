@@ -26,6 +26,15 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateMessagesOutputConfigFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesThinkingFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesContentBlockFields(ProtocolMessages, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source messagesRequest
 	if err := decodeJSON(ProtocolMessages, input, &source); err != nil {
 		return conversionResult{}, err
@@ -68,7 +77,18 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 	var diagnostics []Diagnostic
 	if source.OutputConfig != nil {
 		if source.OutputConfig.Effort != "" {
-			return conversionResult{}, unsupported(ProtocolMessages, "$.output_config.effort", "Messages reasoning effort is not semantically equivalent to Gemini thinkingConfig")
+			switch source.OutputConfig.Effort {
+			case "low", "medium", "high":
+			case "xhigh", "max":
+				return conversionResult{}, unsupported(ProtocolMessages, "$.output_config.effort", "Messages effort %q has no official Gemini thinkingLevel mapping", source.OutputConfig.Effort)
+			default:
+				return conversionResult{}, invalid(ProtocolMessages, "$.output_config.effort", "unsupported Messages effort %q", source.OutputConfig.Effort)
+			}
+			level, err := normalizeGeminiThinkingLevel(ProtocolMessages, "$.output_config.effort", source.OutputConfig.Effort)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			target.GenerationConfig = &geminiGenerationConfig{ThinkingConfig: &geminiThinkingConfig{ThinkingLevel: level}}
 		}
 		if source.OutputConfig.Format != nil {
 			if source.OutputConfig.Format.Type != "json_schema" {
@@ -81,7 +101,11 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 			if err != nil {
 				return conversionResult{}, err
 			}
-			target.GenerationConfig = &geminiGenerationConfig{ResponseMIMEType: "application/json", ResponseJSONSchema: schema}
+			if target.GenerationConfig == nil {
+				target.GenerationConfig = &geminiGenerationConfig{}
+			}
+			target.GenerationConfig.ResponseMIMEType = "application/json"
+			target.GenerationConfig.ResponseJSONSchema = schema
 		}
 	}
 	if target.GenerationConfig == nil {
@@ -116,6 +140,7 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 
 	if len(source.Tools) > 0 {
 		tool := geminiTool{}
+		seenToolNames := make(map[string]struct{}, len(source.Tools))
 		for index, function := range source.Tools {
 			path := fmt.Sprintf("$.tools[%d]", index)
 			if jsonValuePresent(function.CacheControl) {
@@ -127,6 +152,10 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 			if function.Name == "" {
 				return conversionResult{}, invalid(ProtocolMessages, path+".name", "name is required")
 			}
+			if _, duplicate := seenToolNames[function.Name]; duplicate {
+				return conversionResult{}, invalid(ProtocolMessages, path+".name", "duplicate function name %q", function.Name)
+			}
+			seenToolNames[function.Name] = struct{}{}
 			if function.Strict != nil {
 				return conversionResult{}, unsupported(ProtocolMessages, path+".strict", "Gemini function declarations cannot preserve Anthropic strict-tool semantics")
 			}
@@ -157,6 +186,9 @@ func (c *messagesToGeminiConverter) ToUpstreamRequest(_ context.Context, input [
 
 	choice, parallel, err := decodeMessagesToolChoice(source.ToolChoice)
 	if err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateMessagesToolChoiceDeclarations(choice, source.Tools); err != nil {
 		return conversionResult{}, err
 	}
 	if parallel != nil {
@@ -260,7 +292,11 @@ func (c *messagesToGeminiConverter) ToClientResponse(_ context.Context, input []
 	if candidate.Content.Role != "" && candidate.Content.Role != "model" {
 		return conversionResult{}, upstreamResponseError(ProtocolGenerateContent, "$.candidates[0].content.role", "expected model role, got %q", candidate.Content.Role)
 	}
-	blocks, blockDiagnostics, hasToolCall, err := geminiPartsToMessages(candidate.Content.Parts, "assistant", "$.candidates[0].content.parts", nil)
+	reservedCallIDs := make(map[string]struct{})
+	if err := reserveGeminiMessagesCallIDs(reservedCallIDs, candidate.Content.Parts, "$.candidates[0].content.parts", true); err != nil {
+		return conversionResult{}, err
+	}
+	blocks, blockDiagnostics, hasToolCall, err := geminiPartsToMessages(candidate.Content.Parts, "assistant", "$.candidates[0].content.parts", newGeminiCallTracker(reservedCallIDs))
 	if err != nil {
 		return conversionResult{}, err
 	}

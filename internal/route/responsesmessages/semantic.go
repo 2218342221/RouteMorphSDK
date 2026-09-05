@@ -28,6 +28,7 @@ const (
 	toolChoiceNone     = core.ToolChoiceNone
 	toolChoiceRequired = core.ToolChoiceRequired
 	toolChoiceNamed    = core.ToolChoiceNamed
+	toolChoiceAllowed  = core.ToolChoiceAllowed
 )
 
 type toolChoice = core.ToolChoice

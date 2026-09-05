@@ -1,6 +1,7 @@
 package responsesgemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -66,14 +67,19 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 			target.Text = mustJSON(map[string]any{"format": map[string]any{"type": "json_object"}})
 		}
 		if config.ThinkingConfig != nil {
-			if options.LossPolicy == rejectSemanticLoss {
-				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig", "Gemini thinking is not semantically equivalent to Responses reasoning")
+			if config.ThinkingConfig.ThinkingBudget != nil {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingBudget", "Responses reasoning cannot preserve an exact thinking-token budget")
 			}
-			target.Reasoning = &reasoningConfig{Effort: strings.ToLower(config.ThinkingConfig.ThinkingLevel)}
 			if config.ThinkingConfig.IncludeThoughts {
-				target.Reasoning.Summary = "auto"
+				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.includeThoughts", "Responses cannot preserve Gemini's thought-inclusion policy without translating provider reasoning state")
 			}
-			diagnostics = appendDiagnostic(diagnostics, "warning", "thinking_policy_approximated", "$.generationConfig.thinkingConfig", "Gemini thinking level was approximated as Responses reasoning effort")
+			level, err := normalizeGeminiThinkingLevel(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingLevel", config.ThinkingConfig.ThinkingLevel)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			if level != "" {
+				target.Reasoning = &reasoningConfig{Effort: strings.ToLower(level)}
+			}
 		}
 	}
 	if source.SystemInstruction != nil {
@@ -122,10 +128,27 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 	if source.ToolConfig != nil {
 		mode := source.ToolConfig.FunctionCallingConfig.Mode
 		allowed := source.ToolConfig.FunctionCallingConfig.AllowedFunctionNames
+		declared := make(map[string]struct{})
+		for _, tool := range source.Tools {
+			for _, function := range tool.FunctionDeclarations {
+				declared[function.Name] = struct{}{}
+			}
+		}
+		seenAllowed := make(map[string]struct{}, len(allowed))
+		for index, name := range allowed {
+			if _, ok := declared[name]; !ok {
+				return conversionResult{}, invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", index), "function %q is not declared", name)
+			}
+			if _, duplicate := seenAllowed[name]; duplicate {
+				return conversionResult{}, invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", index), "duplicate allowed function %q", name)
+			}
+			seenAllowed[name] = struct{}{}
+		}
+		allAllowed := len(allowed) > 0 && len(allowed) == len(declared)
 		var choice toolChoice
 		switch mode {
 		case "", "AUTO":
-			if len(allowed) != 0 {
+			if len(allowed) != 0 && !allAllowed {
 				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "AUTO with allowedFunctionNames has no exact Responses tool-choice mapping")
 			}
 			choice.Mode = toolChoiceAuto
@@ -136,15 +159,15 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 			choice.Mode = toolChoiceNone
 		case "ANY":
 			choice.Mode = toolChoiceRequired
-			if len(allowed) == 1 {
+			if len(allowed) > 0 && !allAllowed && len(allowed) == 1 {
 				choice = toolChoice{Mode: toolChoiceNamed, Name: allowed[0]}
-			} else if len(allowed) > 1 {
-				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "Responses cannot express a choice restricted to multiple named functions")
+			} else if len(allowed) > 1 && !allAllowed {
+				choice = toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceRequired, AllowedNames: append([]string(nil), allowed...)}
 			}
 		case "VALIDATED":
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "VALIDATED permits either natural-language output or a validated function call and has no exact Responses mapping")
 		default:
-			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "mode %q is not portable", mode)
+			return conversionResult{}, invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "unknown function-calling mode %q", mode)
 		}
 		target.ToolChoice = encodeResponsesToolChoice(choice)
 	}
@@ -152,6 +175,10 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 	callIDsByName := make(map[string][]string)
 	callNamesByID := make(map[string]string)
 	consumedCallIDs := make(map[string]bool)
+	reservedCallIDs, err := reserveGeminiRequestCallIDs(source.Contents)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	generatedCallID := 0
 	for contentIndex, content := range source.Contents {
 		role := "user"
@@ -195,8 +222,7 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 				}
 				callID := part.FunctionCall.ID
 				if callID == "" {
-					generatedCallID++
-					callID = fmt.Sprintf("rm_call_%d", generatedCallID)
+					callID = nextGeneratedGeminiCallID(&generatedCallID, reservedCallIDs)
 					diagnostics = appendDiagnostic(diagnostics, "warning", "generated_function_call_id", path+".functionCall.id", "Gemini omitted the optional function call id; RouteMorph generated a request-local id")
 				}
 				if _, exists := callNamesByID[callID]; exists {
@@ -237,7 +263,11 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 					return conversionResult{}, invalid(ProtocolGenerateContent, path+".functionResponse.name", "function response name %q does not match call name %q", part.FunctionResponse.Name, callName)
 				}
 				consumedCallIDs[callID] = true
-				items = append(items, responsesItem{Type: "function_call_output", CallID: callID, Output: json.RawMessage(mustJSONString(string(part.FunctionResponse.Response)))})
+				output, err := geminiFunctionResponseToResponses(part.FunctionResponse, path+".functionResponse")
+				if err != nil {
+					return conversionResult{}, err
+				}
+				items = append(items, responsesItem{Type: "function_call_output", CallID: callID, Output: output})
 			case part.Thought || part.ThoughtSignature != "":
 				return conversionResult{}, unsupported(ProtocolGenerateContent, path, "Gemini thought and thoughtSignature cannot be injected into Responses")
 			default:
@@ -257,12 +287,101 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
 }
 
+func reserveGeminiRequestCallIDs(contents []geminiContent) (map[string]struct{}, error) {
+	reserved := make(map[string]struct{})
+	for contentIndex, content := range contents {
+		for partIndex, part := range content.Parts {
+			if part.FunctionCall == nil || part.FunctionCall.ID == "" {
+				continue
+			}
+			callID := part.FunctionCall.ID
+			if _, duplicate := reserved[callID]; duplicate {
+				return nil, invalid(ProtocolGenerateContent, fmt.Sprintf("$.contents[%d].parts[%d].functionCall.id", contentIndex, partIndex), "duplicate function call id %q", callID)
+			}
+			reserved[callID] = struct{}{}
+		}
+	}
+	return reserved, nil
+}
+
+func geminiFunctionResponseToResponses(response *geminiFunctionResponse, path string) (json.RawMessage, error) {
+	if len(response.Parts) == 0 {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(response.Response, &object); err != nil || object == nil {
+			return nil, invalid(ProtocolGenerateContent, path+".response", "must be a JSON object")
+		}
+		if _, exists := object["error"]; exists {
+			return nil, unsupported(ProtocolGenerateContent, path+".response.error", "Responses function_call_output has no tool-error state")
+		}
+		if len(object) == 0 {
+			return json.RawMessage(`""`), nil
+		}
+		if rawOutput, exists := object["output"]; exists {
+			if len(object) != 1 {
+				return nil, unsupported(ProtocolGenerateContent, path+".response", "Responses cannot preserve fields alongside Gemini function-response output")
+			}
+			return geminiFunctionResponseToolOutput(rawOutput, path+".response.output")
+		}
+		return mustJSON(string(bytes.TrimSpace(response.Response))), nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(response.Response, &object); err != nil || object == nil {
+		return nil, invalid(ProtocolGenerateContent, path+".response", "must be a JSON object")
+	}
+	if _, exists := object["error"]; exists {
+		return nil, unsupported(ProtocolGenerateContent, path+".response.error", "Responses function_call_output has no tool-error state")
+	}
+	if len(object) != 0 {
+		return nil, unsupported(ProtocolGenerateContent, path, "Responses cannot preserve the ordering between Gemini functionResponse.response and media parts")
+	}
+	converted := make([]responsesContentPart, 0, len(response.Parts))
+	for index, part := range response.Parts {
+		partPath := fmt.Sprintf("%s.parts[%d]", path, index)
+		if part.FileData != nil {
+			return nil, unsupported(ProtocolGenerateContent, partPath+".fileData", "functionResponse.parts fileData is not supported by the Gemini Developer API")
+		}
+		if part.InlineData == nil {
+			return nil, invalid(ProtocolGenerateContent, partPath, "inlineData is required")
+		}
+		media := &portableMedia{MIMEType: part.InlineData.MIMEType, Data: part.InlineData.Data}
+		mimeType := strings.ToLower(media.MIMEType)
+		switch {
+		case strings.HasPrefix(mimeType, "image/"):
+			if !validImageMIMEType(mimeType) {
+				return nil, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "Responses images require JPEG, PNG, GIF, or WebP")
+			}
+			converted = append(converted, responsesContentPart{Type: "input_image", ImageURL: dataURL(media)})
+		case mimeType == "application/pdf":
+			converted = append(converted, responsesContentPart{Type: "input_file", FileData: openAIFileData(media)})
+		default:
+			return nil, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "only inline image and PDF function-response media are portable to Responses")
+		}
+	}
+	return mustJSON(converted), nil
+}
+
+func geminiFunctionResponseToolOutput(raw json.RawMessage, path string) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	var text string
+	if len(trimmed) > 0 && trimmed[0] == '"' && json.Unmarshal(trimmed, &text) == nil {
+		return append(json.RawMessage(nil), trimmed...), nil
+	}
+	var value any
+	if len(trimmed) == 0 || json.Unmarshal(trimmed, &value) != nil {
+		return nil, invalid(ProtocolGenerateContent, path, "output must be valid JSON")
+	}
+	return mustJSON(string(trimmed)), nil
+}
+
 func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
 	var source responsesResponse
 	if err := decodeJSON(ProtocolResponses, input, &source); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateResponsesTerminal(source); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateResponsesOutputItems(ProtocolResponses, input); err != nil {
 		return conversionResult{}, err
 	}
 	var target geminiResponse
@@ -299,7 +418,7 @@ func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input [
 			}
 			parts = append(parts, converted...)
 		case "function_call":
-			if item.Status != "completed" {
+			if item.Status != "" && item.Status != "completed" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Gemini cannot preserve function_call status %q", item.Status)
 			}
 			arguments, err := normalizeArguments(ProtocolResponses, path+".arguments", item.Arguments)
@@ -312,7 +431,32 @@ func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input [
 				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_item_id_not_representable", path+".id", "Gemini preserves call_id but has no separate output item id")
 			}
 		case "reasoning":
-			return conversionResult{}, unsupported(ProtocolResponses, path, "Responses reasoning summary is not equivalent to Gemini signed thought")
+			if item.Status != "" && item.Status != "completed" {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Gemini cannot preserve reasoning status %q", item.Status)
+			}
+			if jsonValuePresent(item.EncryptedContent) {
+				return conversionResult{}, unsupported(ProtocolResponses, path+".encrypted_content", "provider-encrypted Responses reasoning cannot be represented by Gemini")
+			}
+			summaryParts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			contentParts, err := decodeResponsesContentRaw(item.Content, path+".content", false)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			if len(summaryParts) > 0 {
+				if options.LossPolicy == rejectSemanticLoss {
+					return conversionResult{}, unsupported(ProtocolResponses, path+".summary", "a Responses reasoning summary is not raw Gemini thought text")
+				}
+				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_approximated_as_gemini_thought", path+".summary", "Responses reasoning summary was emitted as unsigned Gemini thought text")
+				for _, reasoningPart := range summaryParts {
+					parts = append(parts, geminiPart{Text: reasoningPart.Text, Thought: true})
+				}
+			}
+			for _, reasoningPart := range contentParts {
+				parts = append(parts, geminiPart{Text: reasoningPart.Text, Thought: true})
+			}
 		default:
 			return conversionResult{}, unsupported(ProtocolResponses, path+".type", "output item %q cannot be represented by Gemini", item.Type)
 		}
@@ -338,24 +482,26 @@ func (c *geminiToResponsesConverter) ToClientResponse(_ context.Context, input [
 }
 
 func (c *geminiToResponsesConverter) NewClientStream(_ context.Context, options conversionOptions) (responseStreamConverter, error) {
-	return &responsesToGeminiStreamConverter{clientModel: options.Exchange.ClientModel, LossPolicy: options.LossPolicy, calls: make(map[string]*geminiFunctionCall), items: make(map[string]responsesItem), completedItems: make(map[string]bool), completedArguments: make(map[string]string)}, nil
+	return &responsesToGeminiStreamConverter{clientModel: options.Exchange.ClientModel, LossPolicy: options.LossPolicy, calls: make(map[string]*geminiFunctionCall), items: make(map[string]responsesItem), completedItems: make(map[string]bool), completedArguments: make(map[string]string), emittedReasoning: make(map[string]string)}, nil
 }
 
 type responsesToGeminiStreamConverter struct {
-	id                 string
-	model              string
-	providerID         string
-	providerModel      string
-	clientModel        string
-	LossPolicy         lossPolicy
-	calls              map[string]*geminiFunctionCall
-	items              map[string]responsesItem
-	completedItems     map[string]bool
-	completedArguments map[string]string
-	emittedText        string
-	emittedRefusal     string
-	completed          bool
-	finalized          bool
+	id                       string
+	model                    string
+	providerID               string
+	providerModel            string
+	clientModel              string
+	LossPolicy               lossPolicy
+	calls                    map[string]*geminiFunctionCall
+	items                    map[string]responsesItem
+	completedItems           map[string]bool
+	completedArguments       map[string]string
+	emittedText              string
+	emittedRefusal           string
+	emittedReasoning         map[string]string
+	reportedReasoningSummary bool
+	completed                bool
+	finalized                bool
 }
 
 func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame streamFrame) ([]streamFrame, []Diagnostic, error) {
@@ -418,6 +564,26 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		}
 		c.emittedRefusal += event.Delta
 		return []streamFrame{{Data: c.chunk([]geminiPart{{Text: event.Delta}}, "", nil)}}, []Diagnostic{{Severity: "warning", Code: "responses_refusal_approximated", Path: "$.delta", Message: "Responses refusal content was emitted as Gemini text"}}, nil
+	case "response.reasoning_text.delta":
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		c.emittedReasoning[event.ItemID] += event.Delta
+		return []streamFrame{{Data: c.chunk([]geminiPart{{Text: event.Delta, Thought: true}}, "", nil)}}, nil, nil
+	case "response.reasoning_summary_text.delta":
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		if c.LossPolicy == rejectSemanticLoss {
+			return nil, nil, unsupported(ProtocolResponses, "$.type", "a Responses reasoning summary is not raw Gemini thought text")
+		}
+		c.emittedReasoning[event.ItemID] += event.Delta
+		diagnostics := []Diagnostic(nil)
+		if !c.reportedReasoningSummary {
+			c.reportedReasoningSummary = true
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_approximated_as_gemini_thought", "$.type", "Responses reasoning summary was emitted as unsigned Gemini thought text")
+		}
+		return []streamFrame{{Data: c.chunk([]geminiPart{{Text: event.Delta, Thought: true}}, "", nil)}}, diagnostics, nil
 	case "response.output_item.added":
 		if event.Item.ID == "" {
 			return nil, nil, invalid(ProtocolResponses, "$.item.id", "output item id is required")
@@ -438,7 +604,7 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 			}
 			c.calls[event.Item.ID] = &geminiFunctionCall{ID: event.Item.CallID, Name: event.Item.Name, Args: json.RawMessage{}}
 		case "reasoning":
-			return nil, nil, unsupported(ProtocolResponses, "$.item", "Responses reasoning cannot be represented as a signed Gemini thought")
+			// Unsigned reasoning_text is represented by Gemini thought parts.
 		default:
 			return nil, nil, unsupported(ProtocolResponses, "$.item.type", "output item %q cannot be represented by Gemini", event.Item.Type)
 		}
@@ -454,7 +620,7 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		if err := c.validateOutputItemDone(event.ItemID, event.Item); err != nil {
 			return nil, nil, err
 		}
-		if event.Item.Type == "message" {
+		if event.Item.Type == "message" || event.Item.Type == "reasoning" {
 			return nil, nil, nil
 		}
 		call := c.calls[event.Item.ID]
@@ -508,11 +674,24 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 			return nil, nil, upstreamResponseError(ProtocolResponses, "$.arguments", "completed function arguments do not match streamed deltas")
 		}
 		return nil, nil, nil
-	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_text.delta", "response.reasoning_text.done":
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done":
 		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
 			return nil, nil, err
 		}
-		return nil, nil, unsupported(ProtocolResponses, "$.type", "Responses reasoning cannot be represented as a signed Gemini thought")
+		if c.LossPolicy == rejectSemanticLoss {
+			return nil, nil, unsupported(ProtocolResponses, "$.type", "a Responses reasoning summary is not raw Gemini thought text")
+		}
+		if c.reportedReasoningSummary {
+			return nil, nil, nil
+		}
+		c.reportedReasoningSummary = true
+		diagnostics := appendDiagnostic(nil, "warning", "responses_reasoning_summary_approximated_as_gemini_thought", "$.type", "Responses reasoning summary was emitted as unsigned Gemini thought text")
+		return nil, diagnostics, nil
+	case "response.reasoning_text.done":
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, nil
 	case "response.completed", "response.incomplete", "response.failed":
 		var response responsesResponse
 		if err := json.Unmarshal(event.Response, &response); err != nil {
@@ -632,15 +811,18 @@ func (c *responsesToGeminiStreamConverter) validateKnownItem(itemID, wantType st
 }
 
 func (c *responsesToGeminiStreamConverter) validateContentPartEvent(itemID string, raw json.RawMessage) error {
-	if err := c.validateKnownItem(itemID, "message"); err != nil {
-		return err
-	}
 	var part responsesContentPart
 	if len(raw) == 0 || json.Unmarshal(raw, &part) != nil {
 		return invalid(ProtocolResponses, "$.part", "valid content part is required")
 	}
-	if part.Type != "output_text" && part.Type != "refusal" {
+	wantType := "message"
+	if part.Type == "reasoning_text" {
+		wantType = "reasoning"
+	} else if part.Type != "output_text" && part.Type != "refusal" {
 		return unsupported(ProtocolResponses, "$.part.type", "content part %q cannot be represented by Gemini", part.Type)
+	}
+	if err := c.validateKnownItem(itemID, wantType); err != nil {
+		return err
 	}
 	_, err := decodeResponsesContent([]responsesContentPart{part}, "$.part", false)
 	return err
@@ -660,7 +842,16 @@ func (c *responsesToGeminiStreamConverter) validateOutputItemDone(itemID string,
 		return invalid(ProtocolResponses, "$.item.status", "completed function_call item must have status completed")
 	}
 	if item.Type == "reasoning" {
-		return unsupported(ProtocolResponses, "$.item.type", "Responses reasoning cannot be represented as a signed Gemini thought")
+		if jsonValuePresent(item.EncryptedContent) {
+			return unsupported(ProtocolResponses, "$.item.encrypted_content", "provider-encrypted Responses reasoning cannot be represented by Gemini")
+		}
+		summaryParts, err := decodeResponsesContentRaw(item.Summary, "$.item.summary", false)
+		if err != nil {
+			return err
+		}
+		if len(summaryParts) > 0 && c.LossPolicy == rejectSemanticLoss {
+			return unsupported(ProtocolResponses, "$.item.summary", "a Responses reasoning summary is not raw Gemini thought text")
+		}
 	}
 	if item.Type == "function_call" && !jsonValuePresent(item.Arguments) {
 		return invalid(ProtocolResponses, "$.item.arguments", "completed function_call arguments are required")
@@ -756,7 +947,35 @@ func (c *responsesToGeminiStreamConverter) terminalOutputChunks(response respons
 			delete(c.calls, item.ID)
 			c.completedItems[item.ID] = true
 		case "reasoning":
-			return nil, diagnostics, unsupported(ProtocolResponses, path, "Responses reasoning cannot be represented as a signed Gemini thought")
+			if jsonValuePresent(item.EncryptedContent) {
+				return nil, diagnostics, unsupported(ProtocolResponses, path+".encrypted_content", "provider-encrypted Responses reasoning cannot be represented by Gemini")
+			}
+			summaryParts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
+			if err != nil {
+				return nil, diagnostics, err
+			}
+			contentParts, err := decodeResponsesContentRaw(item.Content, path+".content", false)
+			if err != nil {
+				return nil, diagnostics, err
+			}
+			if len(summaryParts) > 0 {
+				if c.LossPolicy == rejectSemanticLoss {
+					return nil, diagnostics, unsupported(ProtocolResponses, path+".summary", "a Responses reasoning summary is not raw Gemini thought text")
+				}
+				if !c.reportedReasoningSummary {
+					c.reportedReasoningSummary = true
+					diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_approximated_as_gemini_thought", path+".summary", "Responses reasoning summary was emitted as unsigned Gemini thought text")
+				}
+			}
+			complete := joinText(summaryParts) + joinText(contentParts)
+			suffix, rest, err := consumeStreamPrefix(c.emittedReasoning[item.ID], complete, path+".content")
+			if err != nil {
+				return nil, diagnostics, err
+			}
+			c.emittedReasoning[item.ID] = rest
+			if suffix != "" {
+				frames = append(frames, streamFrame{Data: c.chunk([]geminiPart{{Text: suffix, Thought: true}}, "", nil)})
+			}
 		default:
 			return nil, diagnostics, unsupported(ProtocolResponses, path+".type", "output item %q cannot be represented by Gemini", item.Type)
 		}
@@ -772,6 +991,11 @@ func (c *responsesToGeminiStreamConverter) terminalOutputChunks(response respons
 	}
 	if remainingText != "" || remainingRefusal != "" {
 		return nil, diagnostics, upstreamResponseError(ProtocolResponses, "$.response.output", "terminal output is missing content previously emitted as deltas")
+	}
+	for itemID, remaining := range c.emittedReasoning {
+		if remaining != "" {
+			return nil, diagnostics, upstreamResponseError(ProtocolResponses, "$.response.output", "terminal output is missing reasoning previously emitted for item %q", itemID)
+		}
 	}
 	return frames, diagnostics, nil
 }

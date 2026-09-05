@@ -141,7 +141,7 @@ func TestRouterChatResponsesRoundTrip(t *testing.T) {
 	if request["model"] != "provider-model" {
 		t.Fatalf("upstream request = %s", execution.Result.Body)
 	}
-	response := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"provider-model","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	response := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"provider-model","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 	converted, err := harness.ToClientResponse(context.Background(), execution.Plan, response, options)
 	if err != nil {
 		t.Fatalf("ToClientResponse() error = %v", err)
@@ -246,7 +246,7 @@ func TestResponseStreamLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completed := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider-model","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)}
+	completed := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider-model","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)}
 	converted, _, err := stream.Convert(context.Background(), completed)
 	if err != nil || len(converted) < 2 || !converted[len(converted)-1].Done {
 		t.Fatalf("Convert() frames=%#v error=%v", converted, err)

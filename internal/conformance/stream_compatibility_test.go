@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const terminalOnlyResponsesEvent = `{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`
+const terminalOnlyResponsesEvent = `{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`
 
 func TestResponsesTerminalOnlyStreamReplaysOutput(t *testing.T) {
 	tests := []struct {

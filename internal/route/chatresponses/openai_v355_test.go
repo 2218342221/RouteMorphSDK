@@ -318,7 +318,7 @@ func TestOpenAIV355CustomToolsNonStreaming(t *testing.T) {
 
 func TestOpenAIV355CustomToolResponses(t *testing.T) {
 	chatToResponses := New(core.RouteSpec{From: ProtocolChat, To: ProtocolResponses})
-	responsesBody := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"id":"ctc_1","type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo hi","status":"completed","caller":{"type":"direct"}}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	responsesBody := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo hi"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 	converted, err := chatToResponses.ToClientResponse(context.Background(), responsesBody, core.ConversionOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -340,8 +340,8 @@ func TestOpenAIV355CustomToolResponses(t *testing.T) {
 	if err := json.Unmarshal(converted.Body, &response); err != nil {
 		t.Fatal(err)
 	}
-	if got := response["output"].([]any)[0].(map[string]any)["status"]; got != "completed" {
-		t.Fatalf("custom Responses output status = %v, want completed: %s", got, converted.Body)
+	if got, exists := response["output"].([]any)[0].(map[string]any)["status"]; exists {
+		t.Fatalf("custom Responses output invented non-schema status = %v: %s", got, converted.Body)
 	}
 }
 
@@ -490,7 +490,11 @@ func TestOpenAIV355ResponsesRequestToolCallStatus(t *testing.T) {
 	converter := New(core.RouteSpec{From: ProtocolResponses, To: ProtocolChat})
 
 	for _, call := range calls {
-		for _, status := range []string{"", "completed"} {
+		acceptedStatuses := []string{""}
+		if call.name == "function_call" {
+			acceptedStatuses = append(acceptedStatuses, "completed")
+		}
+		for _, status := range acceptedStatuses {
 			name := status
 			statusField := ""
 			if status == "" {
@@ -506,7 +510,11 @@ func TestOpenAIV355ResponsesRequestToolCallStatus(t *testing.T) {
 			})
 		}
 
-		for _, status := range []string{"in_progress", "incomplete"} {
+		unsupportedStatuses := []string{"in_progress", "incomplete"}
+		if call.name == "custom_tool_call" {
+			unsupportedStatuses = append(unsupportedStatuses, "completed", "queued")
+		}
+		for _, status := range unsupportedStatuses {
 			t.Run(call.name+"/unsupported/"+status, func(t *testing.T) {
 				body := `{"model":"m","input":[` + call.item + `,"status":"` + status + `"}]}`
 				_, err := converter.ToUpstreamRequest(context.Background(), []byte(body), core.ConversionOptions{})
@@ -516,13 +524,15 @@ func TestOpenAIV355ResponsesRequestToolCallStatus(t *testing.T) {
 			})
 		}
 
-		t.Run(call.name+"/invalid", func(t *testing.T) {
-			body := `{"model":"m","input":[` + call.item + `,"status":"queued"}]}`
-			_, err := converter.ToUpstreamRequest(context.Background(), []byte(body), core.ConversionOptions{})
-			if !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), "$.input[0].status") {
-				t.Fatalf("error = %v, want ErrInvalidPayload at $.input[0].status", err)
-			}
-		})
+		if call.name == "function_call" {
+			t.Run(call.name+"/invalid", func(t *testing.T) {
+				body := `{"model":"m","input":[` + call.item + `,"status":"queued"}]}`
+				_, err := converter.ToUpstreamRequest(context.Background(), []byte(body), core.ConversionOptions{})
+				if !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), "$.input[0].status") {
+					t.Fatalf("error = %v, want ErrInvalidPayload at $.input[0].status", err)
+				}
+			})
+		}
 	}
 }
 
@@ -541,15 +551,34 @@ func TestOpenAIV355ResponsesReasoningOutputUnion(t *testing.T) {
 			statusField = `,"status":"` + status + `"`
 		}
 		t.Run("accepted/"+name, func(t *testing.T) {
-			item := `{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}],"content":[{"type":"reasoning_text","text":"detail"}]` + statusField + `}`
+			item := `{"id":"rs_1","type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"detail"}]` + statusField + `}`
 			result, err := converter.ToClientResponse(context.Background(), responseWithItem(item), core.ConversionOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(result.Body), `"reasoning_content":"summarydetail"`) {
+			if !strings.Contains(string(result.Body), `"reasoning_content":"detail"`) {
 				t.Fatalf("reasoning content was not preserved: %s", result.Body)
 			}
 		})
+	}
+
+	summaryAndContent := responseWithItem(`{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"summary"}],"content":[{"type":"reasoning_text","text":"detail"}],"status":"completed"}`)
+	if _, err := converter.ToClientResponse(context.Background(), summaryAndContent, core.ConversionOptions{}); !errors.Is(err, core.ErrUnsupported) || !strings.Contains(err.Error(), "$.output[0].summary") {
+		t.Fatalf("strict summary error = %v, want ErrUnsupported at summary", err)
+	}
+	result, err := converter.ToClientResponse(context.Background(), summaryAndContent, core.ConversionOptions{LossPolicy: core.AllowDocumentedLoss})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(result.Body), `"reasoning_content":"summarydetail"`) {
+		t.Fatalf("documented-loss reasoning content = %s", result.Body)
+	}
+	foundDiagnostic := false
+	for _, diagnostic := range result.Diagnostics {
+		foundDiagnostic = foundDiagnostic || diagnostic.Code == "responses_reasoning_summary_mapped_to_reasoning_content"
+	}
+	if !foundDiagnostic {
+		t.Fatalf("missing reasoning summary diagnostic: %#v", result.Diagnostics)
 	}
 
 	for _, test := range []struct {

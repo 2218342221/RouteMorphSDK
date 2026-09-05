@@ -1,6 +1,7 @@
 package responsesmessages
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -18,6 +19,9 @@ func decodeResponsesContentRaw(raw json.RawMessage, path string, input bool) ([]
 	}
 	if raw[0] == '"' {
 		return textParts(rawString(raw)), nil
+	}
+	if err := validateResponsesContentArray(ProtocolResponses, raw, path); err != nil {
+		return nil, err
 	}
 	var source []responsesContentPart
 	if err := json.Unmarshal(raw, &source); err != nil {
@@ -145,27 +149,96 @@ func encodeResponsesContent(parts []portablePart, input bool) ([]responsesConten
 }
 
 func decodeResponsesToolChoice(raw json.RawMessage) (toolChoice, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil
 	}
-	if raw[0] == '"' {
-		value := rawString(raw)
+	if trimmed[0] == '"' {
+		var value string
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice", "must be a string or object")
+		}
 		if value != string(toolChoiceAuto) && value != string(toolChoiceNone) && value != string(toolChoiceRequired) {
-			return toolChoice{}, unsupported(ProtocolResponses, "$.tool_choice", "tool choice %q is not portable", value)
+			return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice", "unknown tool choice %q", value)
 		}
 		return toolChoice{Mode: toolChoiceMode(value)}, nil
+	}
+	var discriminator struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(trimmed, &discriminator); err != nil {
+		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice", "must be a string or object")
+	}
+	if discriminator.Type == "" {
+		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice.type", "non-empty string is required")
+	}
+	if discriminator.Type == "allowed_tools" {
+		fields, err := rejectUnknownResponsesObject(ProtocolResponses, trimmed, "$.tool_choice", "type", "mode", "tools")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var mode string
+		if err := json.Unmarshal(fields["mode"], &mode); err != nil || (mode != string(toolChoiceAuto) && mode != string(toolChoiceRequired)) {
+			return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice.mode", "must be %q or %q", toolChoiceAuto, toolChoiceRequired)
+		}
+		var references []json.RawMessage
+		if err := json.Unmarshal(fields["tools"], &references); err != nil || len(references) == 0 {
+			return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice.tools", "non-empty array is required")
+		}
+		names := make([]string, 0, len(references))
+		seen := make(map[string]struct{}, len(references))
+		for index, reference := range references {
+			path := fmt.Sprintf("$.tool_choice.tools[%d]", index)
+			item, err := rejectUnknownResponsesObject(ProtocolResponses, reference, path, "type", "name")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var kind, name string
+			if err := json.Unmarshal(item["type"], &kind); err != nil || kind == "" {
+				return toolChoice{}, invalid(ProtocolResponses, path+".type", "non-empty string is required")
+			}
+			if kind != "function" {
+				return toolChoice{}, unsupported(ProtocolResponses, path+".type", "allowed tool type %q has no Messages equivalent", kind)
+			}
+			if err := json.Unmarshal(item["name"], &name); err != nil || name == "" {
+				return toolChoice{}, invalid(ProtocolResponses, path+".name", "non-empty string is required")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return toolChoice{}, invalid(ProtocolResponses, path+".name", "duplicate allowed function %q", name)
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceMode(mode), AllowedNames: names}, nil
+	}
+	if _, err := rejectUnknownResponsesObject(ProtocolResponses, trimmed, "$.tool_choice", "type", "name"); err != nil {
+		return toolChoice{}, err
 	}
 	var value struct {
 		Type string `json:"type"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(raw, &value); err != nil || value.Type != "function" || value.Name == "" {
-		return toolChoice{}, unsupported(ProtocolResponses, "$.tool_choice", "only named function choice is portable")
+	if err := json.Unmarshal(trimmed, &value); err != nil {
+		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice", "must be a string or object")
+	}
+	if value.Type != "function" {
+		return toolChoice{}, unsupported(ProtocolResponses, "$.tool_choice.type", "tool choice type %q has no Messages equivalent", value.Type)
+	}
+	if value.Name == "" {
+		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice.name", "non-empty string is required")
 	}
 	return toolChoice{Mode: toolChoiceNamed, Name: value.Name}, nil
 }
 
 func encodeResponsesToolChoice(choice toolChoice) json.RawMessage {
+	if choice.Mode == toolChoiceAllowed {
+		tools := make([]map[string]any, 0, len(choice.AllowedNames))
+		for _, name := range choice.AllowedNames {
+			tools = append(tools, map[string]any{"type": "function", "name": name})
+		}
+		data, _ := json.Marshal(map[string]any{"type": "allowed_tools", "mode": string(choice.AllowedMode), "tools": tools})
+		return data
+	}
 	if choice.Mode == toolChoiceNamed {
 		data, _ := json.Marshal(map[string]any{"type": "function", "name": choice.Name})
 		return data
@@ -304,21 +377,36 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if item.CallID == "" || item.Name == "" {
 				return invalid(ProtocolResponses, itemPath, "function_call requires call_id and name")
 			}
-			if path != "$.output" && item.Status != "" && item.Status != "completed" {
-				return unsupported(ProtocolResponses, itemPath+".status", "Messages history cannot preserve function_call status %q", item.Status)
+			if path == "$.output" {
+				if item.Status != "" && item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
+					return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid function_call status %q", item.Status)
+				}
+			} else {
+				if item.ID != "" && item.ID != item.CallID {
+					return unsupported(ProtocolResponses, itemPath+".id", "Messages cannot preserve a function-call item id separate from call_id")
+				}
+				if item.Status != "" && item.Status != "completed" {
+					return unsupported(ProtocolResponses, itemPath+".status", "Messages history cannot preserve function_call status %q", item.Status)
+				}
 			}
 		case "function_call_output":
 			if err := validateResponsesFunctionItemFields(item, itemPath, false); err != nil {
 				return err
 			}
-			if !nonNullJSON(item.Output) {
-				return invalid(ProtocolResponses, itemPath+".output", "function_call_output output is required")
+			if err := validateResponsesToolOutput(ProtocolResponses, item.Output, itemPath+".output"); err != nil {
+				return err
 			}
 			if path == "$.output" {
 				return unsupported(ProtocolResponses, itemPath+".type", "Messages responses cannot represent a function_call_output item")
 			}
 			if item.CallID == "" && item.Name == "" {
 				return unsupported(ProtocolResponses, itemPath, "Messages tool results require call_id or name correlation")
+			}
+			if item.ID != "" && item.ID != item.CallID {
+				return unsupported(ProtocolResponses, itemPath+".id", "Messages cannot preserve a function-output item id separate from call_id")
+			}
+			if item.Status != "" && item.Status != "completed" {
+				return unsupported(ProtocolResponses, itemPath+".status", "Messages history cannot preserve function output status %q", item.Status)
 			}
 		case "reasoning":
 		default:
@@ -408,8 +496,14 @@ func validateResponsesTerminal(source responsesResponse) error {
 	if source.Status != "completed" && source.Status != "incomplete" {
 		return upstreamResponseError(ProtocolResponses, "$.status", "unexpected terminal status %q", source.Status)
 	}
-	if source.Status == "incomplete" && source.IncompleteDetails != nil && source.IncompleteDetails.Reason != "" && source.IncompleteDetails.Reason != "max_output_tokens" && source.IncompleteDetails.Reason != "content_filter" {
-		return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "unsupported incomplete reason %q", source.IncompleteDetails.Reason)
+	if source.Status == "incomplete" && source.IncompleteDetails != nil {
+		switch source.IncompleteDetails.Reason {
+		case "", "max_output_tokens", "content_filter":
+		case "max_messages", "steered":
+			return unsupported(ProtocolResponses, "$.incomplete_details.reason", "Messages has no exact stop reason for Responses reason %q", source.IncompleteDetails.Reason)
+		default:
+			return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "invalid incomplete reason %q", source.IncompleteDetails.Reason)
+		}
 	}
 	for index, item := range source.Output {
 		path := fmt.Sprintf("$.output[%d]", index)

@@ -1,6 +1,7 @@
 package chatgemini
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -192,32 +193,121 @@ func decodeStop(protocol Protocol, raw json.RawMessage) ([]string, error) {
 }
 
 func decodeChatToolChoice(raw json.RawMessage) (toolChoice, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil
 	}
-	if raw[0] == '"' {
+	if trimmed[0] == '"' {
 		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
+		if err := json.Unmarshal(trimmed, &value); err != nil {
 			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "invalid string choice")
 		}
 		if value != string(toolChoiceAuto) && value != string(toolChoiceNone) && value != string(toolChoiceRequired) {
-			return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "tool choice %q is not portable", value)
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "unknown tool choice %q", value)
 		}
 		return toolChoice{Mode: toolChoiceMode(value)}, nil
 	}
-	var value struct {
-		Type     string `json:"type"`
-		Function struct {
-			Name string `json:"name"`
-		} `json:"function"`
+	var discriminator struct {
+		Type string `json:"type"`
 	}
-	if err := json.Unmarshal(raw, &value); err != nil || value.Type != "function" || value.Function.Name == "" {
-		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "only function tool choices are portable")
+	if err := json.Unmarshal(trimmed, &discriminator); err != nil {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "must be a string or object")
 	}
-	return toolChoice{Mode: toolChoiceNamed, Name: value.Function.Name}, nil
+	if discriminator.Type == "allowed_tools" {
+		fields, err := rejectUnknownObjectFields(ProtocolChat, trimmed, "$.tool_choice", "type", "allowed_tools")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		allowedFields, err := rejectUnknownObjectFields(ProtocolChat, fields["allowed_tools"], "$.tool_choice.allowed_tools", "mode", "tools")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var mode string
+		if err := json.Unmarshal(allowedFields["mode"], &mode); err != nil || mode == "" {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.mode", "mode is required")
+		}
+		if mode != string(toolChoiceRequired) && mode != string(toolChoiceAuto) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.mode", "must be %q or %q", toolChoiceAuto, toolChoiceRequired)
+		}
+		var tools []json.RawMessage
+		if err := json.Unmarshal(allowedFields["tools"], &tools); err != nil || len(tools) == 0 {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.tools", "at least one function reference is required")
+		}
+		names := make([]string, 0, len(tools))
+		seen := make(map[string]struct{}, len(tools))
+		for index, rawTool := range tools {
+			itemPath := fmt.Sprintf("$.tool_choice.allowed_tools.tools[%d]", index)
+			item, err := rejectUnknownObjectFields(ProtocolChat, rawTool, itemPath, "type", "function")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var kind string
+			if err := json.Unmarshal(item["type"], &kind); err != nil || kind != "function" {
+				return toolChoice{}, unsupported(ProtocolChat, itemPath+".type", "only function references are portable to Gemini")
+			}
+			function, err := rejectUnknownObjectFields(ProtocolChat, item["function"], itemPath+".function", "name")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var name string
+			if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+				return toolChoice{}, invalid(ProtocolChat, itemPath+".function.name", "name is required")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return toolChoice{}, invalid(ProtocolChat, itemPath+".function.name", "duplicate allowed function %q", name)
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceMode(mode), AllowedNames: names}, nil
+	}
+	fields, err := rejectUnknownObjectFields(ProtocolChat, trimmed, "$.tool_choice", "type", "function", "custom", "allowed_tools")
+	if err != nil {
+		return toolChoice{}, err
+	}
+	var kind string
+	if err := json.Unmarshal(fields["type"], &kind); err != nil || kind == "" {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.type", "non-empty string is required")
+	}
+	if kind != "function" {
+		if kind == "custom" {
+			if jsonValuePresent(fields["function"]) || jsonValuePresent(fields["allowed_tools"]) {
+				return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "custom choice contains fields for another choice type")
+			}
+			custom, err := rejectUnknownObjectFields(ProtocolChat, fields["custom"], "$.tool_choice.custom", "name")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var name string
+			if err := json.Unmarshal(custom["name"], &name); err != nil || name == "" {
+				return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.custom.name", "non-empty string is required")
+			}
+		}
+		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice.type", "tool choice type %q has no Gemini equivalent", kind)
+	}
+	if jsonValuePresent(fields["custom"]) || jsonValuePresent(fields["allowed_tools"]) {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "function choice contains fields for another choice type")
+	}
+	function, err := rejectUnknownObjectFields(ProtocolChat, fields["function"], "$.tool_choice.function", "name")
+	if err != nil {
+		return toolChoice{}, err
+	}
+	var name string
+	if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.function.name", "non-empty string is required")
+	}
+	return toolChoice{Mode: toolChoiceNamed, Name: name}, nil
 }
 
 func encodeChatToolChoice(choice toolChoice) json.RawMessage {
+	if choice.Mode == toolChoiceAllowed {
+		tools := make([]any, 0, len(choice.AllowedNames))
+		for _, name := range choice.AllowedNames {
+			tools = append(tools, map[string]any{"type": "function", "function": map[string]any{"name": name}})
+		}
+		data, _ := json.Marshal(map[string]any{"type": "allowed_tools", "allowed_tools": map[string]any{"mode": string(choice.AllowedMode), "tools": tools}})
+		return data
+	}
 	if choice.Mode == toolChoiceNamed {
 		data, _ := json.Marshal(map[string]any{"type": "function", "function": map[string]any{"name": choice.Name}})
 		return data

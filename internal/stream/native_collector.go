@@ -59,9 +59,12 @@ func collectResponsesStreamResponse(frames []streamFrame) ([]byte, []Diagnostic,
 	if terminalType == "" {
 		return nil, nil, invalid(ProtocolResponses, "$", "terminal response event is missing")
 	}
+	if _, err := validateNativeResponsesOutput(terminalResponse); err != nil {
+		return nil, nil, err
+	}
 	var response responsesResponse
 	if err := decodeJSON(ProtocolResponses, terminalResponse, &response); err != nil {
-		return nil, nil, err
+		return nil, nil, upstreamResponseError(ProtocolResponses, "$.response", "invalid terminal response object: %v", err)
 	}
 	if err := validateResponsesTerminal(response); err != nil {
 		return nil, nil, err

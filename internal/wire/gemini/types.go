@@ -56,12 +56,21 @@ type FunctionCall struct {
 	Args json.RawMessage `json:"args"`
 }
 type FunctionResponse struct {
-	ID           string          `json:"id,omitempty"`
-	Name         string          `json:"name"`
-	Response     json.RawMessage `json:"response"`
-	WillContinue json.RawMessage `json:"willContinue,omitempty"`
-	Scheduling   json.RawMessage `json:"scheduling,omitempty"`
-	Parts        json.RawMessage `json:"parts,omitempty"`
+	ID           string                 `json:"id,omitempty"`
+	Name         string                 `json:"name"`
+	Response     json.RawMessage        `json:"response"`
+	WillContinue json.RawMessage        `json:"willContinue,omitempty"`
+	Scheduling   json.RawMessage        `json:"scheduling,omitempty"`
+	Parts        []FunctionResponsePart `json:"parts,omitempty"`
+}
+
+// FunctionResponsePart is the media-only union nested under
+// FunctionResponse.parts. The Gemini Developer API supports inlineData here;
+// fileData is retained in the wire type so cross-protocol routes can reject the
+// SDK-exposed, Vertex-only shape without silently dropping it.
+type FunctionResponsePart struct {
+	InlineData *Blob     `json:"inlineData,omitempty"`
+	FileData   *FileData `json:"fileData,omitempty"`
 }
 
 type Tool struct {

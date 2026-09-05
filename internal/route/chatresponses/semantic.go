@@ -22,13 +22,13 @@ type portableMedia = core.Media
 type toolChoiceMode = core.ToolChoiceMode
 
 const (
-	toolChoiceAuto     = core.ToolChoiceAuto
-	toolChoiceNone     = core.ToolChoiceNone
-	toolChoiceRequired = core.ToolChoiceRequired
-	toolChoiceNamed    = core.ToolChoiceNamed
+	toolChoiceAuto                    = core.ToolChoiceAuto
+	toolChoiceNone                    = core.ToolChoiceNone
+	toolChoiceRequired                = core.ToolChoiceRequired
+	toolChoiceNamed                   = core.ToolChoiceNamed
+	toolChoiceAllowed  toolChoiceMode = "allowed_tools"
 )
 
-type toolChoice = core.ToolChoice
 type reasoningConfig = responseswire.ReasoningConfig
 type finishReason = core.FinishReason
 

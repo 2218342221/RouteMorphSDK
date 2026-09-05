@@ -17,6 +17,10 @@ func (c *chatToGeminiConverter) ToClientResponse(_ context.Context, input []byte
 		return conversionResult{}, err
 	}
 	candidate := source.Candidates[0]
+	reservedCallIDs := make(map[string]struct{})
+	if err := reserveGeminiChatCallIDs(reservedCallIDs, candidate.Content.Parts, "$.candidates[0].content.parts", true); err != nil {
+		return conversionResult{}, err
+	}
 	message := chatMessage{Role: "assistant", Content: json.RawMessage(`null`)}
 	var text strings.Builder
 	generatedCallID := 0
@@ -36,8 +40,7 @@ func (c *chatToGeminiConverter) ToClientResponse(_ context.Context, input []byte
 			}
 			callID := part.FunctionCall.ID
 			if callID == "" {
-				generatedCallID++
-				callID = fmt.Sprintf("rm_call_%d", generatedCallID)
+				callID = nextGeminiChatCallID(&generatedCallID, reservedCallIDs)
 				diagnostics = appendDiagnostic(diagnostics, "warning", "generated_function_call_id", path+".functionCall.id", "Gemini omitted the optional function call id; RouteMorph generated a response-local id")
 			}
 			var call chatToolCall
@@ -118,6 +121,9 @@ func (c *geminiToChatConverter) ToClientResponse(_ context.Context, input []byte
 	}
 	if choice.Message.Role != "" && choice.Message.Role != "assistant" {
 		return conversionResult{}, upstreamResponseError(ProtocolChat, "$.choices[0].message.role", "expected assistant role, got %q", choice.Message.Role)
+	}
+	if rawJSONValuePresent(choice.Message.FunctionCall) {
+		return conversionResult{}, unsupported(ProtocolChat, "$.choices[0].message.function_call", "deprecated function_call cannot be represented without semantic loss")
 	}
 	if rawJSONValuePresent(choice.Message.Annotations) {
 		if options.LossPolicy == rejectSemanticLoss {
@@ -246,6 +252,9 @@ func geminiToolConfigForChoice(choice toolChoice) *geminiToolConfig {
 	case toolChoiceNamed:
 		config.FunctionCallingConfig.Mode = "ANY"
 		config.FunctionCallingConfig.AllowedFunctionNames = []string{choice.Name}
+	case toolChoiceAllowed:
+		config.FunctionCallingConfig.Mode = "ANY"
+		config.FunctionCallingConfig.AllowedFunctionNames = append([]string(nil), choice.AllowedNames...)
 	}
 	return config
 }
@@ -272,14 +281,7 @@ func chatToolResultToGemini(raw json.RawMessage, path string) (json.RawMessage, 
 		}
 	}
 	text := joinText(parts)
-	var value any
-	if json.Unmarshal([]byte(text), &value) == nil {
-		if _, ok := value.(map[string]any); ok {
-			return json.RawMessage(text), false, nil
-		}
-		return mustJSON(map[string]any{"result": value}), true, nil
-	}
-	return mustJSON(map[string]any{"result": text}), true, nil
+	return mustJSON(map[string]any{"output": text}), true, nil
 }
 
 func geminiConfigToChat(config *geminiGenerationConfig, target *chatRequest, policy lossPolicy, diagnostics *[]Diagnostic) error {
@@ -346,7 +348,13 @@ func geminiConfigToChat(config *geminiGenerationConfig, target *chatRequest, pol
 		if config.ThinkingConfig.IncludeThoughts {
 			return unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.includeThoughts", "Chat has no equivalent request control for returning thoughts")
 		}
-		target.ReasoningEffort = strings.ToLower(config.ThinkingConfig.ThinkingLevel)
+		level, err := normalizeGeminiThinkingLevel(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingLevel", config.ThinkingConfig.ThinkingLevel)
+		if err != nil {
+			return err
+		}
+		if level != "" {
+			target.ReasoningEffort = strings.ToLower(level)
+		}
 	}
 	schema := config.ResponseJSONSchema
 	if jsonValuePresent(schema) {
@@ -372,14 +380,20 @@ func geminiToolChoiceToChat(config *geminiToolConfig, declared map[string]struct
 	}
 	mode := config.FunctionCallingConfig.Mode
 	names := config.FunctionCallingConfig.AllowedFunctionNames
+	seen := make(map[string]struct{}, len(names))
 	for index, name := range names {
 		if _, ok := declared[name]; !ok {
 			return toolChoice{}, invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", index), "function %q is not declared", name)
 		}
+		if _, duplicate := seen[name]; duplicate {
+			return toolChoice{}, invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", index), "duplicate allowed function %q", name)
+		}
+		seen[name] = struct{}{}
 	}
+	allDeclared := len(names) > 0 && len(names) == len(declared)
 	switch mode {
 	case "", "AUTO":
-		if len(names) > 0 {
+		if len(names) > 0 && !allDeclared {
 			return toolChoice{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "Chat cannot restrict AUTO to a subset of functions")
 		}
 		return toolChoice{Mode: toolChoiceAuto}, nil
@@ -389,32 +403,27 @@ func geminiToolChoiceToChat(config *geminiToolConfig, declared map[string]struct
 		}
 		return toolChoice{Mode: toolChoiceNone}, nil
 	case "ANY":
+		if len(declared) == 0 {
+			return toolChoice{}, invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "ANY requires at least one declared function")
+		}
+		if allDeclared {
+			return toolChoice{Mode: toolChoiceRequired}, nil
+		}
 		if len(names) == 1 {
 			return toolChoice{Mode: toolChoiceNamed, Name: names[0]}, nil
 		}
 		if len(names) > 1 {
-			allowed := make(map[string]struct{}, len(names))
-			for _, name := range names {
-				allowed[name] = struct{}{}
-			}
-			if len(allowed) != len(declared) {
-				return toolChoice{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "Chat cannot express a required subset of multiple functions")
-			}
-			for name := range declared {
-				if _, ok := allowed[name]; !ok {
-					return toolChoice{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "Chat cannot express a required subset of multiple functions")
-				}
-			}
+			return toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceRequired, AllowedNames: append([]string(nil), names...)}, nil
 		}
 		return toolChoice{Mode: toolChoiceRequired}, nil
 	case "VALIDATED":
 		return toolChoice{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "VALIDATED has no exact Chat tool_choice equivalent")
 	default:
-		return toolChoice{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "mode %q has no Chat equivalent", mode)
+		return toolChoice{}, invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "unknown function-calling mode %q", mode)
 	}
 }
 
-func geminiPartsToChat(source []geminiPart, path, role string, policy lossPolicy, generatedCallID *int, diagnostics *[]Diagnostic) ([]portablePart, []portableToolCall, error) {
+func geminiPartsToChat(source []geminiPart, path, role string, policy lossPolicy, generatedCallID *int, reservedCallIDs map[string]struct{}, diagnostics *[]Diagnostic) ([]portablePart, []portableToolCall, error) {
 	parts := make([]portablePart, 0, len(source))
 	calls := make([]portableToolCall, 0)
 	for index, part := range source {
@@ -442,8 +451,7 @@ func geminiPartsToChat(source []geminiPart, path, role string, policy lossPolicy
 				if generatedCallID == nil {
 					return nil, nil, unsupported(ProtocolGenerateContent, partPath+".functionCall.id", "Chat requires a function call id")
 				}
-				(*generatedCallID)++
-				callID = fmt.Sprintf("rm_call_%d", *generatedCallID)
+				callID = nextGeminiChatCallID(generatedCallID, reservedCallIDs)
 				if diagnostics != nil {
 					*diagnostics = appendDiagnostic(*diagnostics, "warning", "generated_function_call_id", partPath+".functionCall.id", "Gemini omitted the optional function call id; RouteMorph generated a request-local id")
 				}
@@ -474,6 +482,36 @@ func geminiPartsToChat(source []geminiPart, path, role string, policy lossPolicy
 		}
 	}
 	return parts, calls, nil
+}
+
+func reserveGeminiChatCallIDs(reserved map[string]struct{}, parts []geminiPart, path string, upstream bool) error {
+	for index, part := range parts {
+		if part.FunctionCall == nil || part.FunctionCall.ID == "" {
+			continue
+		}
+		id := part.FunctionCall.ID
+		if _, duplicate := reserved[id]; duplicate {
+			field := fmt.Sprintf("%s[%d].functionCall.id", path, index)
+			if upstream {
+				return upstreamResponseError(ProtocolGenerateContent, field, "duplicate function call id %q", id)
+			}
+			return invalid(ProtocolGenerateContent, field, "duplicate function call id %q", id)
+		}
+		reserved[id] = struct{}{}
+	}
+	return nil
+}
+
+func nextGeminiChatCallID(counter *int, reserved map[string]struct{}) string {
+	for {
+		*counter = *counter + 1
+		id := fmt.Sprintf("rm_call_%d", *counter)
+		if _, exists := reserved[id]; exists {
+			continue
+		}
+		reserved[id] = struct{}{}
+		return id
+	}
 }
 
 func geminiMediaOrTextToChatPart(part geminiPart, path string) (portablePart, error) {

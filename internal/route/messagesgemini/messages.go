@@ -68,16 +68,23 @@ func rejectMessagesBlockMetadata(block messagesBlock, path string) error {
 }
 
 func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil, nil
+	}
+	if _, err := rejectUnknownObjectFields(ProtocolMessages, trimmed, "$.tool_choice", "type", "name", "disable_parallel_tool_use"); err != nil {
+		return toolChoice{}, nil, err
 	}
 	var value struct {
 		Type                   string `json:"type"`
 		Name                   string `json:"name"`
 		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
 	}
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if err := json.Unmarshal(trimmed, &value); err != nil {
 		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice", "invalid tool choice")
+	}
+	if value.Type == "" {
+		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.type", "non-empty string is required")
 	}
 	var parallel *bool
 	if value.DisableParallelToolUse != nil && value.Type != "none" {
@@ -86,10 +93,19 @@ func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
 	}
 	switch value.Type {
 	case "auto":
+		if value.Name != "" {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.name", "name is only valid for tool choice type tool")
+		}
 		return toolChoice{Mode: toolChoiceAuto}, parallel, nil
 	case "none":
+		if value.Name != "" || value.DisableParallelToolUse != nil {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice", "none choice cannot include name or disable_parallel_tool_use")
+		}
 		return toolChoice{Mode: toolChoiceNone}, nil, nil
 	case "any":
+		if value.Name != "" {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.name", "name is only valid for tool choice type tool")
+		}
 		return toolChoice{Mode: toolChoiceRequired}, parallel, nil
 	case "tool":
 		if value.Name == "" {
@@ -97,7 +113,7 @@ func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
 		}
 		return toolChoice{Mode: toolChoiceNamed, Name: value.Name}, parallel, nil
 	default:
-		return toolChoice{}, nil, unsupported(ProtocolMessages, "$.tool_choice.type", "tool choice %q is not portable", value.Type)
+		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.type", "unknown tool choice type %q", value.Type)
 	}
 }
 

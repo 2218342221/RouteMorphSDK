@@ -19,6 +19,9 @@ func decodeResponsesInstructions(raw json.RawMessage) ([]portablePart, error) {
 	if raw[0] == '"' {
 		return textParts(rawString(raw)), nil
 	}
+	if err := validateResponsesContentArray(ProtocolResponses, raw, "$.instructions"); err != nil {
+		return nil, err
+	}
 	var parts []responsesContentPart
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return nil, unsupported(ProtocolResponses, "$.instructions", "only string or text-part instructions are portable")
@@ -32,6 +35,9 @@ func decodeResponsesContentRaw(raw json.RawMessage, path string, input bool) ([]
 	}
 	if raw[0] == '"' {
 		return textParts(rawString(raw)), nil
+	}
+	if err := validateResponsesContentArray(ProtocolResponses, raw, path); err != nil {
+		return nil, err
 	}
 	var source []responsesContentPart
 	if err := json.Unmarshal(raw, &source); err != nil {
@@ -170,46 +176,6 @@ func encodeResponsesContent(parts []portablePart, input bool) ([]responsesConten
 	return converted, nil
 }
 
-func decodeResponsesToolChoice(raw json.RawMessage) (toolChoice, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return toolChoice{}, nil
-	}
-	if raw[0] == '"' {
-		value := rawString(raw)
-		if value != string(toolChoiceAuto) && value != string(toolChoiceNone) && value != string(toolChoiceRequired) {
-			return toolChoice{}, unsupported(ProtocolResponses, "$.tool_choice", "tool choice %q is not portable", value)
-		}
-		return toolChoice{Mode: toolChoiceMode(value)}, nil
-	}
-	var value struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice", "invalid named tool choice")
-	}
-	if value.Type != "function" && value.Type != "custom" {
-		return toolChoice{}, unsupported(ProtocolResponses, "$.tool_choice.type", "named tool choice type %q has no Chat equivalent", value.Type)
-	}
-	if value.Name == "" {
-		return toolChoice{}, invalid(ProtocolResponses, "$.tool_choice.name", "name is required")
-	}
-	return toolChoice{Mode: toolChoiceNamed, Name: value.Name, Kind: value.Type}, nil
-}
-
-func encodeResponsesToolChoice(choice toolChoice) json.RawMessage {
-	if choice.Mode == toolChoiceNamed {
-		kind := choice.Kind
-		if kind == "" {
-			kind = "function"
-		}
-		data, _ := json.Marshal(map[string]any{"type": kind, "name": choice.Name})
-		return data
-	}
-	data, _ := json.Marshal(string(choice.Mode))
-	return data
-}
-
 func validateResponsesTool(tool responsesTool, path string) error {
 	if err := validateResponsesToolPortableFields(tool, path); err != nil {
 		return err
@@ -303,10 +269,7 @@ func validateResponsesItems(items []responsesItem, path string) error {
 				return invalid(ProtocolResponses, itemPath, "function_call requires call_id and name")
 			}
 			if path == "$.output" {
-				if item.ID == "" || item.Status == "" {
-					return upstreamResponseError(ProtocolResponses, itemPath, "function_call output items require id and status")
-				}
-				if item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
+				if item.Status != "" && item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
 					return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid function_call status %q", item.Status)
 				}
 			} else if err := validateResponsesHistoryCallStatus(item.Status, itemPath+".status"); err != nil {
@@ -316,14 +279,20 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if err := validateResponsesItemProvenance(item, itemPath); err != nil {
 				return err
 			}
-			if !nonNullJSON(item.Output) {
-				return invalid(ProtocolResponses, itemPath+".output", "function_call_output output is required")
+			if err := validateResponsesToolOutput(ProtocolResponses, item.Output, itemPath+".output"); err != nil {
+				return err
 			}
 			if path == "$.output" {
 				return unsupported(ProtocolResponses, itemPath+".type", "Chat responses cannot represent a function_call_output item")
 			}
 			if item.CallID == "" && item.Name == "" {
 				return unsupported(ProtocolResponses, itemPath, "Chat tool results require call_id or name correlation")
+			}
+			if item.ID != "" && item.ID != item.CallID {
+				return unsupported(ProtocolResponses, itemPath+".id", "Chat cannot preserve a function-output item id separate from call_id")
+			}
+			if err := validateResponsesHistoryCallStatus(item.Status, itemPath+".status"); err != nil {
+				return err
 			}
 		case "custom_tool_call":
 			if err := validateResponsesItemProvenance(item, itemPath); err != nil {
@@ -335,22 +304,18 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if _, err := customInput(item.Input, ProtocolResponses, itemPath+".input"); err != nil {
 				return err
 			}
-			if path == "$.output" {
-				if item.ID == "" || item.Status == "" {
-					return upstreamResponseError(ProtocolResponses, itemPath, "custom_tool_call output items require id and status")
+			if item.Status != "" {
+				if path == "$.output" {
+					return upstreamResponseError(ProtocolResponses, itemPath+".status", "custom_tool_call has no status field")
 				}
-				if item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
-					return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid custom_tool_call status %q", item.Status)
-				}
-			} else if err := validateResponsesHistoryCallStatus(item.Status, itemPath+".status"); err != nil {
-				return err
+				return invalid(ProtocolResponses, itemPath+".status", "custom_tool_call has no status field")
 			}
 		case "custom_tool_call_output":
 			if err := validateResponsesItemProvenance(item, itemPath); err != nil {
 				return err
 			}
-			if !nonNullJSON(item.Output) {
-				return invalid(ProtocolResponses, itemPath+".output", "custom_tool_call_output output is required")
+			if err := validateResponsesToolOutput(ProtocolResponses, item.Output, itemPath+".output"); err != nil {
+				return err
 			}
 			if path == "$.output" {
 				return unsupported(ProtocolResponses, itemPath+".type", "Chat responses cannot represent a custom_tool_call_output item")
@@ -358,21 +323,24 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if item.CallID == "" {
 				return invalid(ProtocolResponses, itemPath+".call_id", "call_id is required")
 			}
+			if item.ID != "" && item.ID != item.CallID {
+				return unsupported(ProtocolResponses, itemPath+".id", "Chat cannot preserve a custom-output item id separate from call_id")
+			}
+			if item.Status != "" {
+				return invalid(ProtocolResponses, itemPath+".status", "custom_tool_call_output has no status field")
+			}
 		case "web_search_call":
 			if path != "$.output" {
 				return unsupported(ProtocolResponses, itemPath+".type", "web_search_call history cannot be represented by Chat")
 			}
 			if item.ID == "" {
-				return invalid(ProtocolResponses, itemPath+".id", "web_search_call id is required")
+				return upstreamResponseError(ProtocolResponses, itemPath+".id", "web_search_call id is required")
 			}
-			if item.Status != "" && item.Status != "in_progress" && item.Status != "searching" && item.Status != "completed" && item.Status != "failed" {
-				return invalid(ProtocolResponses, itemPath+".status", "invalid web_search_call status %q", item.Status)
+			if item.Status != "in_progress" && item.Status != "searching" && item.Status != "completed" && item.Status != "failed" {
+				return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid web_search_call status %q", item.Status)
 			}
-			if nonNullJSON(item.Action) {
-				var action map[string]json.RawMessage
-				if err := json.Unmarshal(item.Action, &action); err != nil || action == nil {
-					return invalid(ProtocolResponses, itemPath+".action", "must be an object")
-				}
+			if err := validateResponsesWebSearchAction(item.Action, itemPath+".action"); err != nil {
+				return err
 			}
 		case "reasoning":
 			if path == "$.output" {
@@ -382,6 +350,84 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			}
 		default:
 			return unsupported(ProtocolResponses, itemPath+".type", "item type %q is not supported by this cross-protocol route", item.Type)
+		}
+	}
+	return nil
+}
+
+func validateResponsesWebSearchAction(raw json.RawMessage, path string) error {
+	var action map[string]json.RawMessage
+	if !nonNullJSON(raw) || json.Unmarshal(raw, &action) != nil || action == nil {
+		return upstreamResponseError(ProtocolResponses, path, "web_search_call action object is required")
+	}
+	var actionType string
+	if err := json.Unmarshal(action["type"], &actionType); err != nil || actionType == "" {
+		return upstreamResponseError(ProtocolResponses, path+".type", "web search action type is required")
+	}
+	allowed := map[string]bool{"type": true}
+	switch actionType {
+	case "search":
+		allowed["query"], allowed["queries"], allowed["sources"] = true, true, true
+		if rawQuery, ok := action["query"]; ok {
+			var query string
+			if json.Unmarshal(rawQuery, &query) != nil {
+				return upstreamResponseError(ProtocolResponses, path+".query", "must be a string")
+			}
+		}
+		if rawQueries, ok := action["queries"]; ok {
+			var queries []string
+			if json.Unmarshal(rawQueries, &queries) != nil {
+				return upstreamResponseError(ProtocolResponses, path+".queries", "must be a string array")
+			}
+		}
+		if rawSources, ok := action["sources"]; ok {
+			var sources []json.RawMessage
+			if json.Unmarshal(rawSources, &sources) != nil {
+				return upstreamResponseError(ProtocolResponses, path+".sources", "must be an array")
+			}
+			for index, source := range sources {
+				sourcePath := fmt.Sprintf("%s.sources[%d]", path, index)
+				var fields map[string]json.RawMessage
+				if json.Unmarshal(source, &fields) != nil || fields == nil {
+					return upstreamResponseError(ProtocolResponses, sourcePath, "must be an object")
+				}
+				for name := range fields {
+					if name != "type" && name != "url" {
+						return upstreamResponseError(ProtocolResponses, sourcePath+"."+name, "field is not valid for a web search source")
+					}
+				}
+				var sourceType, sourceURL string
+				if json.Unmarshal(fields["type"], &sourceType) != nil || sourceType != "url" {
+					return upstreamResponseError(ProtocolResponses, sourcePath+".type", "must be url")
+				}
+				if json.Unmarshal(fields["url"], &sourceURL) != nil || !validHTTPURL(sourceURL) {
+					return upstreamResponseError(ProtocolResponses, sourcePath+".url", "must be an absolute HTTP(S) URL")
+				}
+			}
+		}
+	case "open_page":
+		allowed["url"] = true
+		if rawURL, ok := action["url"]; ok && nonNullJSON(rawURL) {
+			var value string
+			if json.Unmarshal(rawURL, &value) != nil || !validHTTPURL(value) {
+				return upstreamResponseError(ProtocolResponses, path+".url", "must be an absolute HTTP(S) URL or null")
+			}
+		}
+	case "find_in_page":
+		allowed["url"], allowed["pattern"] = true, true
+		var value, pattern string
+		if json.Unmarshal(action["url"], &value) != nil || !validHTTPURL(value) {
+			return upstreamResponseError(ProtocolResponses, path+".url", "must be an absolute HTTP(S) URL")
+		}
+		if json.Unmarshal(action["pattern"], &pattern) != nil || pattern == "" {
+			return upstreamResponseError(ProtocolResponses, path+".pattern", "non-empty pattern is required")
+		}
+	default:
+		return upstreamResponseError(ProtocolResponses, path+".type", "unsupported web search action %q", actionType)
+	}
+	for name := range action {
+		if !allowed[name] {
+			return upstreamResponseError(ProtocolResponses, path+"."+name, "field is not valid for %s action", actionType)
 		}
 	}
 	return nil
@@ -554,8 +600,14 @@ func validateResponsesTerminal(source responsesResponse) error {
 	if source.Status != "completed" && source.Status != "incomplete" {
 		return upstreamResponseError(ProtocolResponses, "$.status", "unexpected terminal status %q", source.Status)
 	}
-	if source.Status == "incomplete" && source.IncompleteDetails != nil && source.IncompleteDetails.Reason != "" && source.IncompleteDetails.Reason != "max_output_tokens" && source.IncompleteDetails.Reason != "content_filter" {
-		return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "unsupported incomplete reason %q", source.IncompleteDetails.Reason)
+	if source.Status == "incomplete" && source.IncompleteDetails != nil {
+		switch source.IncompleteDetails.Reason {
+		case "", "max_output_tokens", "content_filter":
+		case "max_messages", "steered":
+			return unsupported(ProtocolResponses, "$.incomplete_details.reason", "Chat has no exact finish reason for Responses reason %q", source.IncompleteDetails.Reason)
+		default:
+			return upstreamResponseError(ProtocolResponses, "$.incomplete_details.reason", "invalid incomplete reason %q", source.IncompleteDetails.Reason)
+		}
 	}
 	for index, item := range source.Output {
 		path := fmt.Sprintf("$.output[%d]", index)

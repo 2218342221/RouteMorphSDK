@@ -10,32 +10,33 @@ import (
 )
 
 type responsesToChatStreamConverter struct {
-	id                string
-	model             string
-	providerID        string
-	providerModel     string
-	created           int64
-	toolIndexes       map[string]int
-	toolArguments     map[int]string
-	nextTool          int
-	completed         bool
-	finalized         bool
-	clientModel       string
-	includeUsage      bool
-	lossPolicy        lossPolicy
-	started           bool
-	text              string
-	refusal           string
-	reasoning         string
-	logprobs          []json.RawMessage
-	items             map[string]responsesItem
-	completedItems    map[string]bool
-	serviceTier       json.RawMessage
-	moderation        json.RawMessage
-	reportedMetadata  bool
-	reportedCache     bool
-	reportedWebSearch bool
-	sawObfuscation    bool
+	id                       string
+	model                    string
+	providerID               string
+	providerModel            string
+	created                  int64
+	toolIndexes              map[string]int
+	toolArguments            map[int]string
+	nextTool                 int
+	completed                bool
+	finalized                bool
+	clientModel              string
+	includeUsage             bool
+	lossPolicy               lossPolicy
+	started                  bool
+	text                     string
+	refusal                  string
+	reasoning                string
+	logprobs                 []json.RawMessage
+	items                    map[string]responsesItem
+	completedItems           map[string]bool
+	serviceTier              json.RawMessage
+	moderation               json.RawMessage
+	reportedMetadata         bool
+	reportedCache            bool
+	reportedWebSearch        bool
+	reportedReasoningSummary bool
+	sawObfuscation           bool
 }
 
 func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame streamFrame) ([]streamFrame, []Diagnostic, error) {
@@ -108,7 +109,21 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		}
 		c.refusal += event.Delta
 		return c.withStart([]streamFrame{{Data: c.chatChunk(map[string]any{"refusal": event.Delta}, nil, nil)}}), nil, nil
-	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+	case "response.reasoning_summary_text.delta":
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		if c.lossPolicy == rejectSemanticLoss {
+			return nil, nil, unsupported(ProtocolResponses, "$.type", "Chat reasoning_content represents raw reasoning text, not a Responses reasoning summary")
+		}
+		c.reasoning += event.Delta
+		var diagnostics []Diagnostic
+		if !c.reportedReasoningSummary {
+			c.reportedReasoningSummary = true
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_mapped_to_reasoning_content", "$.type", "Responses reasoning summary was appended to Chat reasoning_content; summary and raw-reasoning boundaries are not representable")
+		}
+		return c.withStart([]streamFrame{{Data: c.chatChunk(map[string]any{"reasoning_content": event.Delta}, nil, nil)}}), diagnostics, nil
+	case "response.reasoning_text.delta":
 		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
 			return nil, nil, err
 		}
@@ -209,7 +224,20 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 			return nil, nil, err
 		}
 		return nil, nil, nil
-	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done", "response.reasoning_text.done":
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done", "response.reasoning_summary_text.done":
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		if c.lossPolicy == rejectSemanticLoss {
+			return nil, nil, unsupported(ProtocolResponses, "$.type", "Chat reasoning_content represents raw reasoning text, not a Responses reasoning summary")
+		}
+		if c.reportedReasoningSummary {
+			return nil, nil, nil
+		}
+		c.reportedReasoningSummary = true
+		diagnostics := appendDiagnostic(nil, "warning", "responses_reasoning_summary_mapped_to_reasoning_content", "$.type", "Responses reasoning summary was appended to Chat reasoning_content; summary and raw-reasoning boundaries are not representable")
+		return nil, diagnostics, nil
+	case "response.reasoning_text.done":
 		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
 			return nil, nil, err
 		}
@@ -238,12 +266,16 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 			return nil, nil, err
 		}
 		hadWebSearchDiagnostic := c.reportedWebSearch
+		hadReasoningSummaryDiagnostic := c.reportedReasoningSummary
 		fallback, err := c.terminalOutputChunks(response)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !hadWebSearchDiagnostic && c.reportedWebSearch {
 			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_web_search_call_not_representable", "$.response.output", "Chat preserves cited answer text but has no web-search lifecycle item")
+		}
+		if !hadReasoningSummaryDiagnostic && c.reportedReasoningSummary {
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_summary_mapped_to_reasoning_content", "$.response.output", "Responses reasoning summary was appended to Chat reasoning_content; summary and raw-reasoning boundaries are not representable")
 		}
 		finish := finishStop
 		for _, item := range response.Output {
@@ -303,15 +335,18 @@ func (c *responsesToChatStreamConverter) validateKnownItem(itemID, wantType stri
 }
 
 func (c *responsesToChatStreamConverter) validateContentPartEvent(itemID string, raw json.RawMessage) error {
-	if err := c.validateKnownItem(itemID, "message"); err != nil {
-		return err
-	}
 	var part responsesContentPart
 	if len(raw) == 0 || json.Unmarshal(raw, &part) != nil {
 		return invalid(ProtocolResponses, "$.part", "valid content part is required")
 	}
-	if part.Type != "output_text" && part.Type != "refusal" {
+	wantType := "message"
+	if part.Type == "reasoning_text" {
+		wantType = "reasoning"
+	} else if part.Type != "output_text" && part.Type != "refusal" {
 		return unsupported(ProtocolResponses, "$.part.type", "content part %q cannot be represented by Chat", part.Type)
+	}
+	if err := c.validateKnownItem(itemID, wantType); err != nil {
+		return err
 	}
 	if len(part.Annotations) > 0 && string(part.Annotations) != "null" && string(part.Annotations) != "[]" {
 		return unsupported(ProtocolResponses, "$.part.annotations", "output annotations cannot be represented by Chat")
@@ -416,18 +451,24 @@ func (c *responsesToChatStreamConverter) terminalOutputChunks(response responses
 			}
 		case "reasoning":
 			sawPortableOutput = true
-			parts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
+			summaryParts, err := decodeResponsesContentRaw(item.Summary, path+".summary", false)
 			if err != nil {
 				return nil, err
 			}
-			if err := emit("reasoning_content", joinText(parts), path+".summary", &remainingReasoning, &c.reasoning); err != nil {
-				return nil, err
+			if len(summaryParts) > 0 {
+				if c.lossPolicy == rejectSemanticLoss {
+					return nil, unsupported(ProtocolResponses, path+".summary", "Chat reasoning_content represents raw reasoning text, not a Responses reasoning summary")
+				}
+				c.reportedReasoningSummary = true
+				if err := emit("reasoning_content", joinText(summaryParts), path+".summary", &remainingReasoning, &c.reasoning); err != nil {
+					return nil, err
+				}
 			}
-			parts, err = decodeResponsesContentRaw(item.Content, path+".content", false)
+			contentParts, err := decodeResponsesContentRaw(item.Content, path+".content", false)
 			if err != nil {
 				return nil, err
 			}
-			if err := emit("reasoning_content", joinText(parts), path+".content", &remainingReasoning, &c.reasoning); err != nil {
+			if err := emit("reasoning_content", joinText(contentParts), path+".content", &remainingReasoning, &c.reasoning); err != nil {
 				return nil, err
 			}
 		case "function_call":

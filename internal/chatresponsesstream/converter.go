@@ -38,6 +38,7 @@ type Converter struct {
 	reasoning                 *reasoningState
 	message                   *messageState
 	tools                     map[int]*toolState
+	toolCallIDs               map[string]int
 	outputs                   []*outputSlot
 	usage                     *chatUsage
 	sawNormalChunk            bool
@@ -151,7 +152,7 @@ type chatError struct {
 
 // New creates an isolated converter for one upstream response stream.
 func New(options Options) *Converter {
-	return &Converter{options: options, tools: make(map[int]*toolState)}
+	return &Converter{options: options, tools: make(map[int]*toolState), toolCallIDs: make(map[string]int)}
 }
 
 // Convert consumes one decoded Chat SSE frame.
@@ -486,15 +487,15 @@ func (c *Converter) appendReasoning(delta string) []core.Frame {
 				"output_index": reasoning.outputIndex,
 				"item":         c.reasoningSnapshot(reasoning, "in_progress"),
 			}),
-			c.event("response.reasoning_summary_part.added", map[string]any{
-				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0,
-				"part": map[string]any{"type": "summary_text", "text": ""},
+			c.event("response.content_part.added", map[string]any{
+				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0,
+				"part": map[string]any{"type": "reasoning_text", "text": ""},
 			}),
 		)
 	}
 	reasoning.text.WriteString(delta)
-	frames = append(frames, c.event("response.reasoning_summary_text.delta", map[string]any{
-		"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0, "delta": delta,
+	frames = append(frames, c.event("response.reasoning_text.delta", map[string]any{
+		"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0, "delta": delta,
 	}))
 	return frames
 }
@@ -567,8 +568,19 @@ func (c *Converter) appendTool(delta chatToolDelta) ([]core.Frame, error) {
 	if tool.closed {
 		return nil, core.Invalid(core.ProtocolChat, "$.choices[0].delta.tool_calls", "received data for a closed tool call")
 	}
+	if delta.ID != "" {
+		if tool.callID != "" && tool.callID != delta.ID {
+			return nil, core.Invalid(core.ProtocolChat, "$.choices[0].delta.tool_calls[].id", "changed during stream")
+		}
+		if priorIndex, duplicate := c.toolCallIDs[delta.ID]; duplicate && priorIndex != *delta.Index {
+			return nil, core.UpstreamResponseError(core.ProtocolChat, "$.choices[0].delta.tool_calls[].id", "tool call id %q is reused at indexes %d and %d", delta.ID, priorIndex, *delta.Index)
+		}
+	}
 	if err := mergeIdentity(&tool.callID, delta.ID, "id"); err != nil {
 		return nil, err
+	}
+	if delta.ID != "" {
+		c.toolCallIDs[delta.ID] = *delta.Index
 	}
 	if err := mergeIdentity(&tool.name, delta.Function.Name, "function.name"); err != nil {
 		return nil, err
@@ -655,18 +667,18 @@ func (c *Converter) closeOutputs(status string) ([]core.Frame, error) {
 	if reasoning := c.reasoning; reasoning != nil && !reasoning.closed {
 		text := reasoning.text.String()
 		frames = append(frames,
-			c.event("response.reasoning_summary_text.done", map[string]any{
-				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0, "text": text,
+			c.event("response.reasoning_text.done", map[string]any{
+				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0, "text": text,
 			}),
 		)
 		partDone := map[string]any{
-			"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0,
-			"part": map[string]any{"type": "summary_text", "text": text},
+			"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0,
+			"part": map[string]any{"type": "reasoning_text", "text": text},
 		}
 		if status == "incomplete" {
 			partDone["status"] = "incomplete"
 		}
-		frames = append(frames, c.event("response.reasoning_summary_part.done", partDone))
+		frames = append(frames, c.event("response.content_part.done", partDone))
 		reasoning.closed = true
 		frames = append(frames, c.event("response.output_item.done", map[string]any{
 			"output_index": reasoning.outputIndex,
@@ -818,13 +830,13 @@ func (c *Converter) responseObject(status string, terminal bool) map[string]any 
 }
 
 func (c *Converter) reasoningSnapshot(reasoning *reasoningState, status string) map[string]any {
-	summary := make([]any, 0, 1)
+	content := make([]any, 0, 1)
 	if reasoning.text.Len() > 0 {
-		summary = append(summary, map[string]any{"type": "summary_text", "text": reasoning.text.String()})
+		content = append(content, map[string]any{"type": "reasoning_text", "text": reasoning.text.String()})
 	}
 	return map[string]any{
 		"id": reasoning.id, "type": "reasoning", "status": status,
-		"summary": summary, "encrypted_content": nil,
+		"summary": []any{}, "content": content, "encrypted_content": nil,
 	}
 }
 

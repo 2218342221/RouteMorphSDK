@@ -202,7 +202,7 @@ func TestAnthropicV170ReasoningUsageMapsBackToMessages(t *testing.T) {
 
 	responsesBody := []byte(`{
 		"id":"resp_1","object":"response","model":"gpt","status":"completed",
-		"output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],
+		"output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
 		"usage":{"input_tokens":2,"output_tokens":6,"total_tokens":8,"output_tokens_details":{"reasoning_tokens":4}}
 	}`)
 	result, err = newResponsesMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolResponses}).ToClientResponse(ctx, responsesBody, conversionOptions{})
@@ -268,7 +268,7 @@ func TestResponsesMessagesExtensionsAndCacheWriteAccounting(t *testing.T) {
 	body := []byte(`{
 		"id":"resp_1","object":"response","model":"gpt","status":"completed",
 		"metadata":{"trace":"x"},"moderation":{"results":[]},"service_tier":"default",
-		"output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],
+		"output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
 		"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11,
 			"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"output_tokens_details":{"reasoning_tokens":0}}
 	}`)

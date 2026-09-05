@@ -18,6 +18,7 @@ type geminiBlob = geminiwire.Blob
 type geminiFileData = geminiwire.FileData
 type geminiFunctionCall = geminiwire.FunctionCall
 type geminiFunctionResponse = geminiwire.FunctionResponse
+type geminiFunctionResponsePart = geminiwire.FunctionResponsePart
 type geminiTool = geminiwire.Tool
 type geminiFunctionDeclaration = geminiwire.FunctionDeclaration
 type geminiToolConfig = geminiwire.ToolConfig
@@ -132,6 +133,41 @@ func validateGeminiContentJSON(raw json.RawMessage, path string) error {
 				}
 			}
 		}
+		if responseRaw := value["functionResponse"]; jsonValuePresent(responseRaw) {
+			var response map[string]json.RawMessage
+			_ = json.Unmarshal(responseRaw, &response)
+			if partsRaw := response["parts"]; jsonValuePresent(partsRaw) {
+				if err := validateGeminiFunctionResponsePartsJSON(partsRaw, partPath+".functionResponse.parts"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateGeminiFunctionResponsePartsJSON(raw json.RawMessage, path string) error {
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return invalid(ProtocolGenerateContent, path, "must be an array")
+	}
+	for index, part := range parts {
+		partPath := fmt.Sprintf("%s[%d]", path, index)
+		if err := rejectGeminiObjectFields(part, partPath, "inlineData", "fileData"); err != nil {
+			return err
+		}
+		var value map[string]json.RawMessage
+		_ = json.Unmarshal(part, &value)
+		if jsonValuePresent(value["inlineData"]) {
+			if err := rejectGeminiObjectFields(value["inlineData"], partPath+".inlineData", "mimeType", "data", "displayName"); err != nil {
+				return err
+			}
+		}
+		if jsonValuePresent(value["fileData"]) {
+			if err := rejectGeminiObjectFields(value["fileData"], partPath+".fileData", "mimeType", "fileUri", "displayName"); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -244,10 +280,27 @@ func validateGeminiPortableRequest(source *geminiRequest) error {
 		if jsonValuePresent(source.ToolConfig.RetrievalConfig) || source.ToolConfig.IncludeServerSideToolInvocations != nil {
 			return unsupported(ProtocolGenerateContent, "$.toolConfig", "retrieval and server-side tool invocation settings require a native provider")
 		}
+		mode := source.ToolConfig.FunctionCallingConfig.Mode
+		switch mode {
+		case "", "AUTO", "NONE", "ANY", "VALIDATED":
+		default:
+			return invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "unknown function-calling mode %q", mode)
+		}
+		if mode == "ANY" && len(declared) == 0 {
+			return invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "ANY requires at least one declared function")
+		}
+		if mode == "NONE" && len(source.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) > 0 {
+			return invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "NONE cannot restrict allowed functions")
+		}
+		seen := make(map[string]struct{}, len(source.ToolConfig.FunctionCallingConfig.AllowedFunctionNames))
 		for i, name := range source.ToolConfig.FunctionCallingConfig.AllowedFunctionNames {
 			if _, ok := declared[name]; !ok {
 				return invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", i), "function %q is not declared", name)
 			}
+			if _, duplicate := seen[name]; duplicate {
+				return invalid(ProtocolGenerateContent, fmt.Sprintf("$.toolConfig.functionCallingConfig.allowedFunctionNames[%d]", i), "duplicate allowed function %q", name)
+			}
+			seen[name] = struct{}{}
 		}
 	}
 	return validateGeminiPortableGenerationConfig(source.GenerationConfig)
@@ -302,15 +355,39 @@ func validateGeminiPortableGenerationConfig(config *geminiGenerationConfig) erro
 }
 
 func normalizeGeminiThinkingLevel(protocol Protocol, path, value string) (string, error) {
-	level := strings.ToUpper(strings.TrimSpace(value))
-	if level == "" {
+	if value == "" {
 		return "", nil
 	}
-	switch level {
-	case "MINIMAL", "LOW", "MEDIUM", "HIGH":
-		return level, nil
+	switch protocol {
+	case ProtocolGenerateContent:
+		switch value {
+		case "THINKING_LEVEL_UNSPECIFIED":
+			return "", nil
+		case "MINIMAL", "LOW", "MEDIUM", "HIGH":
+			return value, nil
+		default:
+			return "", invalid(protocol, path, "invalid Gemini thinkingLevel %q", value)
+		}
+	case ProtocolChat, ProtocolResponses:
+		switch value {
+		case "minimal", "low", "medium", "high":
+			return strings.ToUpper(value), nil
+		case "none", "xhigh", "max":
+			return "", unsupported(protocol, path, "reasoning effort %q has no official Gemini thinkingLevel mapping", value)
+		default:
+			return "", invalid(protocol, path, "invalid reasoning effort %q", value)
+		}
+	case ProtocolMessages:
+		switch value {
+		case "low", "medium", "high":
+			return strings.ToUpper(value), nil
+		case "xhigh", "max":
+			return "", unsupported(protocol, path, "reasoning effort %q has no official Gemini thinkingLevel mapping", value)
+		default:
+			return "", invalid(protocol, path, "invalid reasoning effort %q", value)
+		}
 	default:
-		return "", unsupported(protocol, path, "reasoning effort %q has no official Gemini thinkingLevel mapping", value)
+		return "", invalid(protocol, path, "unsupported reasoning-control protocol")
 	}
 }
 
@@ -434,8 +511,8 @@ func validateGeminiPart(part geminiPart, path string) error {
 			return invalid(ProtocolGenerateContent, path+".fileData.mimeType", "must be a bare IANA media type")
 		}
 	}
-	if part.FunctionResponse != nil && (jsonValuePresent(part.FunctionResponse.WillContinue) || jsonValuePresent(part.FunctionResponse.Scheduling) || jsonValuePresent(part.FunctionResponse.Parts)) {
-		return unsupported(ProtocolGenerateContent, path+".functionResponse", "streaming or multimodal function responses require a native Gemini provider")
+	if part.FunctionResponse != nil && (jsonValuePresent(part.FunctionResponse.WillContinue) || jsonValuePresent(part.FunctionResponse.Scheduling)) {
+		return unsupported(ProtocolGenerateContent, path+".functionResponse", "streaming function responses require a native Gemini provider")
 	}
 	if part.FunctionCall != nil {
 		if strings.TrimSpace(part.FunctionCall.Name) == "" {
@@ -452,6 +529,41 @@ func validateGeminiPart(part geminiPart, path string) error {
 		var response map[string]any
 		if err := json.Unmarshal(part.FunctionResponse.Response, &response); err != nil || response == nil {
 			return invalid(ProtocolGenerateContent, path+".functionResponse.response", "must be a JSON object")
+		}
+		if err := validateGeminiFunctionResponseParts(part.FunctionResponse.Parts, path+".functionResponse.parts"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGeminiFunctionResponseParts(parts []geminiFunctionResponsePart, path string) error {
+	for index, part := range parts {
+		partPath := fmt.Sprintf("%s[%d]", path, index)
+		payloads := 0
+		if part.InlineData != nil {
+			payloads++
+		}
+		if part.FileData != nil {
+			payloads++
+		}
+		if payloads != 1 {
+			return invalid(ProtocolGenerateContent, partPath, "FunctionResponsePart must contain exactly one data field")
+		}
+		if part.FileData != nil {
+			return unsupported(ProtocolGenerateContent, partPath+".fileData", "functionResponse.parts fileData is not supported by the Gemini Developer API")
+		}
+		if part.InlineData.DisplayName != "" {
+			return unsupported(ProtocolGenerateContent, partPath+".inlineData.displayName", "functionResponse.parts inlineData displayName is not supported by the Gemini Developer API")
+		}
+		if part.InlineData.MIMEType == "" || part.InlineData.Data == "" {
+			return invalid(ProtocolGenerateContent, partPath+".inlineData", "mimeType and data are required")
+		}
+		if !validMIMEType(part.InlineData.MIMEType) {
+			return invalid(ProtocolGenerateContent, partPath+".inlineData.mimeType", "must be a bare IANA media type")
+		}
+		if !validBase64(part.InlineData.Data) {
+			return invalid(ProtocolGenerateContent, partPath+".inlineData.data", "must be valid base64")
 		}
 	}
 	return nil

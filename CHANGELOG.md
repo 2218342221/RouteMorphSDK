@@ -17,9 +17,14 @@ here.
 - Added non-streaming OpenAI Chat↔Responses conversion for the shared custom
   tool declaration, choice, call, and text-output shapes, including text and
   grammar formats.
+- Added exact `allowed_tools` conversion, declaration-aware named/required
+  choice validation, and safe all-functions lowering across Chat, Responses,
+  Messages, and Gemini.
 - Added non-streaming Chat `web_search_options` ↔ unversioned Responses
   `web_search` conversion for shared context-size and approximate-location
   fields, with diagnostics for non-representable web-search lifecycle output.
+- Added ordered multimodal tool-result conversion for the compatible
+  Responses↔Messages and Responses/Messages↔Gemini image/PDF intersections.
 - Explicit unsupported-feature documentation and regression coverage for new
   request, response, usage, and stream extensions.
 
@@ -43,9 +48,14 @@ here.
 - Fail closed or emit an explicit diagnostic for provider-only fields instead
   of silently dropping them; provider-issued reasoning signatures are never
   forged.
+- Preserve Chat `reasoning_content` and unsigned Gemini thoughts as Responses
+  raw `reasoning_text`; keep Responses summaries distinct from raw reasoning.
 - Validate portable function-tool histories as a call/result ledger: unique
   call IDs, preceding references, single consumption, matching names, required
   arguments/output, and protocol-valid roles.
+- Deep-validate Responses v3.56 output-item and provider tool-definition
+  unions, media URL/base64 sources, partial SSE additions, terminal item
+  reconciliation, and buffered terminal statuses before emitting events.
 - Validate every upstream stream against its source protocol before native
   relay or cross-protocol conversion. Enforce Responses SSE creation, sequence,
   item/part, delta/done, and terminal lifecycles; pin buffered Chat/Gemini

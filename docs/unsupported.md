@@ -60,6 +60,34 @@ non-streaming common subset:
 - model-output custom calls, with any separate Responses item ID omitted only
   under an explicit diagnostic.
 
+Chat↔Responses also converts `tool_choice.type:"allowed_tools"` in both
+directions, but only for a non-empty, duplicate-free list of declared
+`function`/`custom` name references and `mode` `auto` or `required`. Hosted-tool
+references, an empty list, duplicate `(type, name)` references, an undeclared
+name, or a declaration/reference type mismatch fail closed. Referencing a
+custom tool does not relax the non-streaming custom-tool boundary.
+
+Across Messages and Gemini routes, an allowed set is reduced only when its
+meaning stays exact. Messages represents the all-functions required set as
+`any`, including a one-member complete set; a one-function proper subset is a
+named choice, while a larger proper subset is unsupported. Gemini represents
+any non-empty required subset as `ANY` plus names. Auto can become unrestricted
+`auto`/`AUTO` only when the allowed set equals all declarations. In the reverse
+direction, Gemini `ANY` over all declarations becomes Chat/Responses
+`required` or Messages `any`; a singleton proper subset becomes named, and a
+larger proper subset is expressible only by Chat/Responses `allowed_tools`.
+A required or any choice with no function declarations, a missing choice
+discriminator/name, an unknown mode, or an undeclared function reference is
+malformed and returns `ErrInvalidPayload`. Provider-native custom, hosted, and
+discovery choices remain `ErrUnsupported` where the target has no such union.
+Gemini `VALIDATED` is a known but non-portable mode and returns
+`ErrUnsupported`, not `ErrInvalidPayload`.
+
+Portable function/custom declaration names must be unique. A missing Chat tool
+type, conflicting members from multiple tagged-choice variants, and unreviewed
+nested fields in known tool-choice, thinking, or structured-output config
+objects fail closed instead of disappearing during JSON decoding.
+
 The conversion is intentionally unavailable for streaming because official
 Chat chunks have no custom-tool delta representation. This also means a
 buffered Responses custom call cannot be rendered as a valid Chat stream: the
@@ -85,7 +113,7 @@ The following remain Responses-native or fail closed when targeting Chat:
 - `web_search_2025_08_26` and other versioned search variants;
 - cache-only `external_web_access:false`, non-empty domain filters, and more
   than one search configuration;
-- streaming web-search requests and streaming URL-annotation conversion;
+- streaming web-search requests;
 - the tool-discovery declaration/items `tool_search`, `tool_search_call`,
   `tool_search_output`, and `additional_tools`.
 
@@ -100,6 +128,21 @@ coerced into the JSON-encoded argument string of a function call. A Responses
 `web_search_call` lifecycle item is omitted with
 `responses_web_search_call_not_representable` only when portable output is also
 present; a lifecycle-only response fails closed.
+
+Native Responses routes preserve these objects as their real Responses types.
+A buffered native body can render `custom_tool_call` input
+delta/done and `web_search_call` progress events; `tool_search_call`,
+`tool_search_output`, `additional_tools`, and complete custom-tool outputs use
+the generic output-item added/done lifecycle. No item is relabeled as a
+function call merely to cross a protocol boundary. `configuration_update` is
+a conversation item, not a `Response.output` item.
+
+The native validator understands the audited OpenAI v3.56 output-item and
+provider tool-definition unions. It validates known nested fields before an
+SSE `output_item.added` frame can escape, reconciles completed items with the
+terminal response, and rejects non-terminal item statuses during buffered SSE
+rendering. Future top-level extension fields can pass through, but an unknown
+union discriminator is not assumed safe.
 
 Supported response extensions are deliberately narrower:
 
@@ -131,6 +174,22 @@ Multimodal support is an intersection of role, content union, source form,
 MIME type, URL/file provenance, and detail controls. Matching words such as
 "file" or "audio" are not enough to make two shapes equivalent.
 
+Known Chat and Messages content/source unions are checked before unmarshalling
+into the portable model. A payload that mixes members from two tagged variants
+is malformed, and an unreviewed nested extension is unsupported; neither is
+silently discarded.
+
+The supported ordinary-input intersections are:
+
+- Chat↔Responses: user text, common image URL/data sources, and common file
+  ID/data sources;
+- Chat↔Messages: user text, JPEG/PNG/GIF/WebP images, and portable PDFs;
+- Chat↔Gemini: user text, common images/files, and inline WAV/MP3;
+- Responses↔Messages: text, JPEG/PNG/GIF/WebP images, and portable PDFs;
+- Responses↔Gemini: text and common image/file forms, but no Responses Create
+  audio;
+- Messages↔Gemini: text, JPEG/PNG/GIF/WebP images, and portable PDFs.
+
 ### System and developer instructions
 
 When converting Chat, Responses, or Messages instruction/system messages to a
@@ -158,11 +217,13 @@ interleaved after a conversational turn fail closed.
   `input_audio` is not in the Responses Create request union; a similarly named
   SDK type used by other API surfaces does not make it valid here.
 - `input_image` selects URL or file ID. `detail:"original"` has no Chat
-  equivalent and fails when targeting Chat.
+  equivalent and fails when targeting Chat. URLs must be absolute HTTP(S), and
+  inline data URLs must contain valid base64 in a supported image MIME type.
 - `input_file` selects file ID, file URL, or file data. A filename is required
   when raw data must carry type information to the destination. Its `detail`
   values `auto`, `low`, and `high` fail on routes whose destination has no
-  matching file-detail control.
+  matching file-detail control. File URLs must be absolute HTTP(S); raw or
+  data-URL file payloads must be valid base64.
 
 ### Messages and Gemini
 
@@ -192,6 +253,23 @@ provider's namespace. Multimodal tool-result parts are portable only on routes
 whose destination can preserve their order and exact media source; Chat custom
 and function tool outputs use the text-only shared subset.
 
+Responses↔Messages supports ordered text/image/PDF tool-result content when
+the exact source form is accepted by both protocols. Messages `is_error`,
+OpenAI detail controls and filenames, provider file IDs, and otherwise
+unsupported MIME/source forms fail closed.
+
+For Responses↔Gemini and Messages↔Gemini, that portable tool-result subset is
+specifically an ordered, media-only list of inline JPEG, PNG, GIF, WebP, or PDF
+data. It maps to Gemini `functionResponse.parts` with an empty `response`
+object for Responses, or with the exact empty `error` marker needed to preserve
+a Messages `is_error:true` result (`{"error":""}` or `{"error":null}`).
+Text-only results use exactly one `output`
+or `error` member; a marker plus sibling data fails closed. Mixed text/media
+results, other non-empty `response` data plus media parts, `fileData`,
+audio/video, filenames, detail controls, provider file IDs, remote URLs, and
+malformed or mixed part variants fail closed because their semantics or
+ordering cannot be preserved.
+
 ## Reasoning and thinking boundaries
 
 Reasoning is not one transferable field. Four layers are handled separately:
@@ -199,13 +277,21 @@ Reasoning is not one transferable field. Four layers are handled separately:
 - **Request control:** Chat/Responses effort, Anthropic adaptive/enabled mode
   and token budget/display policy, and Gemini level/budget/`includeThoughts`
   are not generally equivalent. Exact budgets and display/include policies
-  require native routing; only route-specific audited intersections map.
-  When targeting Messages, the portable OpenAI effort intersection is
-  `low`, `medium`, `high`, `xhigh`, and `max`; OpenAI `none` and `minimal`
-  have no Messages `output_config.effort` equivalent and fail closed.
+  require native routing. The exact bidirectional intersections are:
+  OpenAI Chat/Responses↔Messages = `low`, `medium`, `high`, `xhigh`, `max`;
+  OpenAI Chat/Responses↔Gemini = `minimal`, `low`, `medium`, `high` mapped to
+  uppercase Gemini levels; Messages↔Gemini = `low`, `medium`, `high` mapped to
+  uppercase Gemini levels. Chat↔Responses itself preserves all audited OpenAI
+  values unchanged: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+  `max`. OpenAI `summary`, Messages adaptive/enabled thinking and token budget,
+  and Gemini exact budget/`includeThoughts` do not follow from an effort match.
+  Values outside each listed intersection fail closed.
 - **Visible text:** Chat `reasoning_content` is a non-standard extension.
   Responses reasoning summary/text, Messages thinking text, and Gemini thought
-  text map only where a destination has a compatible visible-text field.
+  text map only where a destination has a compatible visible-text field. In
+  particular, Chat `reasoning_content` and unsigned Gemini thoughts map to
+  Responses raw `reasoning_text`; a Responses `summary_text` is not silently
+  reclassified as raw reasoning.
 - **Opaque replay state:** Responses `encrypted_content`, Anthropic thinking
   signatures/redacted data, and Gemini `thoughtSignature` are provider-issued
   state. Cross-provider conversion never forges or silently drops them.

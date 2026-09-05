@@ -538,3 +538,178 @@ func TestResponsesURLDocumentsRequirePDFForMessages(t *testing.T) {
 		})
 	}
 }
+
+func TestResponsesAndGeminiPreserveInlineMediaFunctionResults(t *testing.T) {
+	toGemini := newResponsesGeminiRoute(routeSpec{From: ProtocolResponses, To: ProtocolGenerateContent})
+	result, err := toGemini.ToUpstreamRequest(context.Background(), []byte(`{
+		"model":"responses",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_1","output":[
+				{"type":"input_image","image_url":"data:image/png;base64,aW1n"},
+				{"type":"input_file","file_data":"data:application/pdf;base64,JVBERg=="}
+			]}
+		]
+	}`), conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "gemini"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gemini geminiRequest
+	if err := json.Unmarshal(result.Body, &gemini); err != nil {
+		t.Fatal(err)
+	}
+	if len(gemini.Contents) != 2 || len(gemini.Contents[1].Parts) != 1 || gemini.Contents[1].Parts[0].FunctionResponse == nil {
+		t.Fatalf("converted request = %s", result.Body)
+	}
+	functionResponse := gemini.Contents[1].Parts[0].FunctionResponse
+	if string(functionResponse.Response) != `{}` || len(functionResponse.Parts) != 2 {
+		t.Fatalf("functionResponse = %#v", functionResponse)
+	}
+	if got := functionResponse.Parts[0].InlineData; got == nil || got.MIMEType != "image/png" || got.Data != "aW1n" {
+		t.Fatalf("image part = %#v", got)
+	}
+	if got := functionResponse.Parts[1].InlineData; got == nil || got.MIMEType != "application/pdf" || got.Data != "JVBERg==" {
+		t.Fatalf("document part = %#v", got)
+	}
+
+	toResponses := newResponsesGeminiRoute(routeSpec{From: ProtocolGenerateContent, To: ProtocolResponses})
+	back, err := toResponses.ToUpstreamRequest(context.Background(), []byte(`{
+		"contents":[
+			{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"inspect","args":{}}}]},
+			{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"inspect","response":{},"parts":[
+				{"inlineData":{"mimeType":"image/png","data":"aW1n"}},
+				{"inlineData":{"mimeType":"application/pdf","data":"JVBERg=="}}
+			]}}]}
+		]
+	}`), conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "responses"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var responses responsesRequest
+	if err := json.Unmarshal(back.Body, &responses); err != nil {
+		t.Fatal(err)
+	}
+	var items []responsesItem
+	if err := json.Unmarshal(responses.Input, &items); err != nil || len(items) != 2 {
+		t.Fatalf("converted input = %s", responses.Input)
+	}
+	var output []responsesContentPart
+	if err := json.Unmarshal(items[1].Output, &output); err != nil || len(output) != 2 {
+		t.Fatalf("function output = %s", items[1].Output)
+	}
+	if output[0].Type != "input_image" || output[0].ImageURL != "data:image/png;base64,aW1n" {
+		t.Fatalf("image output = %#v", output[0])
+	}
+	if output[1].Type != "input_file" || output[1].FileData != "data:application/pdf;base64,JVBERg==" {
+		t.Fatalf("file output = %#v", output[1])
+	}
+}
+
+func TestMessagesAndGeminiPreserveInlineMediaToolResults(t *testing.T) {
+	toGemini := newMessagesGeminiRoute(routeSpec{From: ProtocolMessages, To: ProtocolGenerateContent})
+	result, err := toGemini.ToUpstreamRequest(context.Background(), []byte(`{
+		"model":"claude","max_tokens":64,
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"}},
+				{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="}}
+			]}]}
+		]
+	}`), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gemini geminiRequest
+	if err := json.Unmarshal(result.Body, &gemini); err != nil {
+		t.Fatal(err)
+	}
+	if len(gemini.Contents) != 2 || len(gemini.Contents[1].Parts) != 1 || gemini.Contents[1].Parts[0].FunctionResponse == nil {
+		t.Fatalf("converted request = %s", result.Body)
+	}
+	functionResponse := gemini.Contents[1].Parts[0].FunctionResponse
+	if string(functionResponse.Response) != `{}` || len(functionResponse.Parts) != 2 {
+		t.Fatalf("functionResponse = %#v", functionResponse)
+	}
+	if functionResponse.Parts[0].InlineData == nil || functionResponse.Parts[0].InlineData.MIMEType != "image/png" {
+		t.Fatalf("image part = %#v", functionResponse.Parts[0])
+	}
+	if functionResponse.Parts[1].InlineData == nil || functionResponse.Parts[1].InlineData.MIMEType != "application/pdf" {
+		t.Fatalf("document part = %#v", functionResponse.Parts[1])
+	}
+
+	toMessages := newMessagesGeminiRoute(routeSpec{From: ProtocolGenerateContent, To: ProtocolMessages})
+	back, err := toMessages.ToUpstreamRequest(context.Background(), []byte(`{
+		"contents":[
+			{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"inspect","args":{}}}]},
+			{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"inspect","response":{},"parts":[
+				{"inlineData":{"mimeType":"image/png","data":"aW1n"}},
+				{"inlineData":{"mimeType":"application/pdf","data":"JVBERg=="}}
+			]}}]}
+		]
+	}`), conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "claude"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var messages messagesRequest
+	if err := json.Unmarshal(back.Body, &messages); err != nil || len(messages.Messages) != 2 {
+		t.Fatalf("converted request = %s", back.Body)
+	}
+	var outer []messagesBlock
+	if err := json.Unmarshal(messages.Messages[1].Content, &outer); err != nil || len(outer) != 1 || outer[0].Type != "tool_result" {
+		t.Fatalf("tool-result message = %s", messages.Messages[1].Content)
+	}
+	var content []messagesBlock
+	if err := json.Unmarshal(outer[0].Content, &content); err != nil || len(content) != 2 {
+		t.Fatalf("tool-result content = %s", outer[0].Content)
+	}
+	if content[0].Type != "image" || content[0].Source == nil || content[0].Source.MediaType != "image/png" || content[0].Source.Data != "aW1n" {
+		t.Fatalf("image block = %#v", content[0])
+	}
+	if content[1].Type != "document" || content[1].Source == nil || content[1].Source.MediaType != "application/pdf" || content[1].Source.Data != "JVBERg==" {
+		t.Fatalf("document block = %#v", content[1])
+	}
+}
+
+func TestGeminiFunctionResponseMediaFailsClosedOutsideExactInlineSubset(t *testing.T) {
+	harness, err := newTestRouterHarness()
+	if err != nil {
+		t.Fatal(err)
+	}
+	responsesMixed := `{"model":"responses","input":[{"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"caption"},{"type":"input_image","image_url":"data:image/png;base64,aW1n"}]}]}`
+	responsesDetailed := `{"model":"responses","input":[{"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_image","image_url":"data:image/png;base64,aW1n","detail":"low"}]}]}`
+	messagesMixed := `{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"text","text":"caption"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n"}}]}]}]}`
+	messagesUnknownSource := `{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"inspect","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1n","future":true}}]}]}]}`
+	geminiPrefix := `{"contents":[{"role":"model","parts":[{"functionCall":{"id":"call_1","name":"inspect","args":{}}}]},{"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"inspect",`
+	geminiSuffix := `}}]}]}`
+	tests := []struct {
+		name string
+		from Protocol
+		to   Protocol
+		body string
+		path string
+		kind error
+	}{
+		{name: "Responses mixed text and media", from: ProtocolResponses, to: ProtocolGenerateContent, body: responsesMixed, path: ".output[0]", kind: ErrUnsupported},
+		{name: "Responses media detail", from: ProtocolResponses, to: ProtocolGenerateContent, body: responsesDetailed, path: ".detail", kind: ErrUnsupported},
+		{name: "Messages mixed text and media", from: ProtocolMessages, to: ProtocolGenerateContent, body: messagesMixed, path: ".content[1]", kind: ErrUnsupported},
+		{name: "Messages unknown source field", from: ProtocolMessages, to: ProtocolGenerateContent, body: messagesUnknownSource, path: ".source.future", kind: ErrUnsupported},
+		{name: "Gemini response plus media to Responses", from: ProtocolGenerateContent, to: ProtocolResponses, body: geminiPrefix + `"response":{"output":"caption"},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n"}}]` + geminiSuffix, path: ".functionResponse", kind: ErrUnsupported},
+		{name: "Gemini response plus media to Messages", from: ProtocolGenerateContent, to: ProtocolMessages, body: geminiPrefix + `"response":{"output":"caption"},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n"}}]` + geminiSuffix, path: ".functionResponse", kind: ErrUnsupported},
+		{name: "Gemini fileData to Responses", from: ProtocolGenerateContent, to: ProtocolResponses, body: geminiPrefix + `"response":{},"parts":[{"fileData":{"mimeType":"application/pdf","fileUri":"gs://bucket/report.pdf"}}]` + geminiSuffix, path: ".parts[0].fileData", kind: ErrUnsupported},
+		{name: "Gemini audio to Messages", from: ProtocolGenerateContent, to: ProtocolMessages, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"audio/wav","data":"UklGRg=="}}]` + geminiSuffix, path: ".inlineData.mimeType", kind: ErrUnsupported},
+		{name: "Gemini video to Responses", from: ProtocolGenerateContent, to: ProtocolResponses, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"video/mp4","data":"AAAA"}}]` + geminiSuffix, path: ".inlineData.mimeType", kind: ErrUnsupported},
+		{name: "Gemini mixed nested union", from: ProtocolGenerateContent, to: ProtocolResponses, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n"},"fileData":{"mimeType":"image/png","fileUri":"gs://bucket/image.png"}}]` + geminiSuffix, path: ".parts[0]", kind: ErrInvalidPayload},
+		{name: "Gemini unknown nested field", from: ProtocolGenerateContent, to: ProtocolResponses, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n","future":true}}]` + geminiSuffix, path: ".inlineData.future", kind: ErrUnsupported},
+		{name: "Gemini inlineData display name", from: ProtocolGenerateContent, to: ProtocolMessages, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n","displayName":"image.png"}}]` + geminiSuffix, path: ".inlineData.displayName", kind: ErrUnsupported},
+		{name: "Gemini parts to Chat", from: ProtocolGenerateContent, to: ProtocolChat, body: geminiPrefix + `"response":{},"parts":[{"inlineData":{"mimeType":"image/png","data":"aW1n"}}]` + geminiSuffix, path: ".functionResponse", kind: ErrUnsupported},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := harness.ToUpstreamRequest(context.Background(), test.from, test.to, []byte(test.body), conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "provider"}})
+			if !errors.Is(err, test.kind) || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("error = %v, want %v at %s", err, test.kind, test.path)
+			}
+		})
+	}
+}

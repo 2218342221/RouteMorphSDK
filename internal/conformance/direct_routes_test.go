@@ -41,7 +41,7 @@ func TestResponsesProviderRequestMatrixUsesDirectedRoutes(t *testing.T) {
 
 func TestResponsesProviderResponseMatrix(t *testing.T) {
 	harness, _ := newTestRouterHarness()
-	response := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_item","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"key\":\"x\"}","status":"completed"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	response := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"key\":\"x\"}"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
 	for _, from := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolGenerateContent} {
 		t.Run(string(from), func(t *testing.T) {
 			plan, err := harness.catalog().Plan(from, ProtocolResponses)
@@ -64,8 +64,8 @@ func TestResponsesStreamsAreIncrementalForPrimaryIngressProtocols(t *testing.T) 
 	created := streamFrame{Event: "response.created", Data: []byte(`{"type":"response.created","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"in_progress","output":[],"usage":{"input_tokens":3,"output_tokens":0,"total_tokens":3}}}`)}
 	itemAdded := streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","status":"in_progress","content":[]}}`)}
 	delta := streamFrame{Event: "response.output_text.delta", Data: []byte(`{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hello"}`)}
-	partAdded := streamFrame{Event: "response.content_part.added", Data: []byte(`{"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}`)}
-	completed := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`)}
+	partAdded := streamFrame{Event: "response.content_part.added", Data: []byte(`{"type":"response.content_part.added","item_id":"msg_1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`)}
+	completed := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`)}
 	for _, from := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolGenerateContent} {
 		t.Run(string(from), func(t *testing.T) {
 			plan, _ := harness.catalog().Plan(from, ProtocolResponses)
@@ -129,6 +129,25 @@ func TestProviderFailureIsNotFabricatedAsCompletion(t *testing.T) {
 	_, err := harness.ToClientResponse(context.Background(), plan, failed, conversionOptions{})
 	if !errors.Is(err, ErrUpstreamResponse) {
 		t.Fatalf("error = %v, want ErrUpstreamResponse", err)
+	}
+}
+
+func TestOfficialResponsesIncompleteReasonsFailOnlyAtCrossProtocolBoundary(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	for _, reason := range []string{"max_messages", "steered"} {
+		for _, from := range []Protocol{ProtocolChat, ProtocolMessages, ProtocolGenerateContent} {
+			t.Run(string(from)+"/"+reason, func(t *testing.T) {
+				plan, err := harness.catalog().Plan(from, ProtocolResponses)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := []byte(`{"id":"resp_1","object":"response","status":"incomplete","incomplete_details":{"reason":"` + reason + `"},"output":[],"usage":{}}`)
+				_, err = harness.ToClientResponse(context.Background(), plan, body, conversionOptions{})
+				if !errors.Is(err, ErrUnsupported) || errors.Is(err, ErrUpstreamResponse) {
+					t.Fatalf("error = %v, want semantic boundary ErrUnsupported", err)
+				}
+			})
+		}
 	}
 }
 

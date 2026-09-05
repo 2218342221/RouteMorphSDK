@@ -48,11 +48,17 @@ func upstreamResponseError(protocol Protocol, path, format string, args ...any) 
 }
 
 var (
-	rawObject             = routekit.RawObject
-	jsonValuePresent      = routekit.ValuePresent
-	rawJSONValuePresent   = routekit.ValuePresent
-	mustJSONString        = routekit.MustJSONString
-	resolveExchangeStream = routekit.ResolveExchangeStream
+	rawObject                        = routekit.RawObject
+	jsonValuePresent                 = routekit.ValuePresent
+	rawJSONValuePresent              = routekit.ValuePresent
+	mustJSONString                   = routekit.MustJSONString
+	resolveExchangeStream            = routekit.ResolveExchangeStream
+	validateResponsesContentArray    = routekit.ValidateResponsesContentArray
+	validateResponsesInputItems      = routekit.ValidateResponsesInputItems
+	validateResponsesOutputItems     = routekit.ValidateResponsesOutputItems
+	validateResponsesToolOutput      = routekit.ValidateResponsesToolOutput
+	validateResponsesToolsShape      = routekit.ValidateResponsesTools
+	validateChatMessageContentFields = routekit.ValidateChatMessageContentFields
 )
 
 func joinText(parts []portablePart) string {

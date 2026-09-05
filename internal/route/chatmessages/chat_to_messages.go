@@ -30,6 +30,12 @@ func (c *chatToMessagesConverter) ToUpstreamRequest(_ context.Context, input []b
 		"prompt_cache_key", "prompt_cache_retention", "safety_identifier", "stream_options"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateChatResponseFormatFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateChatMessageContentFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
 	extraDiagnostics, err := validateChatToMessagesRequest(input, options.LossPolicy)
 	if err != nil {
 		return conversionResult{}, err

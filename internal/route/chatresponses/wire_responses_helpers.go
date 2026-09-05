@@ -24,6 +24,9 @@ func responseInputItems(raw json.RawMessage) ([]responsesItem, error) {
 	if raw[0] == '"' {
 		return []responsesItem{{Type: "message", Role: "user", Content: mustJSON([]responsesContentPart{{Type: "input_text", Text: rawString(raw)}})}}, nil
 	}
+	if err := validateResponsesInputItems(ProtocolResponses, raw, "$.input"); err != nil {
+		return nil, err
+	}
 	var items []responsesItem
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, invalid(ProtocolResponses, "$.input", "input must be a string or item array: %v", err)

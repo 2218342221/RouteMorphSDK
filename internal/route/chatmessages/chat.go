@@ -1,6 +1,7 @@
 package chatmessages
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -15,8 +16,12 @@ type chatToolCall = chatwire.ToolCall
 
 func decodeChatMessage(source chatMessage, index int) (portableMessage, error) {
 	path := fmt.Sprintf("$.messages[%d]", index)
-	if rawJSONValuePresent(source.FunctionCall) {
-		return portableMessage{}, unsupported(ProtocolChat, path+".function_call", "deprecated function_call cannot be represented without semantic loss")
+	return decodeChatMessageAtPath(source, path)
+}
+
+func decodeChatMessageAtPath(source chatMessage, path string) (portableMessage, error) {
+	if err := validateChatMessageMetadata(source, path); err != nil {
+		return portableMessage{}, err
 	}
 	message := portableMessage{Role: semanticRole(source.Role), Name: source.Name}
 	switch message.Role {
@@ -66,6 +71,31 @@ func decodeChatMessage(source chatMessage, index int) (portableMessage, error) {
 		message.Parts = append(message.Parts, portablePart{Kind: partToolCall, ToolCall: &portableToolCall{ID: toolCall.ID, Name: toolCall.Function.Name, Arguments: arguments}})
 	}
 	return message, nil
+}
+
+func validateChatMessageMetadata(source chatMessage, path string) error {
+	if rawJSONValuePresent(source.FunctionCall) {
+		return unsupported(ProtocolChat, path+".function_call", "deprecated function_call cannot be represented without semantic loss")
+	}
+	if source.Role == "assistant" {
+		if source.ToolCallID != "" {
+			return invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is only valid on tool messages")
+		}
+		return nil
+	}
+	if source.ToolCallID != "" && source.Role != "tool" {
+		return invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is only valid on tool messages")
+	}
+	if len(source.ToolCalls) > 0 {
+		return invalid(ProtocolChat, path+".tool_calls", "tool_calls are only valid on assistant messages")
+	}
+	if source.Refusal != "" {
+		return invalid(ProtocolChat, path+".refusal", "refusal is only valid on assistant messages")
+	}
+	if source.ReasoningContent != "" {
+		return invalid(ProtocolChat, path+".reasoning_content", "reasoning_content is only valid on assistant messages")
+	}
+	return nil
 }
 
 func validateChatContentRole(role string, parts []portablePart, path string) error {
@@ -295,29 +325,110 @@ func decodeStop(protocol Protocol, raw json.RawMessage) ([]string, error) {
 }
 
 func decodeChatToolChoice(raw json.RawMessage) (toolChoice, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil
 	}
-	if raw[0] == '"' {
+	if trimmed[0] == '"' {
 		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
+		if err := json.Unmarshal(trimmed, &value); err != nil {
 			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "invalid string choice")
 		}
 		if value != string(toolChoiceAuto) && value != string(toolChoiceNone) && value != string(toolChoiceRequired) {
-			return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "tool choice %q is not portable", value)
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "unknown tool choice %q", value)
 		}
 		return toolChoice{Mode: toolChoiceMode(value)}, nil
 	}
-	var value struct {
-		Type     string `json:"type"`
-		Function struct {
-			Name string `json:"name"`
-		} `json:"function"`
+	fields, err := rejectUnknownObjectFields(ProtocolChat, trimmed, "$.tool_choice", "type", "function", "custom", "allowed_tools")
+	if err != nil {
+		return toolChoice{}, err
 	}
-	if err := json.Unmarshal(raw, &value); err != nil || value.Type != "function" || value.Function.Name == "" {
-		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "only function tool choices are portable")
+	var kind string
+	if err := json.Unmarshal(fields["type"], &kind); err != nil || kind == "" {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.type", "non-empty string is required")
 	}
-	return toolChoice{Mode: toolChoiceNamed, Name: value.Function.Name}, nil
+	switch kind {
+	case "function":
+		if jsonValuePresent(fields["custom"]) || jsonValuePresent(fields["allowed_tools"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "function choice contains fields for another choice type")
+		}
+		function, err := rejectUnknownObjectFields(ProtocolChat, fields["function"], "$.tool_choice.function", "name")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var name string
+		if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.function.name", "non-empty string is required")
+		}
+		return toolChoice{Mode: toolChoiceNamed, Name: name}, nil
+	case "allowed_tools":
+		if jsonValuePresent(fields["function"]) || jsonValuePresent(fields["custom"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "allowed_tools choice contains fields for another choice type")
+		}
+		allowed, err := rejectUnknownObjectFields(ProtocolChat, fields["allowed_tools"], "$.tool_choice.allowed_tools", "mode", "tools")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var mode string
+		if err := json.Unmarshal(allowed["mode"], &mode); err != nil || (mode != string(toolChoiceAuto) && mode != string(toolChoiceRequired)) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.mode", "must be %q or %q", toolChoiceAuto, toolChoiceRequired)
+		}
+		var references []json.RawMessage
+		if err := json.Unmarshal(allowed["tools"], &references); err != nil || len(references) == 0 {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.tools", "non-empty array is required")
+		}
+		names := make([]string, 0, len(references))
+		seen := make(map[string]struct{}, len(references))
+		for index, reference := range references {
+			path := fmt.Sprintf("$.tool_choice.allowed_tools.tools[%d]", index)
+			item, err := rejectUnknownObjectFields(ProtocolChat, reference, path, "type", "function", "custom")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var itemType string
+			if err := json.Unmarshal(item["type"], &itemType); err != nil || itemType == "" {
+				return toolChoice{}, invalid(ProtocolChat, path+".type", "non-empty string is required")
+			}
+			if itemType != "function" {
+				return toolChoice{}, unsupported(ProtocolChat, path+".type", "allowed tool type %q has no Messages equivalent", itemType)
+			}
+			if jsonValuePresent(item["custom"]) {
+				return toolChoice{}, invalid(ProtocolChat, path+".custom", "is not valid for a function reference")
+			}
+			function, err := rejectUnknownObjectFields(ProtocolChat, item["function"], path+".function", "name")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var name string
+			if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+				return toolChoice{}, invalid(ProtocolChat, path+".function.name", "non-empty string is required")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return toolChoice{}, invalid(ProtocolChat, path+".function.name", "duplicate allowed function %q", name)
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceMode(mode), AllowedNames: names}, nil
+	case "custom":
+		if jsonValuePresent(fields["function"]) || jsonValuePresent(fields["allowed_tools"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "custom choice contains fields for another choice type")
+		}
+		if !jsonValuePresent(fields["custom"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.custom", "is required")
+		}
+		custom, err := rejectUnknownObjectFields(ProtocolChat, fields["custom"], "$.tool_choice.custom", "name")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var name string
+		if err := json.Unmarshal(custom["name"], &name); err != nil || name == "" {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.custom.name", "non-empty string is required")
+		}
+		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice.type", "custom tool choice has no Messages equivalent")
+	default:
+		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice.type", "tool choice type %q has no Messages equivalent", kind)
+	}
 }
 
 func encodeChatToolChoice(choice toolChoice) json.RawMessage {

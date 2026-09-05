@@ -81,6 +81,31 @@ func TestGeminiToResponsesCorrelatesParallelSameNameCalls(t *testing.T) {
 	}
 }
 
+func TestGeminiGeneratedRequestCallIDsAvoidExplicitIDs(t *testing.T) {
+	harness, _ := newTestRouterHarness()
+	body := []byte(`{
+		"contents":[{"role":"model","parts":[
+			{"functionCall":{"name":"generated","args":{}}},
+			{"functionCall":{"id":"rm_call_1","name":"explicit","args":{}}}
+		]}]
+	}`)
+	execution, err := harness.ToUpstreamRequest(context.Background(), ProtocolGenerateContent, ProtocolResponses, body, conversionOptions{Exchange: exchangeMetadata{UpstreamModel: "responses"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request responsesRequest
+	if err := json.Unmarshal(execution.Result.Body, &request); err != nil {
+		t.Fatal(err)
+	}
+	var items []responsesItem
+	if err := json.Unmarshal(request.Input, &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].CallID != "rm_call_2" || items[1].CallID != "rm_call_1" {
+		t.Fatalf("items = %#v", items)
+	}
+}
+
 func TestGeminiSignedFunctionCallFailsClosed(t *testing.T) {
 	harness, _ := newTestRouterHarness()
 	body := []byte(`{"contents":[{"role":"model","parts":[{"functionCall":{"name":"ping","args":{}},"thoughtSignature":"signed"}]}]}`)
@@ -240,6 +265,51 @@ func TestGeminiToResponsesResponseRejectsDuplicateCallIDs(t *testing.T) {
 	}
 }
 
+func TestGeminiGeneratedResponseCallIDsAvoidExplicitIDs(t *testing.T) {
+	chatConverter := newChatGeminiRoute(routeSpec{From: ProtocolChat, To: ProtocolGenerateContent})
+	chatResult, err := chatConverter.ToClientResponse(context.Background(), []byte(`{
+		"responseId":"gem_1","modelVersion":"gemini",
+		"candidates":[{"content":{"role":"model","parts":[
+			{"functionCall":{"id":"rm_call_1","name":"first","args":{}}},
+			{"functionCall":{"name":"second","args":{}}}
+		]},"finishReason":"STOP"}]
+	}`), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chat chatResponse
+	if err := json.Unmarshal(chatResult.Body, &chat); err != nil {
+		t.Fatal(err)
+	}
+	chatCalls := chat.Choices[0].Message.ToolCalls
+	if len(chatCalls) != 2 || chatCalls[0].ID != "rm_call_1" || chatCalls[1].ID != "rm_call_2" {
+		t.Fatalf("Chat call ids = %#v", chatCalls)
+	}
+
+	messagesConverter := newMessagesGeminiRoute(routeSpec{From: ProtocolMessages, To: ProtocolGenerateContent})
+	messagesResult, err := messagesConverter.ToClientResponse(context.Background(), []byte(`{
+		"responseId":"gem_2","modelVersion":"gemini",
+		"candidates":[{"content":{"role":"model","parts":[
+			{"functionCall":{"id":"call_rm_2","name":"first","args":{}}},
+			{"functionCall":{"name":"second","args":{}}}
+		]},"finishReason":"STOP"}]
+	}`), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var messages messagesResponse
+	if err := json.Unmarshal(messagesResult.Body, &messages); err != nil {
+		t.Fatal(err)
+	}
+	var blocks []messagesBlock
+	if err := json.Unmarshal(messages.Content, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blocks) != 2 || blocks[0].ID != "call_rm_2" || blocks[1].ID != "call_rm_1" {
+		t.Fatalf("Messages blocks = %#v", blocks)
+	}
+}
+
 func TestGeminiToResponsesStreamKeepsCallIDsUnique(t *testing.T) {
 	stream, err := newResponsesGeminiRoute(routeSpec{From: ProtocolResponses, To: ProtocolGenerateContent}).NewClientStream(context.Background(), conversionOptions{})
 	if err != nil {
@@ -273,6 +343,81 @@ func TestGeminiToResponsesStreamKeepsCallIDsUnique(t *testing.T) {
 	}
 	if got, want := strings.Join(callIDs, ","), "rm_call_1,rm_call_2"; got != want {
 		t.Fatalf("call ids = %q, want %q", got, want)
+	}
+}
+
+func TestGeminiToResponsesStreamRemapsExplicitIDCollidingWithGeneratedID(t *testing.T) {
+	stream, err := newResponsesGeminiRoute(routeSpec{From: ProtocolResponses, To: ProtocolGenerateContent}).NewClientStream(context.Background(), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := []streamFrame{
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"generated","args":{}}}]}}]}`)},
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"rm_call_1","name":"explicit","args":{}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`)},
+	}
+	var generated []streamFrame
+	var callIDs []string
+	var sawRemapDiagnostic bool
+	for _, input := range inputs {
+		frames, diagnostics, err := stream.Convert(context.Background(), input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		generated = append(generated, frames...)
+		for _, diagnostic := range diagnostics {
+			if diagnostic.Code == "remapped_function_call_id" {
+				sawRemapDiagnostic = true
+			}
+		}
+		for _, frame := range frames {
+			if frame.Event != "response.output_item.added" {
+				continue
+			}
+			var event struct {
+				Item responsesItem `json:"item"`
+			}
+			if err := json.Unmarshal(frame.Data, &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Item.Type == "function_call" {
+				callIDs = append(callIDs, event.Item.CallID)
+			}
+		}
+	}
+	finalFrames, _, err := stream.Finalize(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated = append(generated, finalFrames...)
+	if got, want := strings.Join(callIDs, ","), "rm_call_1,rm_call_2"; got != want {
+		t.Fatalf("call ids = %q, want %q", got, want)
+	}
+	if !sawRemapDiagnostic {
+		t.Fatal("missing remapped_function_call_id diagnostic")
+	}
+	if _, _, err := collectNativeStreamResponse(ProtocolResponses, generated, rejectSemanticLoss); err != nil {
+		t.Fatalf("generated Responses SSE failed native validation: %v", err)
+	}
+}
+
+func TestGeminiToResponsesStreamStillRejectsRepeatedExplicitIDAfterRemap(t *testing.T) {
+	stream, err := newResponsesGeminiRoute(routeSpec{From: ProtocolResponses, To: ProtocolGenerateContent}).NewClientStream(context.Background(), conversionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := []streamFrame{
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"generated","args":{}}}]}}]}`)},
+		{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"rm_call_1","name":"explicit","args":{}}}]}}]}`)},
+	}
+	for _, input := range inputs {
+		if _, _, err := stream.Convert(context.Background(), input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	duplicate := streamFrame{Data: []byte(`{"responseId":"gem_1","modelVersion":"gemini","candidates":[{"content":{"role":"model","parts":[{"functionCall":{"id":"rm_call_1","name":"duplicate","args":{}}}]},"finishReason":"STOP"}]}`)}
+	_, _, err = stream.Convert(context.Background(), duplicate)
+	if !errors.Is(err, ErrUpstreamResponse) || !strings.Contains(err.Error(), "duplicate function call id") {
+		t.Fatalf("error = %v, want duplicate call id ErrUpstreamResponse", err)
 	}
 }
 
@@ -335,7 +480,7 @@ func TestGeminiToolConfigFailsClosedWithoutExactResponsesMapping(t *testing.T) {
 		want error
 	}{
 		{name: "validated", mode: `"mode":"VALIDATED"`, want: ErrUnsupported},
-		{name: "auto restricted", mode: `"mode":"AUTO","allowedFunctionNames":["f"]`, want: ErrUnsupported},
+		{name: "auto all declared", mode: `"mode":"AUTO","allowedFunctionNames":["f"]`, want: nil},
 		{name: "none restricted", mode: `"mode":"NONE","allowedFunctionNames":["f"]`, want: ErrInvalidPayload},
 	} {
 		t.Run(test.name, func(t *testing.T) {

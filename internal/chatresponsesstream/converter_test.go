@@ -60,7 +60,7 @@ func TestRefusalLifecycle(t *testing.T) {
 	}
 }
 
-func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
+func TestReasoningTextLifecycleAndTerminalOutput(t *testing.T) {
 	converter := New(Options{})
 	frames := convertAll(t, converter,
 		frame(`{"id":"chatcmpl-reason","created":8,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"plan "},"finish_reason":null}]}`),
@@ -69,9 +69,9 @@ func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
 	)
 	wantEvents := []string{
 		"response.created", "response.in_progress", "response.output_item.added",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_text.delta",
-		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-		"response.reasoning_summary_part.done", "response.output_item.done", "response.completed",
+		"response.content_part.added", "response.reasoning_text.delta",
+		"response.reasoning_text.delta", "response.reasoning_text.done",
+		"response.content_part.done", "response.output_item.done", "response.completed",
 	}
 	assertEvents(t, frames, wantEvents)
 	assertSequence(t, frames)
@@ -85,9 +85,12 @@ func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
 	if reasoning["type"] != "reasoning" || reasoning["status"] != "completed" {
 		t.Fatalf("reasoning item = %#v", reasoning)
 	}
-	summary := reasoning["summary"].([]any)
-	if len(summary) != 1 || summary[0].(map[string]any)["text"] != "plan done" {
+	if summary := reasoning["summary"].([]any); len(summary) != 0 {
 		t.Fatalf("reasoning summary = %#v", summary)
+	}
+	content := reasoning["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["type"] != "reasoning_text" || content[0].(map[string]any)["text"] != "plan done" {
+		t.Fatalf("reasoning content = %#v", content)
 	}
 }
 
@@ -115,6 +118,29 @@ func TestToolCallLifecycle(t *testing.T) {
 	if tool["call_id"] != "call_1" || tool["status"] != "completed" {
 		t.Fatalf("tool output = %#v", tool)
 	}
+}
+
+func TestToolCallIDCannotBeReusedAcrossIndexes(t *testing.T) {
+	converter := New(Options{})
+	first, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"chatcmpl-duplicate","created":9,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"first","arguments":"{}"}}]},"finish_reason":null}]}`))
+	if err != nil || len(diagnostics) != 0 || len(first) == 0 {
+		t.Fatalf("first Convert() frames=%#v diagnostics=%#v error=%v", first, diagnostics, err)
+	}
+
+	frames, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"chatcmpl-duplicate","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"second","arguments":"{}"}}]},"finish_reason":null}]}`))
+	if !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), `tool call id "call_1" is reused at indexes 0 and 1`) {
+		t.Fatalf("second Convert() frames=%#v diagnostics=%#v error=%v, want duplicate call-id error", frames, diagnostics, err)
+	}
+}
+
+func TestToolCallIDMayRepeatAtSameIndex(t *testing.T) {
+	converter := New(Options{})
+	frames := convertAll(t, converter,
+		frame(`{"id":"chatcmpl-repeat","created":9,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{"}}]},"finish_reason":null}]}`),
+		frame(`{"id":"chatcmpl-repeat","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}`),
+		doneFrame(),
+	)
+	assertContainsEvents(t, frames, "response.function_call_arguments.done", "response.completed")
 }
 
 func TestEmptyToolArgumentsBecomeJSONObject(t *testing.T) {

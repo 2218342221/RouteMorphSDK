@@ -17,6 +17,15 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 	if err := rejectUnknownCrossTopLevel(ProtocolResponses, input); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateResponsesReasoningConfig(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateResponsesTextConfigFields(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateResponsesToolsShape(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source responsesRequest
 	if err := decodeJSON(ProtocolResponses, input, &source); err != nil {
 		return conversionResult{}, err
@@ -61,12 +70,12 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 		if err := validateOpenAIReasoningEffortForMessages(ProtocolResponses, "$.reasoning.effort", source.Reasoning.Effort); err != nil {
 			return conversionResult{}, err
 		}
-		if options.LossPolicy == rejectSemanticLoss {
-			return conversionResult{}, unsupported(ProtocolResponses, "$.reasoning", "Responses reasoning is not semantically equivalent to Messages thinking")
+		if source.Reasoning.Summary != "" {
+			return conversionResult{}, unsupported(ProtocolResponses, "$.reasoning.summary", "Messages has no equivalent control for returning a reasoning summary")
 		}
-		target.Thinking = &messagesThinking{Type: "adaptive"}
-		target.OutputConfig = &messagesOutputConfig{Effort: source.Reasoning.Effort}
-		diagnostics = appendDiagnostic(diagnostics, "warning", "reasoning_policy_approximated", "$.reasoning", "Responses reasoning was approximated as Messages adaptive thinking")
+		if source.Reasoning.Effort != "" {
+			target.OutputConfig = &messagesOutputConfig{Effort: source.Reasoning.Effort}
+		}
 	}
 	var textEnvelope struct {
 		Format struct {
@@ -105,6 +114,10 @@ func (c *responsesToMessagesConverter) ToUpstreamRequest(_ context.Context, inpu
 		}{Type: "json_schema", Schema: format.Schema}
 	}
 	choice, err := decodeResponsesToolChoice(source.ToolChoice)
+	if err != nil {
+		return conversionResult{}, err
+	}
+	choice, err = normalizeResponsesChoiceForMessages(choice, source.Tools)
 	if err != nil {
 		return conversionResult{}, err
 	}

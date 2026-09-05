@@ -54,26 +54,47 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 		target.Temperature, target.TopP, target.TopK = config.Temperature, config.TopP, config.TopK
 		target.StopSequences = append([]string(nil), config.StopSequences...)
 		if config.ThinkingConfig != nil {
-			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig", "Gemini thinkingConfig is not semantically equivalent to Messages thinking")
+			if config.ThinkingConfig.ThinkingBudget != nil {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingBudget", "Messages output_config cannot preserve an exact Gemini thinking-token budget")
+			}
+			if config.ThinkingConfig.IncludeThoughts {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.includeThoughts", "Messages output_config cannot preserve Gemini's thought-inclusion policy")
+			}
+			level, err := normalizeGeminiThinkingLevel(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingLevel", config.ThinkingConfig.ThinkingLevel)
+			if err != nil {
+				return conversionResult{}, err
+			}
+			if level == "MINIMAL" {
+				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.thinkingConfig.thinkingLevel", "Messages output_config has no minimal effort level")
+			}
+			if level != "" {
+				target.OutputConfig = &messagesOutputConfig{Effort: strings.ToLower(level)}
+			}
 		}
 		if jsonValuePresent(config.ResponseJSONSchema) {
 			converted, err := normalizeGeminiJSONSchema(ProtocolGenerateContent, "$.generationConfig.responseJsonSchema", config.ResponseJSONSchema)
 			if err != nil {
 				return conversionResult{}, err
 			}
-			target.OutputConfig = &messagesOutputConfig{Format: &struct {
+			if target.OutputConfig == nil {
+				target.OutputConfig = &messagesOutputConfig{}
+			}
+			target.OutputConfig.Format = &struct {
 				Type   string          `json:"type"`
 				Schema json.RawMessage `json:"schema"`
-			}{Type: "json_schema", Schema: converted}}
+			}{Type: "json_schema", Schema: converted}
 		} else if jsonValuePresent(config.ResponseSchema) {
 			converted, err := messagesGeminiSchemaToJSONSchema(config.ResponseSchema, "$.generationConfig.responseSchema")
 			if err != nil {
 				return conversionResult{}, err
 			}
-			target.OutputConfig = &messagesOutputConfig{Format: &struct {
+			if target.OutputConfig == nil {
+				target.OutputConfig = &messagesOutputConfig{}
+			}
+			target.OutputConfig.Format = &struct {
 				Type   string          `json:"type"`
 				Schema json.RawMessage `json:"schema"`
-			}{Type: "json_schema", Schema: converted}}
+			}{Type: "json_schema", Schema: converted}
 		} else if config.ResponseMIMEType == "application/json" {
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.generationConfig.responseMimeType", "Messages output_config cannot express schema-less JSON mode")
 		}
@@ -124,10 +145,15 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 	}
 	if source.ToolConfig != nil {
 		config := source.ToolConfig.FunctionCallingConfig
+		declared := make(map[string]struct{}, len(target.Tools))
+		for _, tool := range target.Tools {
+			declared[tool.Name] = struct{}{}
+		}
+		allAllowed := len(config.AllowedFunctionNames) > 0 && sameFunctionNameSet(config.AllowedFunctionNames, declared)
 		choice := toolChoice{}
 		switch config.Mode {
 		case "", "AUTO":
-			if len(config.AllowedFunctionNames) > 0 {
+			if len(config.AllowedFunctionNames) > 0 && !allAllowed {
 				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "AUTO restricted to named functions has no Messages equivalent")
 			}
 			choice.Mode = toolChoiceAuto
@@ -137,10 +163,10 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 			}
 			choice.Mode = toolChoiceNone
 		case "ANY":
-			switch len(config.AllowedFunctionNames) {
-			case 0:
+			switch {
+			case len(config.AllowedFunctionNames) == 0 || allAllowed:
 				choice.Mode = toolChoiceRequired
-			case 1:
+			case len(config.AllowedFunctionNames) == 1:
 				choice = toolChoice{Mode: toolChoiceNamed, Name: config.AllowedFunctionNames[0]}
 			default:
 				return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.allowedFunctionNames", "Messages cannot restrict tool choice to multiple named functions")
@@ -148,12 +174,18 @@ func (c *geminiToMessagesConverter) ToUpstreamRequest(_ context.Context, input [
 		case "VALIDATED":
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "VALIDATED permits text or schema-valid calls and has no Messages equivalent")
 		default:
-			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "mode %q is not portable", config.Mode)
+			return conversionResult{}, invalid(ProtocolGenerateContent, "$.toolConfig.functionCallingConfig.mode", "unknown function-calling mode %q", config.Mode)
 		}
 		target.ToolChoice = encodeMessagesToolChoice(choice, nil)
 	}
 
-	tracker := newGeminiCallTracker()
+	reservedCallIDs := make(map[string]struct{})
+	for contentIndex, content := range source.Contents {
+		if err := reserveGeminiMessagesCallIDs(reservedCallIDs, content.Parts, fmt.Sprintf("$.contents[%d].parts", contentIndex), false); err != nil {
+			return conversionResult{}, err
+		}
+	}
+	tracker := newGeminiCallTracker(reservedCallIDs)
 	for contentIndex, content := range source.Contents {
 		path := fmt.Sprintf("$.contents[%d]", contentIndex)
 		role := content.Role
@@ -387,9 +419,6 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 			if block.ToolUseID == "" {
 				return nil, diagnostics, invalid(ProtocolMessages, blockPath+".tool_use_id", "tool_use_id is required")
 			}
-			if block.IsError {
-				return nil, diagnostics, unsupported(ProtocolMessages, blockPath+".is_error", "Gemini functionResponse cannot preserve the tool error flag")
-			}
 			name := ""
 			if callNames != nil {
 				name = callNames[block.ToolUseID]
@@ -403,11 +432,11 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 				}
 				consumedCallIDs[block.ToolUseID] = true
 			}
-			response, err := messagesToolResultToGemini(block.Content, blockPath+".content")
+			response, responseParts, err := messagesToolResultToGemini(block.Content, block.IsError, blockPath+".content")
 			if err != nil {
 				return nil, diagnostics, err
 			}
-			parts = append(parts, geminiPart{FunctionResponse: &geminiFunctionResponse{ID: block.ToolUseID, Name: name, Response: response}})
+			parts = append(parts, geminiPart{FunctionResponse: &geminiFunctionResponse{ID: block.ToolUseID, Name: name, Response: response, Parts: responseParts}})
 		case "thinking", "redacted_thinking":
 			return nil, diagnostics, unsupported(ProtocolMessages, blockPath, "Anthropic signed or redacted thinking cannot be converted into a Gemini thought signature")
 		default:
@@ -417,47 +446,167 @@ func messagesBlocksToGemini(blocks []messagesBlock, role, path string, callNames
 	return parts, diagnostics, nil
 }
 
-func messagesToolResultToGemini(raw json.RawMessage, path string) (json.RawMessage, error) {
+func messagesToolResultToGemini(raw json.RawMessage, isError bool, path string) (json.RawMessage, []geminiFunctionResponsePart, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		if isError {
+			return mustJSON(map[string]any{"error": ""}), nil, nil
+		}
+		return json.RawMessage(`{}`), nil, nil
+	}
+	if err := validateMessagesToolResultContentJSON(raw, path); err != nil {
+		return nil, nil, err
+	}
+	if trimmed[0] == '[' {
+		var rawBlocks []json.RawMessage
+		if json.Unmarshal(trimmed, &rawBlocks) == nil && len(rawBlocks) == 0 {
+			if isError {
+				return mustJSON(map[string]any{"error": ""}), nil, nil
+			}
+			return json.RawMessage(`{}`), nil, nil
+		}
+	}
 	blocks, err := decodeMessagesBlocks(raw, path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var text strings.Builder
+	var media []geminiFunctionResponsePart
+	textSeen := false
+	mediaSeen := false
 	for index, block := range blocks {
-		if err := rejectMessagesBlockMetadata(block, fmt.Sprintf("%s[%d]", path, index)); err != nil {
-			return nil, err
+		blockPath := fmt.Sprintf("%s[%d]", path, index)
+		if err := rejectMessagesBlockMetadata(block, blockPath); err != nil {
+			return nil, nil, err
 		}
-		if block.Type != "text" {
-			return nil, unsupported(ProtocolMessages, fmt.Sprintf("%s[%d]", path, index), "multimodal tool results require Gemini functionResponse.parts semantics")
+		switch block.Type {
+		case "text":
+			textSeen = true
+			text.WriteString(block.Text)
+		case "image", "document":
+			mediaSeen = true
+			converted, err := messagesToolResultMediaToGemini(block, blockPath)
+			if err != nil {
+				return nil, nil, err
+			}
+			media = append(media, converted)
+		default:
+			return nil, nil, unsupported(ProtocolMessages, blockPath, "only text, inline image, and inline PDF tool results are portable to Gemini")
 		}
-		text.WriteString(block.Text)
+		if textSeen && mediaSeen {
+			return nil, nil, unsupported(ProtocolMessages, blockPath, "Gemini functionResponse cannot preserve text ordering within a multimodal tool result")
+		}
+	}
+	if mediaSeen {
+		if isError {
+			return mustJSON(map[string]any{"error": ""}), media, nil
+		}
+		return json.RawMessage(`{}`), media, nil
 	}
 	value := text.String()
-	var decoded any
-	if json.Unmarshal([]byte(value), &decoded) == nil {
-		if object, ok := decoded.(map[string]any); ok {
-			return mustJSON(object), nil
+	field := "output"
+	if isError {
+		field = "error"
+	}
+	return mustJSON(map[string]any{field: value}), nil, nil
+}
+
+func validateMessagesToolResultContentJSON(raw json.RawMessage, path string) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil
+	}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(trimmed, &blocks); err != nil {
+		return invalid(ProtocolMessages, path, "content must be a string or block array: %v", err)
+	}
+	for index, block := range blocks {
+		blockPath := fmt.Sprintf("%s[%d]", path, index)
+		var discriminator struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(block, &discriminator); err != nil || discriminator.Type == "" {
+			return invalid(ProtocolMessages, blockPath+".type", "content block type is required")
+		}
+		var fields []string
+		switch discriminator.Type {
+		case "text":
+			fields = []string{"type", "text", "cache_control", "citations"}
+		case "image":
+			fields = []string{"type", "source", "cache_control"}
+		case "document":
+			fields = []string{"type", "source", "cache_control", "citations", "title", "context", "transformations"}
+		default:
+			// The semantic validator below reports the unsupported block kind.
+			continue
+		}
+		object, err := rejectUnknownObjectFields(ProtocolMessages, block, blockPath, fields...)
+		if err != nil {
+			return err
+		}
+		if discriminator.Type == "image" || discriminator.Type == "document" {
+			if source := object["source"]; jsonValuePresent(source) {
+				if _, err := rejectUnknownObjectFields(ProtocolMessages, source, blockPath+".source", "type", "media_type", "data", "url", "file_id", "content"); err != nil {
+					return err
+				}
+			}
 		}
 	}
-	return mustJSON(map[string]any{"output": value}), nil
+	return nil
+}
+
+func messagesToolResultMediaToGemini(block messagesBlock, path string) (geminiFunctionResponsePart, error) {
+	if block.Source == nil {
+		return geminiFunctionResponsePart{}, invalid(ProtocolMessages, path+".source", "source is required")
+	}
+	if block.Source.Type != "base64" {
+		return geminiFunctionResponsePart{}, unsupported(ProtocolMessages, path+".source.type", "Gemini Developer API functionResponse.parts supports inline base64 media only")
+	}
+	if block.Source.URL != "" || block.Source.FileID != "" || jsonValuePresent(block.Source.Content) {
+		return geminiFunctionResponsePart{}, invalid(ProtocolMessages, path+".source", "base64 source cannot contain url, file_id, or content")
+	}
+	if block.Source.MediaType == "" || block.Source.Data == "" {
+		return geminiFunctionResponsePart{}, invalid(ProtocolMessages, path+".source", "media_type and data are required")
+	}
+	if !validBase64(block.Source.Data) {
+		return geminiFunctionResponsePart{}, invalid(ProtocolMessages, path+".source.data", "must be valid base64")
+	}
+	if block.Type == "image" {
+		if !validMessagesImageMediaType(block.Source.MediaType) {
+			return geminiFunctionResponsePart{}, unsupported(ProtocolMessages, path+".source.media_type", "Messages images require JPEG, PNG, GIF, or WebP")
+		}
+	} else if block.Source.MediaType != "application/pdf" {
+		return geminiFunctionResponsePart{}, unsupported(ProtocolMessages, path+".source.media_type", "only inline PDF document tool results are portable to Gemini")
+	}
+	return geminiFunctionResponsePart{InlineData: &geminiBlob{MIMEType: block.Source.MediaType, Data: block.Source.Data}}, nil
 }
 
 type geminiCallTracker struct {
 	names     map[string]string
 	pending   map[string][]string
 	consumed  map[string]bool
+	reserved  map[string]struct{}
 	generated int
 }
 
-func newGeminiCallTracker() *geminiCallTracker {
-	return &geminiCallTracker{names: make(map[string]string), pending: make(map[string][]string), consumed: make(map[string]bool)}
+func newGeminiCallTracker(reserved map[string]struct{}) *geminiCallTracker {
+	if reserved == nil {
+		reserved = make(map[string]struct{})
+	}
+	return &geminiCallTracker{names: make(map[string]string), pending: make(map[string][]string), consumed: make(map[string]bool), reserved: reserved}
 }
 
 func (t *geminiCallTracker) add(id, name string) (string, bool, error) {
 	generated := false
 	if id == "" {
-		t.generated++
-		id = fmt.Sprintf("call_rm_%d", t.generated)
+		for {
+			t.generated++
+			id = fmt.Sprintf("call_rm_%d", t.generated)
+			if _, exists := t.reserved[id]; !exists {
+				break
+			}
+		}
+		t.reserved[id] = struct{}{}
 		generated = true
 	}
 	if _, exists := t.names[id]; exists {
@@ -466,6 +615,24 @@ func (t *geminiCallTracker) add(id, name string) (string, bool, error) {
 	t.names[id] = name
 	t.pending[name] = append(t.pending[name], id)
 	return id, generated, nil
+}
+
+func reserveGeminiMessagesCallIDs(reserved map[string]struct{}, parts []geminiPart, path string, upstream bool) error {
+	for index, part := range parts {
+		if part.FunctionCall == nil || part.FunctionCall.ID == "" {
+			continue
+		}
+		id := part.FunctionCall.ID
+		if _, duplicate := reserved[id]; duplicate {
+			field := fmt.Sprintf("%s[%d].functionCall.id", path, index)
+			if upstream {
+				return upstreamResponseError(ProtocolGenerateContent, field, "duplicate function call id %q", id)
+			}
+			return invalid(ProtocolGenerateContent, field, "duplicate function call id %q", id)
+		}
+		reserved[id] = struct{}{}
+	}
+	return nil
 }
 
 func (t *geminiCallTracker) resolve(id, name string) (string, error) {
@@ -549,11 +716,11 @@ func geminiPartsToMessages(parts []geminiPart, role, path string, tracker *gemin
 			if err != nil {
 				return nil, diagnostics, hasToolCall, err
 			}
-			content, err := geminiFunctionResponseToMessages(part.FunctionResponse.Response, partPath+".functionResponse.response")
+			content, isError, err := geminiFunctionResponseToMessages(part.FunctionResponse, partPath+".functionResponse")
 			if err != nil {
 				return nil, diagnostics, hasToolCall, err
 			}
-			blocks = append(blocks, messagesBlock{Type: "tool_result", ToolUseID: callID, Content: content})
+			blocks = append(blocks, messagesBlock{Type: "tool_result", ToolUseID: callID, Content: content, IsError: isError})
 		case part.InlineData != nil:
 			if role == "assistant" {
 				return nil, diagnostics, hasToolCall, unsupported(ProtocolGenerateContent, partPath+".inlineData", "multimodal Gemini model output has no valid Messages assistant-content mapping")
@@ -618,27 +785,99 @@ func geminiPartsToMessages(parts []geminiPart, role, path string, tracker *gemin
 	return blocks, diagnostics, hasToolCall, nil
 }
 
-func geminiFunctionResponseToMessages(raw json.RawMessage, path string) (json.RawMessage, error) {
-	if !jsonValuePresent(raw) {
-		return nil, invalid(ProtocolGenerateContent, path, "response is required")
+func geminiFunctionResponseToMessages(response *geminiFunctionResponse, path string) (json.RawMessage, bool, error) {
+	if !jsonValuePresent(response.Response) {
+		return nil, false, invalid(ProtocolGenerateContent, path+".response", "response is required")
 	}
-	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, invalid(ProtocolGenerateContent, path, "response must be valid JSON: %v", err)
-	}
-	if object, ok := value.(map[string]any); ok && len(object) == 1 {
-		if unwrapped, exists := object["output"]; exists {
-			value = unwrapped
+	if len(response.Parts) > 0 {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(response.Response, &object); err != nil || object == nil {
+			return nil, false, invalid(ProtocolGenerateContent, path+".response", "response must be a JSON object")
 		}
+		isError := false
+		if len(object) != 0 {
+			rawError, hasError := object["error"]
+			if len(object) != 1 || !hasError || !geminiEmptyFunctionResponseValue(rawError) {
+				return nil, false, unsupported(ProtocolGenerateContent, path, "Messages cannot preserve non-empty Gemini functionResponse.response data together with media parts")
+			}
+			isError = true
+		}
+		blocks := make([]messagesBlock, 0, len(response.Parts))
+		for index, part := range response.Parts {
+			partPath := fmt.Sprintf("%s.parts[%d]", path, index)
+			if part.FileData != nil {
+				return nil, false, unsupported(ProtocolGenerateContent, partPath+".fileData", "functionResponse.parts fileData is not supported by the Gemini Developer API")
+			}
+			if part.InlineData == nil {
+				return nil, false, invalid(ProtocolGenerateContent, partPath, "inlineData is required")
+			}
+			mimeType := strings.ToLower(part.InlineData.MIMEType)
+			blockType := "document"
+			if strings.HasPrefix(mimeType, "image/") {
+				if !validMessagesImageMediaType(mimeType) {
+					return nil, false, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "Messages images require JPEG, PNG, GIF, or WebP")
+				}
+				blockType = "image"
+			} else if mimeType != "application/pdf" {
+				return nil, false, unsupported(ProtocolGenerateContent, partPath+".inlineData.mimeType", "only inline image and PDF function-response media are portable to Messages")
+			}
+			block := messagesBlock{Type: blockType}
+			block.Source = &struct {
+				Type      string          `json:"type"`
+				MediaType string          `json:"media_type,omitempty"`
+				Data      string          `json:"data,omitempty"`
+				URL       string          `json:"url,omitempty"`
+				FileID    string          `json:"file_id,omitempty"`
+				Content   json.RawMessage `json:"content,omitempty"`
+			}{Type: "base64", MediaType: mimeType, Data: part.InlineData.Data}
+			blocks = append(blocks, block)
+		}
+		return mustJSON(blocks), isError, nil
 	}
-	if text, ok := value.(string); ok {
-		return mustJSON(text), nil
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(response.Response, &object); err != nil || object == nil {
+		return nil, false, invalid(ProtocolGenerateContent, path+".response", "response must be a JSON object")
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return nil, invalid(ProtocolGenerateContent, path, "cannot encode function response: %v", err)
+	if len(object) == 0 {
+		return nil, false, nil
 	}
-	return mustJSON(string(encoded)), nil
+	if rawError, exists := object["error"]; exists {
+		if len(object) != 1 {
+			return nil, false, unsupported(ProtocolGenerateContent, path+".response", "Messages cannot preserve fields alongside Gemini function-response error")
+		}
+		if text, ok := geminiFunctionResponseStringValue(rawError); ok {
+			return text, true, nil
+		}
+		return mustJSON(string(bytes.TrimSpace(rawError))), true, nil
+	}
+	if rawOutput, exists := object["output"]; exists {
+		if len(object) != 1 {
+			return nil, false, unsupported(ProtocolGenerateContent, path+".response", "Messages cannot preserve fields alongside Gemini function-response output")
+		}
+		if text, ok := geminiFunctionResponseStringValue(rawOutput); ok {
+			return text, false, nil
+		}
+		return mustJSON(string(bytes.TrimSpace(rawOutput))), false, nil
+	}
+	return mustJSON(string(bytes.TrimSpace(response.Response))), false, nil
+}
+
+func geminiEmptyFunctionResponseValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return true
+	}
+	var text string
+	return json.Unmarshal(trimmed, &text) == nil && text == ""
+}
+
+func geminiFunctionResponseStringValue(raw json.RawMessage) (json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	var text string
+	if len(trimmed) > 0 && trimmed[0] == '"' && json.Unmarshal(trimmed, &text) == nil {
+		return append(json.RawMessage(nil), trimmed...), true
+	}
+	return nil, false
 }
 
 func messagesGeminiSchemaToJSONSchema(raw json.RawMessage, path string) (json.RawMessage, error) {

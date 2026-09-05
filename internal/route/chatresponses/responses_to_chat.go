@@ -128,6 +128,9 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 	if err := rejectUnknownTopLevel(ProtocolResponses, input, "model", "input", "instructions", "tools", "tool_choice", "max_output_tokens", "temperature", "top_p", "stream", "parallel_tool_calls", "reasoning", "text", "metadata", "conversation", "previous_response_id", "prompt", "context_management", "background", "include", "top_logprobs", "service_tier", "store", "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "stream_options", "truncation", "user", "max_tool_calls", "client_metadata", "moderation"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateResponsesToolsShape(ProtocolResponses, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source responsesRequest
 	if err := decodeJSON(ProtocolResponses, input, &source); err != nil {
 		return conversionResult{}, err
@@ -211,9 +214,6 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 	if err != nil {
 		return conversionResult{}, err
 	}
-	if choice.Mode != "" {
-		target.ToolChoice = encodeChatToolChoice(choice)
-	}
 	format, verbosity, err := decodeResponsesTextOptions(source.Text)
 	if err != nil {
 		return conversionResult{}, err
@@ -276,6 +276,12 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 			return conversionResult{}, unsupported(ProtocolResponses, path+".type", "built-in tool %q requires a native Responses provider", tool.Type)
 		}
 	}
+	if err := validateToolChoiceReferences(ProtocolResponses, choice, source.Tools); err != nil {
+		return conversionResult{}, err
+	}
+	if choice.Mode != "" {
+		target.ToolChoice = encodeChatToolChoice(choice)
+	}
 	if len(source.Instructions) > 0 && string(source.Instructions) != "null" {
 		parts, err := decodeResponsesInstructions(source.Instructions)
 		if err != nil {
@@ -296,6 +302,7 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 	}
 	callIDsByName := make(map[string][]string)
 	callKinds := make(map[string]string)
+	callNames := make(map[string]string)
 	consumedCallIDs := make(map[string]bool)
 	for index, item := range items {
 		path := fmt.Sprintf("$.input[%d]", index)
@@ -325,6 +332,7 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "duplicate tool call id %q", item.CallID)
 			}
 			callKinds[item.CallID] = "function"
+			callNames[item.CallID] = item.Name
 			callIDsByName[item.Name] = append(callIDsByName[item.Name], item.CallID)
 			var call chatToolCall
 			call.ID, call.Type, call.Function.Name = item.CallID, "function", item.Name
@@ -344,6 +352,9 @@ func (c *responsesToChatConverter) ToUpstreamRequest(_ context.Context, input []
 			}
 			if callID == "" || callKinds[callID] != "function" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".call_id", "function output cannot be correlated with an earlier function call")
+			}
+			if item.Name != "" && item.Name != callNames[callID] {
+				return conversionResult{}, invalid(ProtocolResponses, path+".name", "function output name %q does not match call name %q", item.Name, callNames[callID])
 			}
 			if consumedCallIDs[callID] {
 				return conversionResult{}, invalid(ProtocolResponses, path+".call_id", "tool call %q already has an output", callID)
@@ -487,8 +498,13 @@ func (c *responsesToChatConverter) ToClientResponse(_ context.Context, input []b
 		return conversionResult{}, upstreamResponseError(ProtocolChat, "$.choices[0].message.annotations", "URL citations were returned without message content")
 	}
 	if choice.Message.ReasoningContent != "" {
-		target.Output = append(target.Output, responsesItem{Type: "reasoning", ID: "rs_" + source.ID, Summary: mustJSON([]responsesContentPart{{Type: "summary_text", Text: choice.Message.ReasoningContent}}), Status: "completed"})
+		target.Output = append(target.Output, responsesItem{
+			Type: "reasoning", ID: "rs_" + source.ID, Status: "completed",
+			Summary: mustJSON([]responsesContentPart{}),
+			Content: mustJSON([]responsesContentPart{{Type: "reasoning_text", Text: choice.Message.ReasoningContent}}),
+		})
 	}
+	seenToolCallIDs := make(map[string]string)
 	for index, call := range choice.Message.ToolCalls {
 		path := fmt.Sprintf("$.choices[0].message.tool_calls[%d]", index)
 		switch call.Type {
@@ -499,6 +515,10 @@ func (c *responsesToChatConverter) ToClientResponse(_ context.Context, input []b
 			if call.ID == "" || call.Function.Name == "" {
 				return conversionResult{}, upstreamResponseError(ProtocolChat, path, "function tool call requires id and name")
 			}
+			if previous, duplicate := seenToolCallIDs[call.ID]; duplicate {
+				return conversionResult{}, upstreamResponseError(ProtocolChat, path+".id", "duplicate tool call id %q (already used by %s call)", call.ID, previous)
+			}
+			seenToolCallIDs[call.ID] = "function"
 			arguments, err := normalizeOpenAIToolArguments(ProtocolChat, path+".function.arguments", call.Function.Arguments)
 			if err != nil {
 				return conversionResult{}, err
@@ -508,10 +528,14 @@ func (c *responsesToChatConverter) ToClientResponse(_ context.Context, input []b
 			if call.ID == "" || call.Custom == nil || call.Custom.Name == "" || call.Custom.Input == nil {
 				return conversionResult{}, upstreamResponseError(ProtocolChat, path, "custom tool call requires id, name, and input")
 			}
+			if previous, duplicate := seenToolCallIDs[call.ID]; duplicate {
+				return conversionResult{}, upstreamResponseError(ProtocolChat, path+".id", "duplicate tool call id %q (already used by %s call)", call.ID, previous)
+			}
+			seenToolCallIDs[call.ID] = "custom"
 			if call.Function.Name != "" || nonNullJSON(call.Function.Arguments) {
 				return conversionResult{}, upstreamResponseError(ProtocolChat, path+".function", "is not valid for a custom tool call")
 			}
-			target.Output = append(target.Output, responsesItem{Type: "custom_tool_call", ID: "ctc_" + call.ID, CallID: call.ID, Name: call.Custom.Name, Input: json.RawMessage(mustJSONString(*call.Custom.Input)), Status: "completed"})
+			target.Output = append(target.Output, responsesItem{Type: "custom_tool_call", ID: "ctc_" + call.ID, CallID: call.ID, Name: call.Custom.Name, Input: json.RawMessage(mustJSONString(*call.Custom.Input))})
 		default:
 			return conversionResult{}, unsupported(ProtocolChat, path+".type", "tool call type %q is unsupported", call.Type)
 		}

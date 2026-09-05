@@ -57,12 +57,15 @@ const (
 	ToolChoiceNone     ToolChoiceMode = "none"
 	ToolChoiceRequired ToolChoiceMode = "required"
 	ToolChoiceNamed    ToolChoiceMode = "named"
+	ToolChoiceAllowed  ToolChoiceMode = "allowed_tools"
 )
 
 type ToolChoice struct {
-	Mode ToolChoiceMode
-	Name string
-	Kind string
+	Mode         ToolChoiceMode
+	Name         string
+	Kind         string
+	AllowedMode  ToolChoiceMode
+	AllowedNames []string
 }
 type JSONSchemaFormat struct {
 	Name, Description string

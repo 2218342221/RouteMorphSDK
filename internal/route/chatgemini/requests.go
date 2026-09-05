@@ -33,6 +33,12 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		"prompt_cache_key", "prompt_cache_options", "prompt_cache_retention", "safety_identifier", "moderation", "stream_options"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateChatResponseFormatFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateChatMessageContentFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
 	var source chatRequest
 	if err := decodeJSON(ProtocolChat, input, &source); err != nil {
 		return conversionResult{}, err
@@ -82,6 +88,9 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		return conversionResult{}, err
 	}
 	for index, message := range source.Messages {
+		if rawJSONValuePresent(message.FunctionCall) {
+			return conversionResult{}, unsupported(ProtocolChat, fmt.Sprintf("$.messages[%d].function_call", index), "deprecated function_call cannot be represented without semantic loss")
+		}
 		if rawJSONValuePresent(message.Annotations) {
 			return conversionResult{}, unsupported(ProtocolChat, fmt.Sprintf("$.messages[%d].annotations", index), "message annotations have no Gemini equivalent")
 		}
@@ -157,6 +166,9 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		tool := geminiTool{}
 		for index, item := range source.Tools {
 			path := fmt.Sprintf("$.tools[%d]", index)
+			if item.Type == "" {
+				return conversionResult{}, invalid(ProtocolChat, path+".type", "tool type is required")
+			}
 			if item.Type != "function" {
 				return conversionResult{}, unsupported(ProtocolChat, path+".type", "tool type %q requires a native Chat provider", item.Type)
 			}
@@ -189,12 +201,24 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 		return conversionResult{}, err
 	}
 	if choice.Mode != "" {
-		if len(declaredTools) == 0 && choice.Mode != toolChoiceNone {
+		if len(declaredTools) == 0 && choice.Mode == toolChoiceRequired {
 			return conversionResult{}, invalid(ProtocolChat, "$.tool_choice", "tool choice requires at least one declared function")
 		}
 		if choice.Mode == toolChoiceNamed {
 			if _, ok := declaredTools[choice.Name]; !ok {
 				return conversionResult{}, invalid(ProtocolChat, "$.tool_choice.function.name", "function %q is not declared", choice.Name)
+			}
+		} else if choice.Mode == toolChoiceAllowed {
+			for index, name := range choice.AllowedNames {
+				if _, ok := declaredTools[name]; !ok {
+					return conversionResult{}, invalid(ProtocolChat, fmt.Sprintf("$.tool_choice.allowed_tools.tools[%d].function.name", index), "function %q is not declared", name)
+				}
+			}
+			if choice.AllowedMode == toolChoiceAuto {
+				if len(choice.AllowedNames) != len(declaredTools) {
+					return conversionResult{}, unsupported(ProtocolChat, "$.tool_choice.allowed_tools.tools", "Gemini cannot preserve AUTO restricted to a strict subset of functions")
+				}
+				choice = toolChoice{Mode: toolChoiceAuto}
 			}
 		}
 		target.ToolConfig = geminiToolConfigForChoice(choice)
@@ -226,6 +250,15 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			target.SystemInstruction.Parts = append(target.SystemInstruction.Parts, parts...)
 		case "tool":
 			sawOrdinaryContent = true
+			if len(message.ToolCalls) > 0 {
+				return conversionResult{}, invalid(ProtocolChat, path+".tool_calls", "tool_calls are only valid on assistant messages")
+			}
+			if message.Refusal != "" {
+				return conversionResult{}, invalid(ProtocolChat, path+".refusal", "refusal is only valid on assistant messages")
+			}
+			if message.ReasoningContent != "" {
+				return conversionResult{}, invalid(ProtocolChat, path+".reasoning_content", "reasoning_content is only valid on assistant messages")
+			}
 			if message.ToolCallID == "" {
 				return conversionResult{}, invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is required")
 			}
@@ -248,7 +281,7 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 				return conversionResult{}, err
 			}
 			if wrapped {
-				diagnostics = appendDiagnostic(diagnostics, "warning", "tool_result_wrapped", path+".content", "non-object Chat tool content was wrapped in a Gemini response object")
+				diagnostics = appendDiagnostic(diagnostics, "warning", "tool_result_wrapped", path+".content", "Chat tool content was wrapped under Gemini functionResponse.response.output to preserve its exact text semantics")
 			}
 			appendGeminiContent(&target, "user", geminiPart{FunctionResponse: &geminiFunctionResponse{ID: message.ToolCallID, Name: name, Response: response}})
 		case "user", "assistant":
@@ -262,8 +295,11 @@ func (c *chatToGeminiConverter) ToUpstreamRequest(_ context.Context, input []byt
 			if message.Refusal != "" {
 				return conversionResult{}, unsupported(ProtocolChat, path+".refusal", "Gemini cannot preserve a structured refusal in request history")
 			}
-			if message.Role == "user" && (message.ReasoningContent != "" || len(message.ToolCalls) > 0) {
-				return conversionResult{}, invalid(ProtocolChat, path, "reasoning_content and tool_calls are only valid on assistant messages")
+			if message.Role == "user" && message.ReasoningContent != "" {
+				return conversionResult{}, invalid(ProtocolChat, path+".reasoning_content", "reasoning_content is only valid on assistant messages")
+			}
+			if message.Role == "user" && len(message.ToolCalls) > 0 {
+				return conversionResult{}, invalid(ProtocolChat, path+".tool_calls", "tool_calls are only valid on assistant messages")
 			}
 			var parts []geminiPart
 			if message.ReasoningContent != "" {
@@ -420,7 +456,7 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 		if source.SystemInstruction.Role != "" && source.SystemInstruction.Role != "user" {
 			return conversionResult{}, unsupported(ProtocolGenerateContent, "$.systemInstruction.role", "role %q cannot be represented by Chat", source.SystemInstruction.Role)
 		}
-		parts, _, err := geminiPartsToChat(source.SystemInstruction.Parts, "$.systemInstruction.parts", "system", options.LossPolicy, nil, &diagnostics)
+		parts, _, err := geminiPartsToChat(source.SystemInstruction.Parts, "$.systemInstruction.parts", "system", options.LossPolicy, nil, nil, &diagnostics)
 		if err != nil {
 			return conversionResult{}, err
 		}
@@ -441,6 +477,12 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 	callNamesByID := make(map[string]string)
 	consumedCallIDs := make(map[string]bool)
 	generatedCallID := 0
+	reservedCallIDs := make(map[string]struct{})
+	for contentIndex, content := range source.Contents {
+		if err := reserveGeminiChatCallIDs(reservedCallIDs, content.Parts, fmt.Sprintf("$.contents[%d].parts", contentIndex), false); err != nil {
+			return conversionResult{}, err
+		}
+	}
 	for contentIndex, content := range source.Contents {
 		path := fmt.Sprintf("$.contents[%d]", contentIndex)
 		role := content.Role
@@ -458,7 +500,7 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 			if len(ordinary) == 0 {
 				return nil
 			}
-			parts, calls, err := geminiPartsToChat(ordinary, path+".parts", role, options.LossPolicy, &generatedCallID, &diagnostics)
+			parts, calls, err := geminiPartsToChat(ordinary, path+".parts", role, options.LossPolicy, &generatedCallID, reservedCallIDs, &diagnostics)
 			if err != nil {
 				return err
 			}
@@ -542,9 +584,13 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 				return conversionResult{}, invalid(ProtocolGenerateContent, partPath+".functionResponse.id", "function call %q already has a response", callID)
 			}
 			consumedCallIDs[callID] = true
+			content, err := geminiFunctionResponseToChatText(response, partPath+".functionResponse")
+			if err != nil {
+				return conversionResult{}, err
+			}
 			target.Messages = append(target.Messages, chatMessage{
 				Role: "tool", Name: response.Name, ToolCallID: callID,
-				Content: json.RawMessage(mustJSONString(string(response.Response))),
+				Content: json.RawMessage(mustJSONString(content)),
 			})
 		}
 		if err := flushOrdinary(); err != nil {
@@ -553,4 +599,32 @@ func (c *geminiToChatConverter) ToUpstreamRequest(_ context.Context, input []byt
 	}
 	body, err := marshal(ProtocolChat, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
+}
+
+func geminiFunctionResponseToChatText(response *geminiFunctionResponse, path string) (string, error) {
+	if len(response.Parts) > 0 {
+		return "", unsupported(ProtocolGenerateContent, path+".parts", "Chat tool messages cannot preserve Gemini function-response media")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(response.Response, &object); err != nil || object == nil {
+		return "", invalid(ProtocolGenerateContent, path+".response", "response must be a JSON object")
+	}
+	if _, exists := object["error"]; exists {
+		return "", unsupported(ProtocolGenerateContent, path+".response.error", "Chat tool messages have no portable tool-error state")
+	}
+	if rawOutput, exists := object["output"]; exists {
+		if len(object) != 1 {
+			return "", unsupported(ProtocolGenerateContent, path+".response", "Chat cannot preserve fields alongside Gemini function-response output")
+		}
+		trimmed := bytes.TrimSpace(rawOutput)
+		if len(trimmed) > 0 && trimmed[0] == '"' {
+			var text string
+			if err := json.Unmarshal(trimmed, &text); err != nil {
+				return "", invalid(ProtocolGenerateContent, path+".response.output", "output string is invalid")
+			}
+			return text, nil
+		}
+		return string(trimmed), nil
+	}
+	return string(bytes.TrimSpace(response.Response)), nil
 }

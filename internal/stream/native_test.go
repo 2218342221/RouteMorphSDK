@@ -1,8 +1,11 @@
 package stream
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -12,7 +15,7 @@ import (
 func TestNativeCollectRenderMatrix(t *testing.T) {
 	responses := map[Protocol][]byte{
 		ProtocolChat:            []byte(`{"id":"c","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`),
-		ProtocolResponses:       []byte(`{"id":"r","model":"m","status":"completed","output":[{"id":"i","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`),
+		ProtocolResponses:       []byte(`{"id":"r","model":"m","status":"completed","output":[{"id":"i","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`),
 		ProtocolMessages:        []byte(`{"id":"a","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`),
 		ProtocolGenerateContent: []byte(`{"responseId":"g","modelVersion":"m","candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`),
 	}
@@ -255,12 +258,11 @@ func TestNativeResponsesPromptCacheOptionsRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNativeResponsesPreservesReasoningAndConfigurationItems(t *testing.T) {
+func TestNativeResponsesPreservesReasoningItem(t *testing.T) {
 	source := []byte(`{
 		"id":"r","object":"response","model":"m","status":"completed",
 		"output":[
-			{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque","status":"completed"},
-			{"id":"cfg_1","type":"configuration_update","reasoning":{"effort":"high"}}
+			{"id":"rs_1","type":"reasoning","summary":[],"encrypted_content":"opaque","status":"completed"}
 		],
 		"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}
 	}`)
@@ -272,10 +274,95 @@ func TestNativeResponsesPreservesReasoningAndConfigurationItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"encrypted_content":"opaque"`, `"type":"configuration_update"`, `"effort":"high"`} {
+	for _, want := range []string{`"encrypted_content":"opaque"`, `"type":"reasoning"`} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("round-trip response missing %s: %s", want, body)
 		}
+	}
+	if !strings.Contains(string(frames[2].Data), `"encrypted_content":"opaque"`) {
+		t.Fatalf("reasoning output_item.done lost encrypted content: %s", frames[2].Data)
+	}
+}
+
+func TestNativeResponsesRejectsItemsOutsideOutputUnion(t *testing.T) {
+	for _, itemType := range []string{"configuration_update", "vendor_future_item"} {
+		t.Run(itemType, func(t *testing.T) {
+			body := []byte(`{"id":"r","model":"m","status":"completed","output":[{"id":"item_1","type":"` + itemType + `"}],"usage":{}}`)
+			_, _, err := RenderNativeResponse(ProtocolResponses, body)
+			if !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), ".type") {
+				t.Fatalf("error = %v, want output-union rejection", err)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesRequiresNonNullOutputArray(t *testing.T) {
+	for _, output := range []string{"", `,"output":null`, `,"output":{}`} {
+		body := []byte(`{"id":"r","model":"m","status":"completed"` + output + `,"usage":{}}`)
+		if _, _, err := RenderNativeResponse(ProtocolResponses, body); !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), "$.output") {
+			t.Fatalf("body=%s error=%v, want upstream output-array rejection", body, err)
+		}
+	}
+	frames := []streamFrame{{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"r","model":"m","status":"completed","output":null,"usage":{}}}`)}}
+	if _, _, err := CollectNativeResponse(ProtocolResponses, frames, core.RejectSemanticLoss); !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), "$.output") {
+		t.Fatalf("collector error=%v, want upstream output-array rejection", err)
+	}
+}
+
+func TestNativeResponsesBufferedMessageAndReasoningLifecycle(t *testing.T) {
+	source := []byte(`{
+		"id":"resp_content","object":"response","model":"gpt-5.6","status":"completed",
+		"output":[
+			{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"summary","vendor_summary":"keep"}],"content":[{"type":"reasoning_text","text":"details"}],"provider_state":{"keep":true}},
+			{"id":"msg_1","type":"message","role":"assistant","status":"completed","provider_state":{"keep":true},"content":[
+				{"type":"output_text","text":"answer","annotations":[{"type":"url_citation","url":"https://example.com","title":"source","start_index":0,"end_index":6}],"logprobs":[],"vendor_part":"keep"},
+				{"type":"refusal","refusal":"declined"}
+			]}
+		],
+		"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}
+	}`)
+	frames, _, err := RenderNativeResponse(ProtocolResponses, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"response.created",
+		"response.output_item.added", "response.reasoning_summary_part.added", "response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "response.reasoning_summary_part.done",
+		"response.content_part.added", "response.reasoning_text.delta", "response.reasoning_text.done", "response.content_part.done", "response.output_item.done",
+		"response.output_item.added", "response.content_part.added", "response.output_text.delta", "response.output_text.annotation.added", "response.output_text.done", "response.content_part.done",
+		"response.content_part.added", "response.refusal.delta", "response.refusal.done", "response.content_part.done", "response.output_item.done",
+		"response.completed",
+	}
+	if len(frames) != len(want) {
+		t.Fatalf("frame count=%d want=%d: %#v", len(frames), len(want), frames)
+	}
+	for index, eventType := range want {
+		if frames[index].Event != eventType || !strings.Contains(string(frames[index].Data), `"sequence_number":`+fmt.Sprint(index)) {
+			t.Fatalf("frame %d=%s %s, want %s with sequence_number", index, frames[index].Event, frames[index].Data, eventType)
+		}
+	}
+	if !strings.Contains(string(frames[14].Data), `"annotation_index":0`) || !strings.Contains(string(frames[14].Data), `"url":"https://example.com"`) {
+		t.Fatalf("annotation event=%s", frames[14].Data)
+	}
+	for index, want := range map[int]string{
+		0: `"completed_at":null`, 2: `"text":""`, 5: `"vendor_summary":"keep"`,
+		6: `"text":""`, 10: `"provider_state":{"keep":true}`, 12: `"text":""`,
+		16: `"vendor_part":"keep"`, 17: `"refusal":""`, 21: `"provider_state":{"keep":true}`,
+	} {
+		if !strings.Contains(string(frames[index].Data), want) {
+			t.Fatalf("frame %d missing %s: %s", index, want, frames[index].Data)
+		}
+	}
+	body, _, err := CollectNativeResponse(ProtocolResponses, frames, core.RejectSemanticLoss)
+	var got, expected any
+	if err == nil {
+		err = json.Unmarshal(body, &got)
+	}
+	if err == nil {
+		err = json.Unmarshal(source, &expected)
+	}
+	if err != nil || !reflect.DeepEqual(got, expected) {
+		t.Fatalf("round-trip body=%s error=%v", body, err)
 	}
 }
 
@@ -283,9 +370,9 @@ func TestNativeResponsesBufferedToolItemEvents(t *testing.T) {
 	source := []byte(`{
 		"id":"resp_tools","object":"response","model":"gpt-5.6","status":"completed",
 		"output":[
-			{"id":"ctc_1","type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"echo hello","status":"completed"},
+			{"id":"ctc_1","type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"echo hello"},
 			{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"RouteMorph"}},
-			{"id":"tsc_1","type":"tool_search_call","call_id":"call_search","arguments":{"query":"weather"},"execution":"server","status":"completed"},
+			{"id":"tsc_1","type":"tool_search_call","call_id":"call_search","arguments":{},"execution":"server","status":"completed"},
 			{"id":"tso_1","type":"tool_search_output","call_id":"call_search","execution":"server","status":"completed","tools":[]},
 			{"id":"tools_1","type":"additional_tools","role":"developer","tools":[]}
 		],
@@ -342,13 +429,13 @@ func TestNativeResponsesBufferedToolItemEvents(t *testing.T) {
 			t.Fatalf("custom tool call was rendered as a function call: %s", frame.Data)
 		}
 	}
-	if events[1].Item.Type != "custom_tool_call" || events[1].Item.Status != "in_progress" || rawString(events[1].Item.Input) != "" {
+	if events[1].Item.Type != "custom_tool_call" || events[1].Item.Status != "" || rawString(events[1].Item.Input) != "" {
 		t.Fatalf("custom output_item.added = %#v", events[1].Item)
 	}
 	if events[2].ItemID != "ctc_1" || events[2].Delta != "echo hello" || events[3].Input != "echo hello" {
 		t.Fatalf("custom input events = %#v / %#v", events[2], events[3])
 	}
-	if events[4].Item.Type != "custom_tool_call" || events[4].Item.Status != "completed" || rawString(events[4].Item.Input) != "echo hello" {
+	if events[4].Item.Type != "custom_tool_call" || events[4].Item.Status != "" || rawString(events[4].Item.Input) != "echo hello" {
 		t.Fatalf("custom output_item.done = %#v", events[4].Item)
 	}
 	for _, index := range []int{5, 10, 12} {
@@ -369,21 +456,194 @@ func TestNativeResponsesBufferedToolItemEvents(t *testing.T) {
 	}
 }
 
+func TestNativeResponsesBufferedOptionalItemStatusesRoundTrip(t *testing.T) {
+	source := []byte(`{
+		"id":"resp_optional_status","object":"response","model":"gpt-5.6","status":"completed",
+		"output":[
+			{"id":"rs_1","type":"reasoning","summary":[]},
+			{"id":"fc_1","type":"function_call","call_id":"call_function","name":"lookup","arguments":"{}"},
+			{"id":"ctc_1","type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"pwd"}
+		],
+		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},
+		"vendor_large_integer":9007199254740993
+	}`)
+	frames, _, err := RenderNativeResponse(ProtocolResponses, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, frame := range frames {
+		if frame.Event != "response.output_item.added" {
+			continue
+		}
+		var event struct {
+			Item map[string]json.RawMessage `json:"item"`
+		}
+		if err := json.Unmarshal(frame.Data, &event); err != nil {
+			t.Fatalf("frame %d: %v", index, err)
+		}
+		if _, exists := event.Item["status"]; exists {
+			t.Fatalf("frame %d invented an optional item status: %s", index, frame.Data)
+		}
+	}
+	body, _, err := CollectNativeResponse(ProtocolResponses, frames, core.RejectSemanticLoss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(source, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-trip body=%s", body)
+	}
+	if !bytes.Contains(frames[len(frames)-1].Data, []byte(`"vendor_large_integer":9007199254740993`)) ||
+		!bytes.Contains(body, []byte(`"vendor_large_integer":9007199254740993`)) {
+		t.Fatalf("large integer was not preserved exactly: terminal=%s body=%s", frames[len(frames)-1].Data, body)
+	}
+}
+
+func TestNativeResponsesBufferedGeneratesStableCallItemIDs(t *testing.T) {
+	source := []byte(`{
+		"id":"resp_generated_ids","object":"response","model":"gpt-5.6","status":"completed",
+		"output":[
+			{"type":"function_call","call_id":"call_function","name":"lookup","arguments":"{}"},
+			{"type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"pwd"}
+		],
+		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+	}`)
+	frames, diagnostics, err := RenderNativeResponse(ProtocolResponses, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 2 {
+		t.Fatalf("diagnostics = %#v, want two generated-id warnings", diagnostics)
+	}
+	for index, diagnostic := range diagnostics {
+		if diagnostic.Code != "responses_output_item_id_generated" || diagnostic.Path != fmt.Sprintf("$.output[%d].id", index) {
+			t.Fatalf("diagnostic %d = %#v", index, diagnostic)
+		}
+	}
+	body, _, err := CollectNativeResponse(ProtocolResponses, frames, core.RejectSemanticLoss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response responsesResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Output) != 2 || response.Output[0].ID != "fc_generated_0" || response.Output[1].ID != "ctc_generated_1" {
+		t.Fatalf("generated ids = %#v", response.Output)
+	}
+	for _, frame := range frames {
+		if strings.Contains(frame.Event, "function_call_arguments") || strings.Contains(frame.Event, "custom_tool_call_input") {
+			var event struct {
+				ItemID string `json:"item_id"`
+			}
+			if err := json.Unmarshal(frame.Data, &event); err != nil || event.ItemID == "" {
+				t.Fatalf("delta event lacks generated item id: %s", frame.Data)
+			}
+		}
+	}
+}
+
+func TestNativeResponsesBufferedGenericItemsKeepSchemaSpecificStatuses(t *testing.T) {
+	source := []byte(`{
+		"id":"resp_generic","object":"response","model":"gpt-5.6","status":"completed",
+		"output":[
+			{"id":"program_output_1","type":"program_output","call_id":"call_program","result":"ok","status":"completed"},
+			{"id":"patch_output_1","type":"apply_patch_call_output","call_id":"call_patch","status":"failed","output":"conflict"}
+		],
+		"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+	}`)
+	frames, _, err := RenderNativeResponse(ProtocolResponses, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frame := range frames {
+		if frame.Event != "response.output_item.added" {
+			continue
+		}
+		if bytes.Contains(frame.Data, []byte(`"status":"in_progress"`)) {
+			t.Fatalf("generic item status was rewritten to an invalid enum: %s", frame.Data)
+		}
+	}
+	body, _, err := CollectNativeResponse(ProtocolResponses, frames, core.RejectSemanticLoss)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got, want any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(source, &want); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round-trip body=%s", body)
+	}
+}
+
+func TestNativeResponsesBufferedRejectsDuplicateOutputItemIDs(t *testing.T) {
+	body := []byte(`{"id":"r","model":"m","status":"completed","output":[{"id":"dup","type":"message","role":"assistant","status":"completed","content":[]},{"id":"dup","type":"message","role":"assistant","status":"completed","content":[]}],"usage":{}}`)
+	if _, _, err := RenderNativeResponse(ProtocolResponses, body); !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), "$.output[1].id") {
+		t.Fatalf("error=%v, want ErrUpstreamResponse at duplicate item id", err)
+	}
+}
+
+func TestNativeResponsesBufferedAcceptsOfficialIncompleteReasons(t *testing.T) {
+	for _, reason := range []string{"max_output_tokens", "max_messages", "content_filter", "steered"} {
+		t.Run(reason, func(t *testing.T) {
+			body := []byte(`{"id":"r","model":"m","status":"incomplete","incomplete_details":{"reason":"` + reason + `"},"output":[],"usage":{}}`)
+			if _, _, err := RenderNativeResponse(ProtocolResponses, body); err != nil {
+				t.Fatalf("official incomplete reason rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestNativeResponsesBufferedToolItemsRejectMissingEventFields(t *testing.T) {
 	tests := []struct {
 		name string
 		item string
 		path string
 	}{
-		{name: "custom missing id", item: `{"type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","status":"completed"}`, path: ".id"},
-		{name: "custom missing call id", item: `{"id":"ctc","type":"custom_tool_call","name":"shell","input":"echo","status":"completed"}`, path: "custom_tool_call requires call_id and name"},
-		{name: "custom missing name", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","input":"echo","status":"completed"}`, path: "custom_tool_call requires call_id and name"},
-		{name: "custom missing status", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo"}`, path: ".status"},
-		{name: "custom object input", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":{"command":"echo"},"status":"completed"}`, path: ".input"},
-		{name: "custom null input", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":null,"status":"completed"}`, path: ".input"},
+		{name: "message missing status", item: `{"id":"msg","type":"message","role":"assistant","content":[]}`, path: ".status"},
+		{name: "message invalid part", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"input_text","text":"x"}]}`, path: ".content[0].type"},
+		{name: "message output text missing annotations", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"x"}]}`, path: ".annotations"},
+		{name: "message output text null text", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":null,"annotations":[]}]}`, path: ".text"},
+		{name: "message output text scalar annotation", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"x","annotations":["bad"]}]}`, path: ".annotations[0]"},
+		{name: "message output text scalar logprob", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"x","annotations":[],"logprobs":[1]}]}`, path: ".logprobs[0]"},
+		{name: "message refusal null", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","content":[{"type":"refusal","refusal":null}]}`, path: ".refusal"},
+		{name: "reasoning invalid summary", item: `{"id":"rs","type":"reasoning","status":"completed","summary":[{"type":"output_text","text":"x"}]}`, path: ".summary[0].type"},
+		{name: "reasoning null summary text", item: `{"id":"rs","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":null}]}`, path: ".text"},
+		{name: "reasoning object encrypted content", item: `{"id":"rs","type":"reasoning","summary":[],"encrypted_content":{"opaque":true}}`, path: ".encrypted_content"},
+		{name: "custom status is not in output schema", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","status":"completed"}`, path: ".status"},
+		{name: "custom missing call id", item: `{"id":"ctc","type":"custom_tool_call","name":"shell","input":"echo"}`, path: ".call_id"},
+		{name: "custom missing name", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","input":"echo"}`, path: ".name"},
+		{name: "custom object input", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":{"command":"echo"}}`, path: ".input"},
+		{name: "custom null input", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":null}`, path: ".input"},
+		{name: "function invalid async", item: `{"id":"fc","type":"function_call","call_id":"call","name":"lookup","arguments":"{}","async":"yes"}`, path: ".async"},
+		{name: "function invalid namespace", item: `{"id":"fc","type":"function_call","call_id":"call","name":"lookup","arguments":"{}","namespace":1}`, path: ".namespace"},
+		{name: "function invalid caller", item: `{"id":"fc","type":"function_call","call_id":"call","name":"lookup","arguments":"{}","caller":{"type":"program"}}`, path: ".caller.caller_id"},
+		{name: "custom invalid async", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","async":"yes"}`, path: ".async"},
+		{name: "custom invalid caller", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","caller":1}`, path: ".caller"},
+		{name: "function output missing output", item: `{"id":"fco","type":"function_call_output","status":"completed"}`, path: ".output"},
+		{name: "function output object output", item: `{"id":"fco","type":"function_call_output","status":"completed","output":{}}`, path: ".output"},
+		{name: "function output invalid created by", item: `{"id":"fco","type":"function_call_output","status":"completed","output":"ok","created_by":1}`, path: ".created_by"},
+		{name: "custom output missing call id", item: `{"id":"ctco","type":"custom_tool_call_output","status":"completed","output":"ok"}`, path: ".call_id"},
+		{name: "custom output missing status", item: `{"id":"ctco","type":"custom_tool_call_output","call_id":"call","output":"ok"}`, path: ".status"},
+		{name: "custom output missing output", item: `{"id":"ctco","type":"custom_tool_call_output","call_id":"call","status":"completed"}`, path: ".output"},
+		{name: "custom output invalid caller", item: `{"id":"ctco","type":"custom_tool_call_output","call_id":"call","status":"completed","output":"ok","caller":{"type":"future"}}`, path: ".caller.type"},
 		{name: "web missing id", item: `{"type":"web_search_call","action":{"type":"search","query":"x"},"status":"completed"}`, path: ".id"},
 		{name: "web missing action", item: `{"id":"ws","type":"web_search_call","status":"completed"}`, path: ".action"},
 		{name: "web unknown action", item: `{"id":"ws","type":"web_search_call","action":{"type":"crawl"},"status":"completed"}`, path: ".action.type"},
+		{name: "web numeric query", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","query":123},"status":"completed"}`, path: ".action.query"},
+		{name: "web null queries", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","queries":null},"status":"completed"}`, path: ".action.queries"},
+		{name: "web null sources", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","sources":null},"status":"completed"}`, path: ".action.sources"},
+		{name: "web unknown action field", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","vendor":true},"status":"completed"}`, path: ".action.vendor"},
 		{name: "web find missing url", item: `{"id":"ws","type":"web_search_call","action":{"type":"find_in_page","pattern":"needle"},"status":"completed"}`, path: ".action"},
 		{name: "web find missing pattern", item: `{"id":"ws","type":"web_search_call","action":{"type":"find_in_page","url":"https://example.com"},"status":"completed"}`, path: ".action"},
 		{name: "web incomplete status", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","query":"x"},"status":"incomplete"}`, path: ".status"},
@@ -393,9 +653,39 @@ func TestNativeResponsesBufferedToolItemsRejectMissingEventFields(t *testing.T) 
 		{name: "tool search invalid execution", item: `{"id":"ts","type":"tool_search_call","call_id":"call","arguments":{},"execution":"remote","status":"completed"}`, path: ".execution"},
 		{name: "tool search output missing tools", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed"}`, path: ".tools"},
 		{name: "tool search output malformed tool", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed","tools":[null]}`, path: ".tools[0]"},
+		{name: "tool search output incomplete function", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed","tools":[{"type":"function","name":"lookup"}]}`, path: ".tools[0].parameters"},
+		{name: "tool search output unknown tool", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed","tools":[{"type":"vendor_future"}]}`, path: ".tools[0].type"},
 		{name: "additional tools missing role", item: `{"id":"tools","type":"additional_tools","tools":[]}`, path: ".role"},
 		{name: "additional tools null tools", item: `{"id":"tools","type":"additional_tools","role":"developer","tools":null}`, path: ".tools"},
 		{name: "additional tools missing tool type", item: `{"id":"tools","type":"additional_tools","role":"developer","tools":[{"name":"lookup"}]}`, path: ".tools[0]"},
+		{name: "message invalid phase", item: `{"id":"msg","type":"message","role":"assistant","status":"completed","phase":"draft","content":[]}`, path: ".phase"},
+		{name: "file search non-string query", item: `{"id":"fs","type":"file_search_call","status":"completed","queries":[1]}`, path: ".queries[0]"},
+		{name: "file search invalid result score", item: `{"id":"fs","type":"file_search_call","status":"completed","queries":[],"results":[{"score":"high"}]}`, path: ".results[0].score"},
+		{name: "file search invalid result attributes", item: `{"id":"fs","type":"file_search_call","status":"completed","queries":[],"results":[{"attributes":{"nested":{}}}]}`, path: ".attributes.nested"},
+		{name: "computer call missing call id", item: `{"id":"cc","type":"computer_call","pending_safety_checks":[],"status":"completed","action":{"type":"screenshot"}}`, path: ".call_id"},
+		{name: "computer call null safety checks", item: `{"id":"cc","type":"computer_call","call_id":"call","pending_safety_checks":null,"status":"completed","action":{"type":"screenshot"}}`, path: ".pending_safety_checks"},
+		{name: "computer call invalid action coordinate", item: `{"id":"cc","type":"computer_call","call_id":"call","pending_safety_checks":[],"status":"completed","action":{"type":"click","button":"left","x":"1","y":2}}`, path: ".action.x"},
+		{name: "computer output invalid screenshot", item: `{"id":"cco","type":"computer_call_output","call_id":"call","status":"completed","output":{"type":"image","image_url":"https://example.com/image.png"}}`, path: ".output.type"},
+		{name: "computer output invalid created by", item: `{"id":"cco","type":"computer_call_output","call_id":"call","status":"completed","output":{"type":"computer_screenshot","file_id":"file"},"created_by":1}`, path: ".created_by"},
+		{name: "program missing fingerprint", item: `{"id":"p","type":"program","call_id":"call","code":"return 1"}`, path: ".fingerprint"},
+		{name: "program output invalid result", item: `{"id":"po","type":"program_output","call_id":"call","result":{},"status":"completed"}`, path: ".result"},
+		{name: "compaction invalid encrypted content", item: `{"id":"cmp","type":"compaction","encrypted_content":1}`, path: ".encrypted_content"},
+		{name: "image generation invalid result", item: `{"id":"ig","type":"image_generation_call","result":{},"status":"completed"}`, path: ".result"},
+		{name: "code interpreter invalid output", item: `{"id":"ci","type":"code_interpreter_call","code":"print(1)","container_id":"container","outputs":[{"type":"logs","logs":1}],"status":"completed"}`, path: ".outputs[0].logs"},
+		{name: "local shell invalid env", item: `{"id":"lsc","type":"local_shell_call","call_id":"call","action":{"type":"exec","command":["pwd"],"env":[]},"status":"completed"}`, path: ".action.env"},
+		{name: "local shell invalid timeout", item: `{"id":"lsc","type":"local_shell_call","call_id":"call","action":{"type":"exec","command":["pwd"],"env":{},"timeout_ms":"soon"},"status":"completed"}`, path: ".action.timeout_ms"},
+		{name: "local shell invalid output", item: `{"id":"lsco","type":"local_shell_call_output","output":{},"status":"completed"}`, path: ".output"},
+		{name: "shell call invalid commands", item: `{"id":"sc","type":"shell_call","call_id":"call","action":{"commands":[1],"max_output_length":1024,"timeout_ms":1000},"environment":{"type":"local"},"status":"completed"}`, path: ".action.commands[0]"},
+		{name: "shell call missing container", item: `{"id":"sc","type":"shell_call","call_id":"call","action":{"commands":["pwd"],"max_output_length":1024,"timeout_ms":1000},"environment":{"type":"container_reference"},"status":"completed"}`, path: ".environment.container_id"},
+		{name: "shell output missing exit code", item: `{"id":"sco","type":"shell_call_output","call_id":"call","max_output_length":1024,"output":[{"stdout":"ok","stderr":"","outcome":{"type":"exit"}}],"status":"completed"}`, path: ".outcome.exit_code"},
+		{name: "apply patch call missing diff", item: `{"id":"ap","type":"apply_patch_call","call_id":"call","operation":{"type":"update_file","path":"a.txt"},"status":"completed"}`, path: ".operation.diff"},
+		{name: "apply patch output invalid output", item: `{"id":"apo","type":"apply_patch_call_output","call_id":"call","status":"completed","output":{}}`, path: ".output"},
+		{name: "mcp call invalid output", item: `{"id":"mcp","type":"mcp_call","arguments":"{}","name":"lookup","server_label":"server","status":"completed","output":{}}`, path: ".output"},
+		{name: "mcp call invalid error code", item: `{"id":"mcp","type":"mcp_call","arguments":"{}","name":"lookup","server_label":"server","status":"failed","error":{"type":"http_error","code":"500","message":"failed"}}`, path: ".error.code"},
+		{name: "mcp list tools missing schema", item: `{"id":"list","type":"mcp_list_tools","server_label":"server","tools":[{"name":"lookup"}]}`, path: ".tools[0].input_schema"},
+		{name: "mcp list tools invalid description", item: `{"id":"list","type":"mcp_list_tools","server_label":"server","tools":[{"name":"lookup","input_schema":{},"description":1}]}`, path: ".tools[0].description"},
+		{name: "mcp approval request invalid arguments", item: `{"id":"approval","type":"mcp_approval_request","arguments":{},"name":"lookup","server_label":"server"}`, path: ".arguments"},
+		{name: "mcp approval response invalid approve", item: `{"id":"approval","type":"mcp_approval_response","approval_request_id":"request","approve":"yes"}`, path: ".approve"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -435,8 +725,6 @@ func TestNativeResponsesWebSearchLifecycleMatchesTerminalStatus(t *testing.T) {
 		status string
 		want   []string
 	}{
-		{status: "in_progress", want: []string{"response.output_item.added", "response.web_search_call.in_progress", "response.output_item.done"}},
-		{status: "searching", want: []string{"response.output_item.added", "response.web_search_call.in_progress", "response.web_search_call.searching", "response.output_item.done"}},
 		{status: "completed", want: []string{"response.output_item.added", "response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed", "response.output_item.done"}},
 		{status: "failed", want: []string{"response.output_item.added", "response.web_search_call.in_progress", "response.output_item.done"}},
 	} {
@@ -468,6 +756,120 @@ func TestNativeResponsesWebSearchLifecycleMatchesTerminalStatus(t *testing.T) {
 				if strings.HasPrefix(frame.Event, "response.web_search_call.") && event.ItemID != "ws" {
 					t.Fatalf("event %s item_id=%q, want ws", frame.Event, event.ItemID)
 				}
+			}
+		})
+	}
+}
+
+func TestNativeResponsesBufferedRejectsNonTerminalItemStatuses(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{name: "message", item: `{"id":"msg","type":"message","role":"assistant","status":"in_progress","content":[]}`},
+		{name: "reasoning", item: `{"id":"rs","type":"reasoning","status":"in_progress","summary":[]}`},
+		{name: "function call", item: `{"id":"fc","type":"function_call","call_id":"call","name":"lookup","arguments":"{}","status":"in_progress"}`},
+		{name: "function output", item: `{"id":"fco","type":"function_call_output","call_id":"call","status":"in_progress","output":"ok"}`},
+		{name: "custom output", item: `{"id":"ctco","type":"custom_tool_call_output","call_id":"call","status":"in_progress","output":"ok"}`},
+		{name: "web search searching", item: `{"id":"ws","type":"web_search_call","status":"searching","action":{"type":"search","query":"x"}}`},
+		{name: "file search searching", item: `{"id":"fs","type":"file_search_call","status":"searching","queries":[]}`},
+		{name: "computer call", item: `{"id":"cc","type":"computer_call","call_id":"call","pending_safety_checks":[],"status":"in_progress","action":{"type":"screenshot"}}`},
+		{name: "computer output", item: `{"id":"cco","type":"computer_call_output","call_id":"call","status":"in_progress","output":{"type":"computer_screenshot","image_url":"https://example.com/image.png"}}`},
+		{name: "program output", item: `{"id":"po","type":"program_output","call_id":"call","result":"ok","status":"in_progress"}`},
+		{name: "tool search call", item: `{"id":"ts","type":"tool_search_call","call_id":"call","arguments":{},"execution":"server","status":"in_progress"}`},
+		{name: "tool search output", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"in_progress","tools":[]}`},
+		{name: "image generation generating", item: `{"id":"ig","type":"image_generation_call","result":"aGVsbG8=","status":"generating"}`},
+		{name: "code interpreter interpreting", item: `{"id":"ci","type":"code_interpreter_call","code":"print(1)","container_id":"container","outputs":[],"status":"interpreting"}`},
+		{name: "local shell call", item: `{"id":"lsc","type":"local_shell_call","call_id":"call","action":{"type":"exec","command":["pwd"],"env":{}},"status":"in_progress"}`},
+		{name: "local shell output", item: `{"id":"lsco","type":"local_shell_call_output","output":"ok","status":"in_progress"}`},
+		{name: "shell call", item: `{"id":"sc","type":"shell_call","call_id":"call","action":{"commands":["pwd"],"max_output_length":1024,"timeout_ms":1000},"environment":{"type":"local"},"status":"in_progress"}`},
+		{name: "shell output", item: `{"id":"sco","type":"shell_call_output","call_id":"call","max_output_length":1024,"output":[{"stdout":"ok","stderr":"","outcome":{"type":"exit","exit_code":0}}],"status":"in_progress"}`},
+		{name: "apply patch call", item: `{"id":"ap","type":"apply_patch_call","call_id":"call","operation":{"type":"delete_file","path":"old.txt"},"status":"in_progress"}`},
+		{name: "mcp calling", item: `{"id":"mcp","type":"mcp_call","arguments":"{}","name":"lookup","server_label":"server","status":"calling"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"id":"r","model":"m","status":"completed","output":[` + test.item + `],"usage":{}}`)
+			if _, _, err := RenderNativeResponse(ProtocolResponses, body); !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), ".status") {
+				t.Fatalf("error=%v, want ErrUpstreamResponse at item status", err)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesBufferedAcceptsTerminalIncompleteAndFailedItemStatuses(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{name: "message incomplete", item: `{"id":"msg","type":"message","role":"assistant","status":"incomplete","content":[]}`},
+		{name: "reasoning incomplete", item: `{"id":"rs","type":"reasoning","status":"incomplete","summary":[]}`},
+		{name: "function call incomplete", item: `{"id":"fc","type":"function_call","call_id":"call","name":"lookup","arguments":"{}","status":"incomplete"}`},
+		{name: "function output incomplete", item: `{"id":"fco","type":"function_call_output","call_id":"call","status":"incomplete","output":"partial"}`},
+		{name: "custom output incomplete", item: `{"id":"ctco","type":"custom_tool_call_output","call_id":"call","status":"incomplete","output":"partial"}`},
+		{name: "web search failed", item: `{"id":"ws","type":"web_search_call","status":"failed","action":{"type":"search","query":"x"}}`},
+		{name: "file search incomplete", item: `{"id":"fs","type":"file_search_call","status":"incomplete","queries":[]}`},
+		{name: "file search failed", item: `{"id":"fs","type":"file_search_call","status":"failed","queries":[]}`},
+		{name: "computer call incomplete", item: `{"id":"cc","type":"computer_call","call_id":"call","pending_safety_checks":[],"status":"incomplete","action":{"type":"screenshot"}}`},
+		{name: "computer output failed", item: `{"id":"cco","type":"computer_call_output","call_id":"call","status":"failed","output":{"type":"computer_screenshot","file_id":"file"}}`},
+		{name: "program output incomplete", item: `{"id":"po","type":"program_output","call_id":"call","result":"partial","status":"incomplete"}`},
+		{name: "tool search call incomplete", item: `{"id":"ts","type":"tool_search_call","call_id":"call","arguments":{},"execution":"server","status":"incomplete"}`},
+		{name: "tool search output incomplete", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"incomplete","tools":[]}`},
+		{name: "image generation failed", item: `{"id":"ig","type":"image_generation_call","result":"","status":"failed"}`},
+		{name: "code interpreter failed", item: `{"id":"ci","type":"code_interpreter_call","code":null,"container_id":"container","outputs":null,"status":"failed"}`},
+		{name: "local shell call incomplete", item: `{"id":"lsc","type":"local_shell_call","call_id":"call","action":{"type":"exec","command":["pwd"],"env":{}},"status":"incomplete"}`},
+		{name: "local shell output incomplete", item: `{"id":"lsco","type":"local_shell_call_output","output":"partial","status":"incomplete"}`},
+		{name: "shell call incomplete", item: `{"id":"sc","type":"shell_call","call_id":"call","action":{"commands":["pwd"],"max_output_length":1024,"timeout_ms":1000},"environment":{"type":"local"},"status":"incomplete"}`},
+		{name: "shell output incomplete", item: `{"id":"sco","type":"shell_call_output","call_id":"call","max_output_length":1024,"output":[{"stdout":"partial","stderr":"","outcome":{"type":"timeout"}}],"status":"incomplete"}`},
+		{name: "apply patch output failed", item: `{"id":"apo","type":"apply_patch_call_output","call_id":"call","status":"failed","output":"conflict"}`},
+		{name: "mcp call failed", item: `{"id":"mcp","type":"mcp_call","arguments":"{}","name":"lookup","server_label":"server","status":"failed","error":{"type":"http_error","code":500,"message":"failed"}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"id":"r","model":"m","status":"completed","output":[` + test.item + `],"usage":{},"provider_extension":{"keep":true}}`)
+			frames, _, err := RenderNativeResponse(ProtocolResponses, body)
+			if err != nil {
+				t.Fatalf("terminal item rejected: %v", err)
+			}
+			if !bytes.Contains(frames[len(frames)-1].Data, []byte(`"provider_extension":{"keep":true}`)) {
+				t.Fatalf("top-level provider extension was not preserved: %s", frames[len(frames)-1].Data)
+			}
+		})
+	}
+}
+
+func TestNativeResponsesBufferedAcceptsCompleteKnownUnionShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		item string
+	}{
+		{name: "file search results", item: `{"id":"fs","type":"file_search_call","status":"completed","queries":["docs"],"results":[{"file_id":"file","filename":"docs.md","score":0.9,"text":"found","attributes":{"page":1,"fresh":true}}]}`},
+		{name: "computer actions", item: `{"id":"cc","type":"computer_call","call_id":"call","pending_safety_checks":[{"id":"safe","code":null,"message":"ok"}],"actions":[{"type":"keypress","keys":["CTRL","L"]}],"status":"completed"}`},
+		{name: "program", item: `{"id":"p","type":"program","call_id":"call","code":"return 1","fingerprint":"opaque"}`},
+		{name: "compaction", item: `{"id":"cmp","type":"compaction","encrypted_content":"opaque","created_by":"system"}`},
+		{name: "code interpreter outputs", item: `{"id":"ci","type":"code_interpreter_call","code":"print(1)","container_id":"container","outputs":[{"type":"logs","logs":"1"},{"type":"image","url":"https://example.com/image.png"}],"status":"completed"}`},
+		{name: "local shell nullable status", item: `{"id":"lsco","type":"local_shell_call_output","output":"ok","status":null}`},
+		{name: "shell call", item: `{"id":"sc","type":"shell_call","call_id":"call","action":{"commands":["pwd"],"max_output_length":1024,"timeout_ms":1000},"environment":{"type":"container_reference","container_id":"container"},"caller":{"type":"program","caller_id":"program"},"created_by":"assistant","status":"completed"}`},
+		{name: "apply patch call", item: `{"id":"ap","type":"apply_patch_call","call_id":"call","operation":{"type":"create_file","path":"new.txt","diff":"+hello"},"caller":{"type":"direct"},"created_by":"assistant","status":"completed"}`},
+		{name: "mcp list tools", item: `{"id":"list","type":"mcp_list_tools","server_label":"server","tools":[{"name":"lookup","input_schema":{},"annotations":{"readOnlyHint":true},"description":null}],"error":null}`},
+		{name: "mcp approval request", item: `{"id":"request","type":"mcp_approval_request","arguments":"{}","name":"lookup","server_label":"server"}`},
+		{name: "mcp approval response", item: `{"id":"response","type":"mcp_approval_response","approval_request_id":"request","approve":false,"reason":null}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := []byte(`{"id":"r","model":"m","status":"completed","output":[` + strings.TrimSuffix(test.item, "}") + `,"vendor_item":{"keep":true}}],"usage":{}}`)
+			frames, _, err := RenderNativeResponse(ProtocolResponses, body)
+			if err != nil {
+				t.Fatalf("known union item rejected: %v", err)
+			}
+			var preserved bool
+			for _, frame := range frames {
+				if frame.Event == "response.output_item.done" && bytes.Contains(frame.Data, []byte(`"vendor_item":{"keep":true}`)) {
+					preserved = true
+				}
+			}
+			if !preserved {
+				t.Fatalf("item provider extension was not preserved: %#v", frames)
 			}
 		})
 	}
