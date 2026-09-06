@@ -13,6 +13,8 @@ import (
 
 func TestResponsesNativeStreamAcceptsCompleteItemAndContentLifecycles(t *testing.T) {
 	v := newResponsesLifecycleValidator()
+	customAdded := responsesLifecycleItem("custom_1", "custom_tool_call")
+	customAdded["status"] = "in_progress"
 	events := []core.Frame{
 		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
 
@@ -29,10 +31,12 @@ func TestResponsesNativeStreamAcceptsCompleteItemAndContentLifecycles(t *testing
 
 		responsesLifecycleFrame(t, "response.output_item.added", 11, map[string]any{"output_index": 1, "item": responsesLifecycleItem("function_1", "function_call")}),
 		responsesLifecycleFrame(t, "response.function_call_arguments.delta", 12, map[string]any{"output_index": 1, "item_id": "function_1", "delta": "{}"}),
-		responsesLifecycleFrame(t, "response.function_call_arguments.done", 13, map[string]any{"output_index": 1, "item_id": "function_1", "name": "lookup", "arguments": "{}"}),
+		// Some Responses-compatible providers omit name here and carry it only
+		// on the surrounding output_item events.
+		responsesLifecycleFrame(t, "response.function_call_arguments.done", 13, map[string]any{"output_index": 1, "item_id": "function_1", "arguments": "{}"}),
 		responsesLifecycleFrame(t, "response.output_item.done", 14, map[string]any{"output_index": 1, "item": responsesLifecycleItem("function_1", "function_call")}),
 
-		responsesLifecycleFrame(t, "response.output_item.added", 15, map[string]any{"output_index": 2, "item": responsesLifecycleItem("custom_1", "custom_tool_call")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 15, map[string]any{"output_index": 2, "item": customAdded}),
 		responsesLifecycleFrame(t, "response.custom_tool_call_input.delta", 16, map[string]any{"output_index": 2, "item_id": "custom_1", "delta": "echo hi"}),
 		responsesLifecycleFrame(t, "response.custom_tool_call_input.done", 17, map[string]any{"output_index": 2, "item_id": "custom_1", "input": "echo hi"}),
 		responsesLifecycleFrame(t, "response.output_item.done", 18, map[string]any{"output_index": 2, "item": responsesLifecycleItem("custom_1", "custom_tool_call")}),
@@ -287,26 +291,26 @@ func TestResponsesNativeStreamRejectsDoneMarkerAfterTerminal(t *testing.T) {
 	}
 }
 
-func TestResponsesNativeStreamRejectsMalformedCompletedToolSearchOutput(t *testing.T) {
+func TestResponsesNativeStreamAcceptsProviderServerToolSearchWithoutCorrelationFields(t *testing.T) {
 	v := newResponsesLifecycleValidator()
-	malformed := map[string]any{
-		"id": "tools_1", "type": "tool_search_output", "execution": "server",
+	call := map[string]any{
+		"id": "search_1", "type": "tool_search_call", "arguments": map[string]any{"query": "weather"},
+		"call_id": nil, "execution": nil, "status": "completed",
+	}
+	output := map[string]any{
+		"id": "tools_1", "type": "tool_search_output", "call_id": nil, "execution": nil,
 		"status": "completed", "tools": []any{},
 	}
 	for _, event := range []core.Frame{
 		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
-		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": malformed}),
-		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": malformed}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": call}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": call}),
+		responsesLifecycleFrame(t, "response.output_item.added", 3, map[string]any{"output_index": 1, "item": output}),
+		responsesLifecycleFrame(t, "response.output_item.done", 4, map[string]any{"output_index": 1, "item": output}),
+		responsesLifecycleFrame(t, "response.completed", 5, map[string]any{"response": responsesLifecycleResponseWithItems("completed", call, output)}),
 	} {
-		err := v.validate(context.Background(), event)
-		if event.Event != "response.output_item.done" {
-			if err != nil {
-				t.Fatalf("%s: %v", event.Event, err)
-			}
-			continue
-		}
-		if !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), ".call_id") {
-			t.Fatalf("done error = %v, want missing tool-search call_id", err)
+		if err := v.validate(context.Background(), event); err != nil {
+			t.Fatalf("%s: %v", event.Event, err)
 		}
 	}
 }
@@ -391,7 +395,7 @@ func TestResponsesNativeStreamRejectsMalformedKnownFieldsOnItemAdded(t *testing.
 		{name: "function created by", item: map[string]any{"id": "fc_1", "type": "function_call", "created_by": "model"}, field: ".created_by"},
 		{name: "custom async", item: map[string]any{"id": "ctc_1", "type": "custom_tool_call", "async": []any{}}, field: ".async"},
 		{name: "custom program caller", item: map[string]any{"id": "ctc_1", "type": "custom_tool_call", "caller": map[string]any{"type": "program"}}, field: ".caller.caller_id"},
-		{name: "custom status", item: map[string]any{"id": "ctc_1", "type": "custom_tool_call", "status": "completed"}, field: ".status"},
+		{name: "custom status", item: map[string]any{"id": "ctc_1", "type": "custom_tool_call", "status": "queued"}, field: ".status"},
 		{name: "custom created by", item: map[string]any{"id": "ctc_1", "type": "custom_tool_call", "created_by": "model"}, field: ".created_by"},
 		{name: "custom output created by", item: map[string]any{"id": "ctco_1", "type": "custom_tool_call_output", "created_by": false}, field: ".created_by"},
 	}
@@ -542,6 +546,7 @@ func responsesLifecycleItem(id, itemType string) map[string]any {
 		item["call_id"] = "call_" + id
 		item["name"] = "shell"
 		item["input"] = "echo hi"
+		item["status"] = "completed"
 	case "web_search_call":
 		item["status"] = "completed"
 		item["action"] = map[string]any{"type": "open_page"}

@@ -203,7 +203,7 @@ func TestValidateResponsesOutputItemOfficialToolVariants(t *testing.T) {
 		"output":[
 			{"type":"function_call","call_id":"call_1","name":"weather","arguments":"{}","caller":{"type":"direct"}},
 			{"type":"function_call_output","id":"fco_1","status":"completed","output":"sunny","created_by":"client"},
-			{"type":"custom_tool_call","call_id":"call_2","name":"shell","input":"pwd","caller":{"type":"program","caller_id":"prog_1"}},
+			{"type":"custom_tool_call","call_id":"call_2","name":"shell","input":"pwd","status":"completed","caller":{"type":"program","caller_id":"prog_1"}},
 			{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_2","output":[{"type":"input_text","text":"/tmp"}],"status":"completed","created_by":"client"},
 			{"type":"tool_search_call","id":"tsc_1","call_id":"call_3","arguments":{},"execution":"server","status":"completed","created_by":"model"},
 			{"type":"tool_search_output","id":"tso_1","call_id":"call_3","execution":"server","status":"completed","tools":[{"type":"function","name":"weather","parameters":{},"strict":true}],"created_by":"server"},
@@ -212,6 +212,37 @@ func TestValidateResponsesOutputItemOfficialToolVariants(t *testing.T) {
 	}`)
 	if err := ValidateResponsesOutputItems(core.ProtocolResponses, response); err != nil {
 		t.Fatalf("official tool variants error = %v", err)
+	}
+}
+
+func TestValidateResponsesOutputItemProviderToolSearchOptionalCorrelationFields(t *testing.T) {
+	valid := []string{
+		`{"output":[{"type":"tool_search_call","id":"tsc_1","arguments":{"query":"weather"},"status":"completed"},{"type":"tool_search_output","id":"tso_1","status":"completed","tools":[{"type":"function","name":"weather","parameters":{},"strict":true,"defer_loading":true}]}]}`,
+		`{"output":[{"type":"tool_search_call","id":"tsc_1","call_id":null,"arguments":{},"execution":null,"status":"completed"},{"type":"tool_search_output","id":"tso_1","call_id":null,"execution":null,"status":"completed","tools":[]}]}`,
+		`{"output":[{"type":"tool_search_call","id":"tsc_1","arguments":{},"execution":"server","status":"completed"},{"type":"tool_search_output","id":"tso_1","execution":"server","status":"completed","tools":[]}]}`,
+		`{"output":[{"type":"tool_search_call","id":"tsc_1","call_id":"call_1","arguments":{},"execution":"client","status":"completed"},{"type":"tool_search_output","id":"tso_1","call_id":"call_1","execution":"client","status":"completed","tools":[]}]}`,
+	}
+	for index, response := range valid {
+		if err := ValidateResponsesOutputItems(core.ProtocolResponses, []byte(response)); err != nil {
+			t.Fatalf("valid provider tool-search shape %d: %v", index, err)
+		}
+	}
+
+	invalid := []struct {
+		name string
+		item string
+		path string
+	}{
+		{name: "call empty call id", item: `{"type":"tool_search_call","id":"tsc_1","call_id":" ","arguments":{},"status":"completed"}`, path: "$.output[0].call_id"},
+		{name: "call invalid execution", item: `{"type":"tool_search_call","id":"tsc_1","arguments":{},"execution":"remote","status":"completed"}`, path: "$.output[0].execution"},
+		{name: "client call missing call id", item: `{"type":"tool_search_call","id":"tsc_1","arguments":{},"execution":"client","status":"completed"}`, path: "$.output[0].call_id"},
+		{name: "client output missing call id", item: `{"type":"tool_search_output","id":"tso_1","execution":"client","status":"completed","tools":[]}`, path: "$.output[0].call_id"},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateResponsesOutputItems(core.ProtocolResponses, []byte(`{"output":[`+test.item+`]}`))
+			assertConversionError(t, err, core.ErrUpstreamResponse, test.path)
+		})
 	}
 }
 
@@ -226,7 +257,7 @@ func TestValidateResponsesOutputItemRequiredFieldsAndTypes(t *testing.T) {
 		{name: "function arguments object", item: `{"type":"function_call","id":"f","call_id":"c","name":"n","arguments":{},"status":"completed"}`, path: "$.output[0].arguments"},
 		{name: "function created by is not in schema", item: `{"type":"function_call","call_id":"c","name":"n","arguments":"{}","created_by":"model"}`, path: "$.output[0].created_by"},
 		{name: "function output null", item: `{"type":"function_call_output","id":"f","status":"completed","output":null}`, path: "$.output[0].output"},
-		{name: "custom status is not in schema", item: `{"type":"custom_tool_call","call_id":"c","name":"n","input":"raw","status":"completed"}`, path: "$.output[0].status"},
+		{name: "custom status invalid", item: `{"type":"custom_tool_call","call_id":"c","name":"n","input":"raw","status":"queued"}`, path: "$.output[0].status"},
 		{name: "custom created by is not in schema", item: `{"type":"custom_tool_call","call_id":"c","name":"n","input":"raw","created_by":"model"}`, path: "$.output[0].created_by"},
 		{name: "custom output call id missing", item: `{"type":"custom_tool_call_output","id":"c","status":"completed","output":"ok"}`, path: "$.output[0].call_id"},
 		{name: "created by wrong type", item: `{"type":"tool_search_call","id":"t","call_id":"c","arguments":{},"execution":"server","status":"completed","created_by":1}`, path: "$.output[0].created_by"},

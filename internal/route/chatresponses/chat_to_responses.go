@@ -262,8 +262,15 @@ func (c *chatToResponsesConverter) ToUpstreamRequest(_ context.Context, input []
 		if message.Refusal != "" {
 			return conversionResult{}, unsupported(ProtocolChat, path+".refusal", "refusal input has no portable Responses request representation")
 		}
+		if message.Role == "assistant" {
+			for partIndex, part := range parts {
+				if jsonValuePresent(part.PromptCacheBreakpoint) {
+					return conversionResult{}, unsupported(ProtocolChat, fmt.Sprintf("%s.content[%d].prompt_cache_breakpoint", path, partIndex), "Responses output_text cannot carry an input prompt cache breakpoint")
+				}
+			}
+		}
 		if len(parts) > 0 {
-			content, err := encodeResponsesContent(parts, true)
+			content, err := encodeResponsesContent(parts, message.Role != "assistant")
 			if err != nil {
 				return conversionResult{}, err
 			}
@@ -404,7 +411,7 @@ func (c *chatToResponsesConverter) ToClientResponse(_ context.Context, input []b
 				return conversionResult{}, upstreamResponseError(ProtocolResponses, path+".call_id", "duplicate tool call id %q (already used by %s call)", item.CallID, previous)
 			}
 			seenToolCallIDs[item.CallID] = "custom"
-			if item.Status != "" {
+			if item.Status != "" && item.Status != "completed" {
 				return conversionResult{}, unsupported(ProtocolResponses, path+".status", "Chat cannot preserve custom_tool_call status %q", item.Status)
 			}
 			input, err := customInput(item.Input, ProtocolResponses, path+".input")

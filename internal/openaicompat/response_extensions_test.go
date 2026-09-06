@@ -68,6 +68,39 @@ func TestServiceTierIntersection(t *testing.T) {
 	}
 }
 
+func TestResponsesServiceTierStreamResolution(t *testing.T) {
+	merged, err := MergeResponsesServiceTierForChat(nil, json.RawMessage(`"auto"`), "$.response.service_tier")
+	if err != nil || string(merged) != `"auto"` {
+		t.Fatalf("initial tier = %s, error = %v", merged, err)
+	}
+	merged, err = MergeResponsesServiceTierForChat(merged, json.RawMessage(`"default"`), "$.response.service_tier")
+	if err != nil || string(merged) != `"default"` {
+		t.Fatalf("resolved tier = %s, error = %v", merged, err)
+	}
+	if _, err := MergeResponsesServiceTierForChat(merged, json.RawMessage(`"priority"`), "$.response.service_tier"); !errors.Is(err, core.ErrUpstreamResponse) {
+		t.Fatalf("concrete tier change error = %v, want ErrUpstreamResponse", err)
+	}
+	if _, err := MergeResponsesServiceTierForChat(json.RawMessage(`"auto"`), json.RawMessage(`"ultrafast"`), "$.response.service_tier"); !errors.Is(err, core.ErrUnsupported) {
+		t.Fatalf("ultrafast transition error = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestImplicitResponsesServiceTier(t *testing.T) {
+	for _, tier := range []string{"auto", "default"} {
+		implicit, err := IsImplicitResponsesServiceTier(json.RawMessage(`"`+tier+`"`), "$.service_tier", true)
+		if err != nil || !implicit {
+			t.Errorf("tier %q implicit=%v error=%v", tier, implicit, err)
+		}
+	}
+	implicit, err := IsImplicitResponsesServiceTier(json.RawMessage(`"priority"`), "$.service_tier", true)
+	if err != nil || implicit {
+		t.Errorf("priority implicit=%v error=%v", implicit, err)
+	}
+	if _, err := IsImplicitResponsesServiceTier(json.RawMessage(`"future"`), "$.service_tier", true); !errors.Is(err, core.ErrUpstreamResponse) {
+		t.Fatalf("unknown tier error = %v, want ErrUpstreamResponse", err)
+	}
+}
+
 func TestMergeModerationAccumulatesSidesAndRejectsChanges(t *testing.T) {
 	input := json.RawMessage(`{"input":` + moderationResult + `}`)
 	output := json.RawMessage(`{"output":` + moderationResult + `}`)

@@ -195,7 +195,7 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 			if len(ordinary) == 0 {
 				return nil
 			}
-			content, err := encodeResponsesContent(ordinary, true)
+			content, err := encodeResponsesContent(ordinary, message.Role != "assistant")
 			if err != nil {
 				return err
 			}

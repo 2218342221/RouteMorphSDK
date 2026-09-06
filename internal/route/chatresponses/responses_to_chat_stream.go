@@ -604,13 +604,11 @@ func (c *responsesToChatStreamConverter) setBase(response responsesResponse, pat
 		c.model = c.providerModel
 	}
 	if rawJSONValuePresent(response.ServiceTier) {
-		if err := openaicompat.ValidateResponsesServiceTierForChat(response.ServiceTier, path+".service_tier", true); err != nil {
+		merged, err := openaicompat.MergeResponsesServiceTierForChat(c.serviceTier, response.ServiceTier, path+".service_tier")
+		if err != nil {
 			return nil, err
 		}
-		if rawJSONValuePresent(c.serviceTier) && !jsonObjectsEqual(c.serviceTier, response.ServiceTier) {
-			return nil, invalid(ProtocolResponses, path+".service_tier", "changed during stream")
-		}
-		c.serviceTier = append(json.RawMessage(nil), response.ServiceTier...)
+		c.serviceTier = merged
 	}
 	if rawJSONValuePresent(response.Moderation) {
 		converted, err := openaicompat.ResponsesModerationToChat(response.Moderation, path+".moderation", true)

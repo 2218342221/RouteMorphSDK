@@ -1,0 +1,45 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Call record_marker with marker RM_TOOL_GENERATECONTENT_STREAM. Do not answer with text."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "record_marker",
+          "description": "Record a test marker",
+          "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+              "marker": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "marker"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  ],
+  "toolConfig": {
+    "functionCallingConfig": {
+      "mode": "ANY",
+      "allowedFunctionNames": [
+        "record_marker"
+      ]
+    }
+  },
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

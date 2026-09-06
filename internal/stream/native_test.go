@@ -370,7 +370,7 @@ func TestNativeResponsesBufferedToolItemEvents(t *testing.T) {
 	source := []byte(`{
 		"id":"resp_tools","object":"response","model":"gpt-5.6","status":"completed",
 		"output":[
-			{"id":"ctc_1","type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"echo hello"},
+			{"id":"ctc_1","type":"custom_tool_call","call_id":"call_custom","name":"shell","input":"echo hello","status":"completed"},
 			{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"RouteMorph"}},
 			{"id":"tsc_1","type":"tool_search_call","call_id":"call_search","arguments":{},"execution":"server","status":"completed"},
 			{"id":"tso_1","type":"tool_search_output","call_id":"call_search","execution":"server","status":"completed","tools":[]},
@@ -429,13 +429,13 @@ func TestNativeResponsesBufferedToolItemEvents(t *testing.T) {
 			t.Fatalf("custom tool call was rendered as a function call: %s", frame.Data)
 		}
 	}
-	if events[1].Item.Type != "custom_tool_call" || events[1].Item.Status != "" || rawString(events[1].Item.Input) != "" {
+	if events[1].Item.Type != "custom_tool_call" || events[1].Item.Status != "in_progress" || rawString(events[1].Item.Input) != "" {
 		t.Fatalf("custom output_item.added = %#v", events[1].Item)
 	}
 	if events[2].ItemID != "ctc_1" || events[2].Delta != "echo hello" || events[3].Input != "echo hello" {
 		t.Fatalf("custom input events = %#v / %#v", events[2], events[3])
 	}
-	if events[4].Item.Type != "custom_tool_call" || events[4].Item.Status != "" || rawString(events[4].Item.Input) != "echo hello" {
+	if events[4].Item.Type != "custom_tool_call" || events[4].Item.Status != "completed" || rawString(events[4].Item.Input) != "echo hello" {
 		t.Fatalf("custom output_item.done = %#v", events[4].Item)
 	}
 	for _, index := range []int{5, 10, 12} {
@@ -620,7 +620,7 @@ func TestNativeResponsesBufferedToolItemsRejectMissingEventFields(t *testing.T) 
 		{name: "reasoning invalid summary", item: `{"id":"rs","type":"reasoning","status":"completed","summary":[{"type":"output_text","text":"x"}]}`, path: ".summary[0].type"},
 		{name: "reasoning null summary text", item: `{"id":"rs","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":null}]}`, path: ".text"},
 		{name: "reasoning object encrypted content", item: `{"id":"rs","type":"reasoning","summary":[],"encrypted_content":{"opaque":true}}`, path: ".encrypted_content"},
-		{name: "custom status is not in output schema", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","status":"completed"}`, path: ".status"},
+		{name: "custom invalid status", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":"echo","status":"queued"}`, path: ".status"},
 		{name: "custom missing call id", item: `{"id":"ctc","type":"custom_tool_call","name":"shell","input":"echo"}`, path: ".call_id"},
 		{name: "custom missing name", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","input":"echo"}`, path: ".name"},
 		{name: "custom object input", item: `{"id":"ctc","type":"custom_tool_call","call_id":"call","name":"shell","input":{"command":"echo"}}`, path: ".input"},
@@ -649,7 +649,8 @@ func TestNativeResponsesBufferedToolItemsRejectMissingEventFields(t *testing.T) 
 		{name: "web incomplete status", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","query":"x"},"status":"incomplete"}`, path: ".status"},
 		{name: "web unknown status", item: `{"id":"ws","type":"web_search_call","action":{"type":"search","query":"x"},"status":"done"}`, path: ".status"},
 		{name: "tool search missing arguments", item: `{"id":"ts","type":"tool_search_call","call_id":"call","execution":"server","status":"completed"}`, path: ".arguments"},
-		{name: "tool search missing call id", item: `{"id":"ts","type":"tool_search_call","arguments":{},"execution":"server","status":"completed"}`, path: ".call_id"},
+		{name: "client tool search missing call id", item: `{"id":"ts","type":"tool_search_call","arguments":{},"execution":"client","status":"completed"}`, path: ".call_id"},
+		{name: "tool search empty call id", item: `{"id":"ts","type":"tool_search_call","call_id":"","arguments":{},"execution":"server","status":"completed"}`, path: ".call_id"},
 		{name: "tool search invalid execution", item: `{"id":"ts","type":"tool_search_call","call_id":"call","arguments":{},"execution":"remote","status":"completed"}`, path: ".execution"},
 		{name: "tool search output missing tools", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed"}`, path: ".tools"},
 		{name: "tool search output malformed tool", item: `{"id":"tso","type":"tool_search_output","call_id":"call","execution":"server","status":"completed","tools":[null]}`, path: ".tools[0]"},

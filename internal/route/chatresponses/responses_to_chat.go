@@ -535,7 +535,7 @@ func (c *responsesToChatConverter) ToClientResponse(_ context.Context, input []b
 			if call.Function.Name != "" || nonNullJSON(call.Function.Arguments) {
 				return conversionResult{}, upstreamResponseError(ProtocolChat, path+".function", "is not valid for a custom tool call")
 			}
-			target.Output = append(target.Output, responsesItem{Type: "custom_tool_call", ID: "ctc_" + call.ID, CallID: call.ID, Name: call.Custom.Name, Input: json.RawMessage(mustJSONString(*call.Custom.Input))})
+			target.Output = append(target.Output, responsesItem{Type: "custom_tool_call", ID: "ctc_" + call.ID, CallID: call.ID, Name: call.Custom.Name, Input: json.RawMessage(mustJSONString(*call.Custom.Input)), Status: "completed"})
 		default:
 			return conversionResult{}, unsupported(ProtocolChat, path+".type", "tool call type %q is unsupported", call.Type)
 		}

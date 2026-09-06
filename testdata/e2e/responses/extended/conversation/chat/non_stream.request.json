@@ -1,0 +1,27 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a deterministic regression assistant."
+    },
+    {
+      "role": "developer",
+      "content": "When the final user asks for a token, output only that ASCII token."
+    },
+    {
+      "role": "user",
+      "content": "The earlier token is RM_CONVERSATION_OLD_CHAT_NON_STREAM. Reply with ACK."
+    },
+    {
+      "role": "assistant",
+      "content": "ACK"
+    },
+    {
+      "role": "user",
+      "content": "Return exactly the ASCII token RM_CONVERSATION_CHAT_NON_STREAM."
+    }
+  ],
+  "max_completion_tokens": 256,
+  "stream": false
+}

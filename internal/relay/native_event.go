@@ -639,8 +639,14 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 		if _, err := requireJSONString(core.ProtocolResponses, "$.arguments", event.Arguments); err != nil {
 			return err
 		}
-		if err := requireResponsesEventString(fields, "name", true); err != nil {
-			return err
+		// The OpenAI schema includes name, but Responses-compatible providers
+		// may omit it because the preceding output_item.added/done item already
+		// carries the function identity. Validate name when present; lifecycle
+		// validation still requires the event to reference a known function item.
+		if _, exists := fields["name"]; exists {
+			if err := requireResponsesEventString(fields, "name", true); err != nil {
+				return err
+			}
 		}
 	case "response.custom_tool_call_input.done":
 		if _, err := requireJSONString(core.ProtocolResponses, "$.input", event.Input); err != nil {
@@ -906,7 +912,7 @@ func validatePartialResponsesItem(raw json.RawMessage) error {
 	case "function_call":
 		incompatible = []string{"created_by"}
 	case "custom_tool_call":
-		incompatible = []string{"status", "created_by"}
+		incompatible = []string{"created_by"}
 	}
 	for _, field := range incompatible {
 		if _, exists := source[field]; exists {
@@ -1051,7 +1057,7 @@ func knownResponsesOutputItemFields(itemType string) ([]string, bool) {
 		"file_search_call":        {"type", "id", "queries", "results", "status"},
 		"function_call":           {"type", "id", "call_id", "name", "arguments", "async", "namespace", "caller", "status"},
 		"function_call_output":    {"type", "id", "call_id", "name", "namespace", "caller", "status", "output", "created_by"},
-		"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller"},
+		"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller", "status"},
 		"custom_tool_call_output": {"type", "id", "call_id", "output", "caller", "status", "created_by"},
 		"web_search_call":         {"type", "id", "status", "action"},
 		"computer_call":           {"type", "id", "call_id", "pending_safety_checks", "status", "action", "actions"},
@@ -1090,6 +1096,7 @@ func normalizePartialResponsesItemStatus(filtered, source map[string]json.RawMes
 		"file_search_call":        {"in_progress", "searching", "completed", "incomplete", "failed"},
 		"function_call":           {"in_progress", "completed", "incomplete"},
 		"function_call_output":    {"in_progress", "completed", "incomplete"},
+		"custom_tool_call":        {"in_progress", "completed", "incomplete"},
 		"web_search_call":         {"in_progress", "searching", "completed", "failed"},
 		"computer_call":           {"in_progress", "completed", "incomplete"},
 		"computer_call_output":    {"in_progress", "completed", "incomplete", "failed"},
@@ -1141,11 +1148,16 @@ func validateKnownResponsesItem(raw json.RawMessage) error {
 	if err := json.Unmarshal(raw, &object); err != nil {
 		return core.Invalid(core.ProtocolResponses, "$.item", "invalid item object")
 	}
-	for _, field := range []string{"type", "role", "id", "call_id", "name", "status", "phase", "encrypted_content"} {
+	for _, field := range []string{"type", "role", "id", "name", "status", "phase", "encrypted_content"} {
 		if value, exists := object[field]; exists {
 			if _, err := requireJSONString(core.ProtocolResponses, "$.item."+field, value); err != nil {
 				return err
 			}
+		}
+	}
+	if value, exists := object["call_id"]; exists && !(bytes.Equal(bytes.TrimSpace(value), []byte("null")) && (item.Type == "tool_search_call" || item.Type == "tool_search_output")) {
+		if _, err := requireJSONString(core.ProtocolResponses, "$.item.call_id", value); err != nil {
+			return err
 		}
 	}
 	for _, field := range []string{"content", "summary"} {

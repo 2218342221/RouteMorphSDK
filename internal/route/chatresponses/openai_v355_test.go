@@ -73,6 +73,46 @@ func TestOpenAIV355RequestValidationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestChatToResponsesAssistantHistoryPromptCacheBreakpointFailsClosed(t *testing.T) {
+	converter := New(core.RouteSpec{From: ProtocolChat, To: ProtocolResponses})
+
+	t.Run("user input remains supported", func(t *testing.T) {
+		result, err := converter.ToUpstreamRequest(context.Background(), []byte(`{
+			"model":"m",
+			"messages":[{"role":"user","content":[{"type":"text","text":"hi","prompt_cache_breakpoint":{"mode":"explicit"}}]}]
+		}`), core.ConversionOptions{})
+		if err != nil {
+			t.Fatalf("ToUpstreamRequest() error = %v", err)
+		}
+		for _, want := range []string{`"role":"user"`, `"type":"input_text"`, `"prompt_cache_breakpoint":{"mode":"explicit"}`} {
+			if !strings.Contains(string(result.Body), want) {
+				t.Errorf("converted body missing %s: %s", want, result.Body)
+			}
+		}
+	})
+
+	t.Run("assistant output fails closed at exact path", func(t *testing.T) {
+		_, err := converter.ToUpstreamRequest(context.Background(), []byte(`{
+			"model":"m",
+			"messages":[
+				{"role":"user","content":"hi"},
+				{"role":"assistant","content":[{"type":"text","text":"cached","prompt_cache_breakpoint":{"mode":"explicit"}}]},
+				{"role":"user","content":"continue"}
+			]
+		}`), core.ConversionOptions{})
+		if !errors.Is(err, core.ErrUnsupported) {
+			t.Fatalf("error = %v, want ErrUnsupported", err)
+		}
+		var conversionErr *core.ConversionError
+		if !errors.As(err, &conversionErr) {
+			t.Fatalf("error type = %T, want *core.ConversionError", err)
+		}
+		if conversionErr.Path != "$.messages[1].content[0].prompt_cache_breakpoint" {
+			t.Fatalf("error path = %q", conversionErr.Path)
+		}
+	})
+}
+
 func TestOpenAIV355NonStreamResponseEnvelopeAndCitations(t *testing.T) {
 	responsesUpstream := New(core.RouteSpec{From: ProtocolChat, To: ProtocolResponses})
 	responsesBody := []byte(`{"id":"resp_1","object":"response","created_at":7,"model":"provider","status":"completed","metadata":{"trace":"one"},"service_tier":"priority","moderation":{"input":{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false},"output":{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false}},"output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi ","annotations":[{"type":"url_citation","start_index":0,"end_index":2,"title":"first","url":"https://one.example"}]},{"type":"output_text","text":"there","annotations":[{"type":"url_citation","start_index":3,"end_index":8,"title":"second","url":"https://two.example"}]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}`)
@@ -318,7 +358,7 @@ func TestOpenAIV355CustomToolsNonStreaming(t *testing.T) {
 
 func TestOpenAIV355CustomToolResponses(t *testing.T) {
 	chatToResponses := New(core.RouteSpec{From: ProtocolChat, To: ProtocolResponses})
-	responsesBody := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo hi"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
+	responsesBody := []byte(`{"id":"resp_1","object":"response","created_at":1,"model":"m","status":"completed","output":[{"id":"ctc_1","type":"custom_tool_call","call_id":"call_1","name":"shell","input":"echo hi","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`)
 	converted, err := chatToResponses.ToClientResponse(context.Background(), responsesBody, core.ConversionOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -340,8 +380,8 @@ func TestOpenAIV355CustomToolResponses(t *testing.T) {
 	if err := json.Unmarshal(converted.Body, &response); err != nil {
 		t.Fatal(err)
 	}
-	if got, exists := response["output"].([]any)[0].(map[string]any)["status"]; exists {
-		t.Fatalf("custom Responses output invented non-schema status = %v: %s", got, converted.Body)
+	if got := response["output"].([]any)[0].(map[string]any)["status"]; got != "completed" {
+		t.Fatalf("custom Responses output status = %v, want completed: %s", got, converted.Body)
 	}
 }
 

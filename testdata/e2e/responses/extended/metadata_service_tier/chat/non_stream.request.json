@@ -1,0 +1,17 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return exactly the ASCII token RM_METADATA_TIER_CHAT_NON_STREAM."
+    }
+  ],
+  "metadata": {
+    "routemorph_suite": "extended",
+    "routemorph_case": "metadata_service_tier_chat"
+  },
+  "service_tier": "auto",
+  "store": false,
+  "max_completion_tokens": 256,
+  "stream": false
+}

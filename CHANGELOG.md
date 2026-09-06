@@ -10,6 +10,13 @@ here.
 
 ### Added
 
+- Added a credential-safe catalog of 63 independently maintained JSON request
+  fixtures for Responses-provider end-to-end regression: core 32, extended 18,
+  and tools 13. Opt-in live runners expose separate
+  `test-live-responses-core`, `test-live-responses-extended`, and
+  `test-live-responses-tools` targets plus the combined 63-call
+  `test-live-responses` target; deterministic tests validate every fixture and
+  its local public-adapter conversion without provider credentials.
 - Added `Adapter.HTTPClient` for injecting RouteMorph protocol conversion into
   the official OpenAI, Anthropic, and Gemini Go SDKs, with fail-closed endpoint
   routing and HTTP transport contract tests.
@@ -35,6 +42,26 @@ here.
 
 ### Changed
 
+- Encode prior assistant/model text as Responses `output_text` on the
+  Chat-, Messages-, and Gemini-to-Responses routes. This preserves the semantic
+  distinction from user `input_text` and matches the live provider's accepted
+  multi-turn request shape. Chat assistant history carrying an input-only
+  `prompt_cache_breakpoint` now fails closed instead of emitting an invalid
+  Responses output-text part.
+- Accept Responses streams that resolve `service_tier` from `auto` to the
+  concrete terminal tier, and diagnose omission of provider-selected
+  `auto`/`default` tiers when converting responses to Messages or Gemini.
+- Accept provider-compatible `response.function_call_arguments.done` events
+  without a duplicate `name` when the function identity is established by the
+  output-item lifecycle.
+- Accept the provider-returned `status` lifecycle on `custom_tool_call` items
+  and validate `response.custom_tool_call_input.delta`/`done` without
+  reclassifying custom calls as ordinary function calls.
+- Accept Responses-compatible server `tool_search_call` and
+  `tool_search_output` items whose `call_id` and `execution` are omitted or
+  null. Non-null values remain validated, and explicit client execution still
+  requires a correlation ID. Tool discovery remains Responses-native and
+  fails closed at cross-protocol boundaries.
 - Gemini stream failures now close with the typed read error without emitting a
   JSON error payload that the official Gemini SDK interprets as an empty
   successful response.

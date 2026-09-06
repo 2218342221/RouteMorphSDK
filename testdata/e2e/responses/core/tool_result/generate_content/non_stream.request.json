@@ -1,0 +1,43 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Record marker RM_RESULT_GENERATECONTENT_NON_STREAM with record_marker."
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "id": "call_routemorph_regression",
+            "name": "record_marker",
+            "args": {
+              "marker": "RM_RESULT_GENERATECONTENT_NON_STREAM"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "id": "call_routemorph_regression",
+            "name": "record_marker",
+            "response": {
+              "result": "The marker was recorded. Return exactly the ASCII token RM_RESULT_GENERATECONTENT_NON_STREAM."
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

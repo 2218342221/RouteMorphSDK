@@ -164,12 +164,6 @@ func TestKnownResponsesEventsRequireLifecycleAndDonePayloadFields(t *testing.T) 
 			path:      "$.response",
 		},
 		{
-			name:      "function name",
-			eventType: "response.function_call_arguments.done",
-			payload:   `{"type":"response.function_call_arguments.done","sequence_number":0,"output_index":0,"item_id":"fc_1","arguments":"{}"}`,
-			path:      "$.name",
-		},
-		{
 			name:      "error code",
 			eventType: "error",
 			payload:   `{"type":"error","sequence_number":0,"message":"bad","param":"input"}`,
@@ -247,6 +241,17 @@ func TestKnownResponsesEventCommonFieldsAcceptOfficialShapes(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestKnownResponsesFunctionArgumentsDoneAcceptsProviderShapeWithoutName(t *testing.T) {
+	payload := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"output_index":2,"item_id":"fc_1","arguments":"{}"}`)
+	if err := validateKnownResponsesEvent(payload, "response.function_call_arguments.done"); err != nil {
+		t.Fatal(err)
+	}
+	badName := []byte(`{"type":"response.function_call_arguments.done","sequence_number":4,"output_index":2,"item_id":"fc_1","name":"","arguments":"{}"}`)
+	if err := validateKnownResponsesEvent(badName, "response.function_call_arguments.done"); !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), "$.name") {
+		t.Fatalf("empty name error = %v, want ErrInvalidPayload at $.name", err)
 	}
 }
 

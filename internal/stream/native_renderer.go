@@ -818,6 +818,7 @@ func validateNativeResponsesTerminalItemStatus(fields map[string]json.RawMessage
 		"file_search_call":        {required: true, values: []string{"completed", "incomplete", "failed"}},
 		"function_call":           {values: []string{"completed", "incomplete"}},
 		"function_call_output":    {required: true, values: []string{"completed", "incomplete"}},
+		"custom_tool_call":        {values: []string{"completed", "incomplete"}},
 		"web_search_call":         {required: true, values: []string{"completed", "failed"}},
 		"computer_call":           {required: true, values: []string{"completed", "incomplete"}},
 		"computer_call_output":    {required: true, values: []string{"completed", "incomplete", "failed"}},
@@ -1678,12 +1679,15 @@ func validateNativeResponsesToolItem(fields map[string]json.RawMessage, path str
 			return upstreamResponseError(ProtocolResponses, path+".arguments", "function_call arguments must be a JSON string")
 		}
 	case "custom_tool_call":
-		for _, field := range []string{"status", "created_by"} {
+		for _, field := range []string{"created_by"} {
 			if _, exists := fields[field]; exists {
 				return upstreamResponseError(ProtocolResponses, path+"."+field, "field is not valid for custom_tool_call")
 			}
 		}
 		if err := validateNativeResponsesKnownCallFields(fields, itemType); err != nil {
+			return err
+		}
+		if err := validateOptionalStatus("completed", "incomplete"); err != nil {
 			return err
 		}
 		callID, err := nativeResponsesRequiredString(fields, "call_id", path+".call_id")
@@ -1759,14 +1763,6 @@ func validateNativeResponsesToolItem(fields map[string]json.RawMessage, path str
 		if err := requireStatus("completed", "incomplete"); err != nil {
 			return err
 		}
-		callID, err := nativeResponsesRequiredString(fields, "call_id", path+".call_id")
-		if err != nil || callID == "" {
-			return upstreamResponseError(ProtocolResponses, path+".call_id", "tool_search_call call_id is required")
-		}
-		execution, err := nativeResponsesRequiredString(fields, "execution", path+".execution")
-		if err != nil || execution != "server" && execution != "client" {
-			return upstreamResponseError(ProtocolResponses, path+".execution", "tool_search_call execution must be server or client")
-		}
 		arguments, exists := fields["arguments"]
 		if !exists || nativeResponsesNull(arguments) {
 			return upstreamResponseError(ProtocolResponses, path+".arguments", "tool_search_call arguments are required")
@@ -1777,14 +1773,6 @@ func validateNativeResponsesToolItem(fields map[string]json.RawMessage, path str
 		}
 		if err := requireStatus("completed", "incomplete"); err != nil {
 			return err
-		}
-		callID, err := nativeResponsesRequiredString(fields, "call_id", path+".call_id")
-		if err != nil || callID == "" {
-			return upstreamResponseError(ProtocolResponses, path+".call_id", "tool_search_output call_id is required")
-		}
-		execution, err := nativeResponsesRequiredString(fields, "execution", path+".execution")
-		if err != nil || execution != "server" && execution != "client" {
-			return upstreamResponseError(ProtocolResponses, path+".execution", "tool_search_output execution must be server or client")
 		}
 		return requireToolArray("tools")
 	case "additional_tools":
@@ -1869,7 +1857,7 @@ func validateNativeResponsesKnownCallFields(fields map[string]json.RawMessage, i
 	allowedByType := map[string][]string{
 		"function_call":           {"type", "id", "call_id", "name", "arguments", "async", "namespace", "caller", "status"},
 		"function_call_output":    {"type", "id", "call_id", "name", "namespace", "caller", "status", "output", "created_by"},
-		"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller"},
+		"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller", "status"},
 		"custom_tool_call_output": {"type", "id", "call_id", "output", "caller", "status", "created_by"},
 		"tool_search_call":        {"type", "id", "call_id", "arguments", "execution", "status", "created_by"},
 		"tool_search_output":      {"type", "id", "call_id", "execution", "status", "tools", "created_by"},

@@ -942,7 +942,7 @@ func ValidateResponsesOutputItems(protocol core.Protocol, response []byte) error
 		case "function_call_output":
 			fields = []string{"type", "id", "call_id", "name", "namespace", "caller", "status", "output", "created_by"}
 		case "custom_tool_call":
-			fields = []string{"type", "id", "call_id", "name", "input", "async", "namespace", "caller"}
+			fields = []string{"type", "id", "call_id", "name", "input", "async", "namespace", "caller", "status"}
 		case "custom_tool_call_output":
 			fields = []string{"type", "id", "call_id", "output", "caller", "status", "created_by"}
 		case "web_search_call":
@@ -1101,10 +1101,8 @@ func validateResponsesCallItem(protocol core.Protocol, values map[string]json.Ra
 	if _, err := responsesRequiredString(protocol, values, payloadField, path, true, false); err != nil {
 		return err
 	}
-	if !custom {
-		if err := responsesOptionalEnum(protocol, values, "status", path, true, false, "in_progress", "completed", "incomplete"); err != nil {
-			return err
-		}
+	if err := responsesOptionalEnum(protocol, values, "status", path, true, false, "in_progress", "completed", "incomplete"); err != nil {
+		return err
 	}
 	if err := responsesOptionalBool(protocol, values, "async", path, true); err != nil {
 		return err
@@ -1279,17 +1277,32 @@ func validateResponsesWebSearchCall(protocol core.Protocol, values map[string]js
 	return nil
 }
 
+// Server-executed tool search responses in the wild can omit or null call_id
+// and execution. Preserve that provider shape, while keeping explicit
+// client-side discovery correlated and validating either non-null field.
 func validateResponsesToolSearchCall(protocol core.Protocol, values map[string]json.RawMessage, path string) error {
-	for _, field := range []string{"id", "call_id"} {
-		if _, err := responsesRequiredString(protocol, values, field, path, true, true); err != nil {
-			return err
-		}
+	if _, err := responsesRequiredString(protocol, values, "id", path, true, true); err != nil {
+		return err
+	}
+	callID, hasCallID, err := responsesOptionalString(protocol, values, "call_id", path, true, true)
+	if err != nil {
+		return err
+	}
+	if hasCallID && strings.TrimSpace(callID) == "" {
+		return core.UpstreamResponseError(protocol, path+".call_id", "call_id must not be empty")
 	}
 	if _, err := responsesRequiredRaw(protocol, values, "arguments", path, true); err != nil {
 		return err
 	}
-	if err := responsesRequireEnum(protocol, values, "execution", path, true, "server", "client"); err != nil {
+	execution, hasExecution, err := responsesOptionalString(protocol, values, "execution", path, true, true)
+	if err != nil {
 		return err
+	}
+	if hasExecution && !responsesStringIn(execution, "server", "client") {
+		return core.UpstreamResponseError(protocol, path+".execution", "unsupported execution %q", execution)
+	}
+	if execution == "client" && !hasCallID {
+		return core.UpstreamResponseError(protocol, path+".call_id", "client tool_search_call requires call_id")
 	}
 	if err := responsesRequireEnum(protocol, values, "status", path, true, "in_progress", "completed", "incomplete"); err != nil {
 		return err
@@ -1298,13 +1311,25 @@ func validateResponsesToolSearchCall(protocol core.Protocol, values map[string]j
 }
 
 func validateResponsesToolSearchOutput(protocol core.Protocol, values map[string]json.RawMessage, path string) error {
-	for _, field := range []string{"id", "call_id"} {
-		if _, err := responsesRequiredString(protocol, values, field, path, true, true); err != nil {
-			return err
-		}
-	}
-	if err := responsesRequireEnum(protocol, values, "execution", path, true, "server", "client"); err != nil {
+	if _, err := responsesRequiredString(protocol, values, "id", path, true, true); err != nil {
 		return err
+	}
+	callID, hasCallID, err := responsesOptionalString(protocol, values, "call_id", path, true, true)
+	if err != nil {
+		return err
+	}
+	if hasCallID && strings.TrimSpace(callID) == "" {
+		return core.UpstreamResponseError(protocol, path+".call_id", "call_id must not be empty")
+	}
+	execution, hasExecution, err := responsesOptionalString(protocol, values, "execution", path, true, true)
+	if err != nil {
+		return err
+	}
+	if hasExecution && !responsesStringIn(execution, "server", "client") {
+		return core.UpstreamResponseError(protocol, path+".execution", "unsupported execution %q", execution)
+	}
+	if execution == "client" && !hasCallID {
+		return core.UpstreamResponseError(protocol, path+".call_id", "client tool_search_output requires call_id")
 	}
 	if err := responsesRequireEnum(protocol, values, "status", path, true, "in_progress", "completed", "incomplete"); err != nil {
 		return err

@@ -1,0 +1,72 @@
+{
+  "model": "routemorph-live-client",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Use tool search to find record_marker. After the tool definition is supplied, call record_marker with marker RM_TOOL_SEARCH_CLIENT_CONTINUATION. Do not answer with text."
+        }
+      ]
+    },
+    {
+      "$live_fixture": "CLIENT_TOOL_SEARCH_CALL"
+    },
+    {
+      "type": "tool_search_output",
+      "call_id": "{{CLIENT_TOOL_SEARCH_CALL_ID}}",
+      "tools": [
+        {
+          "type": "function",
+          "name": "record_marker",
+          "description": "Record a regression-test marker",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "marker": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "marker"
+            ],
+            "additionalProperties": false
+          },
+          "strict": true,
+          "defer_loading": true
+        }
+      ]
+    },
+    {
+      "type": "additional_tools",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "function",
+          "name": "record_marker",
+          "description": "Record a regression-test marker",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "marker": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "marker"
+            ],
+            "additionalProperties": false
+          },
+          "strict": true,
+          "defer_loading": true
+        }
+      ]
+    }
+  ],
+  "instructions": "Call the discovered record_marker tool exactly once with marker RM_TOOL_SEARCH_CLIENT_CONTINUATION. Do not answer with text.",
+  "max_output_tokens": 256,
+  "stream": false,
+  "store": false
+}

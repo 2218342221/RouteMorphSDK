@@ -281,12 +281,17 @@ Important protocol boundaries in this release:
   subset on every cross-protocol route;
 - OpenAI Chat and Responses additionally share a **non-streaming** custom-tool
   subset. The official Responses item names are `custom_tool_call` and
-  `custom_tool_call_output` (not `customized_tool_call`);
+  `custom_tool_call_output` (not `customized_tool_call`). Native Responses
+  streams preserve the custom input delta/done lifecycle, but Chat has no
+  official equivalent streaming delta;
 - Chat `web_search_options` and the unversioned Responses `web_search` tool map
   only for their common non-streaming request fields. Responses `tool_search`
-  and `additional_tools` remain Responses-native. Responses
-  `configuration_update` is also native-only because it updates persisted
-  conversation state rather than the current request's top-level reasoning;
+  and `additional_tools` remain Responses-native. Server tool search is
+  provider-executed discovery; client tool search requires the caller to return
+  `tool_search_output` and the discovered definitions before the model can
+  continue. Responses `configuration_update` is also native-only because it
+  updates persisted conversation state rather than the current request's
+  top-level reasoning;
 - multimodal input is converted only when role, source, MIME type, URL/file
   provenance, and detail controls all have a destination equivalent. In
   particular, Responses Create message content has no `input_audio` member;
@@ -382,6 +387,28 @@ All commands run from this directory without the parent repository:
 ```bash
 make check
 ```
+
+Live Responses-provider regression tests are opt-in and billable. Their
+file-backed catalog contains 63 independently maintained JSON request fixtures
+under `testdata/e2e/responses`: core 32, extended 18, and tools 13. Each fixture
+represents one provider HTTP request. Run a group or the complete catalog:
+
+```bash
+make test-live-responses-core      # 32 HTTP calls
+make test-live-responses-extended  # 18 HTTP calls
+make test-live-responses-tools     # 13 HTTP calls in 12 logical cases
+make test-live-responses           # all 63 HTTP calls
+```
+
+The request files use a fixed client-side model alias and contain no provider
+base URL, API key, authorization header, or deployment model. The live loader
+supplies those values from `ROUTEMORPH_LIVE_*` environment variables at runtime.
+The tool matrix verifies native Responses lifecycles and the supported
+non-streaming Chat↔Responses subset; it does not imply that native discovery
+items can be converted to Messages or Gemini. See
+[Live provider testing](docs/live-testing.md) for the exact matrix, local and
+live reproduction commands, known cross-protocol boundaries, and credential
+handling rules.
 
 `BenchmarkBuiltinRoutes` measures request and response conversion for all 12
 ordered cross-protocol routes. `BenchmarkBuiltinRouteStreams` measures their

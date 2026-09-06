@@ -151,6 +151,14 @@ Supported response extensions are deliberately narrower:
 - a single successful moderation result is wrapped or unwrapped between the
   APIs; multiple Chat moderation results are unsupported;
 - Responses-only `ultrafast` service tier is unsupported when targeting Chat;
+- Responses stream snapshots may report `service_tier:"auto"` before the
+  terminal response reports the concrete selected tier such as `default`;
+  this one-way resolution is accepted, while unrelated concrete-tier changes
+  remain invalid upstream output;
+- Messages and Gemini omit provider-selected Responses `auto`/`default`
+  response tiers with `responses_service_tier_not_representable`; explicit
+  non-default tiers still fail closed because those protocols have no
+  equivalent response field;
 - Responses terminal `prompt_cache_options` has no Chat response field;
 - Chat audio-token and prediction-token usage and Responses cache-write usage
   have no counterpart in the other API;
@@ -366,6 +374,11 @@ require native OpenAI routing when they cannot otherwise be represented.
   lifecycle events can produce a diagnostic, but are not emitted as fabricated
   Chat tool calls.
 - Responses↔Gemini is incremental for portable text and function-call events.
+- A Responses-compatible provider may omit `name` from
+  `response.function_call_arguments.done` when the surrounding
+  `output_item.added`/`output_item.done` supplies the function identity. The
+  validator accepts that observed shape but still requires a valid referenced
+  function-call lifecycle and validates `name` when it is present.
 - All other cross-protocol streams are buffered up to 32 MiB, validated as a
   terminal native response, and then rendered in the destination protocol.
 - Buffered Gemini stream conversion requires exactly one candidate. Multiple

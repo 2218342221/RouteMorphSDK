@@ -1,0 +1,636 @@
+{
+  "version": 1,
+  "requests": [
+    {
+      "id": "core/text/chat/non_stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "chat",
+      "stream": false,
+      "request": "core/text/chat/non_stream.request.json",
+      "marker": "RM_TEXT_CHAT_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/chat/stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "chat",
+      "stream": true,
+      "request": "core/text/chat/stream.request.json",
+      "marker": "RM_TEXT_CHAT_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/responses/non_stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "responses",
+      "stream": false,
+      "request": "core/text/responses/non_stream.request.json",
+      "marker": "RM_TEXT_RESPONSES_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/responses/stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "responses",
+      "stream": true,
+      "request": "core/text/responses/stream.request.json",
+      "marker": "RM_TEXT_RESPONSES_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/messages/non_stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "messages",
+      "stream": false,
+      "request": "core/text/messages/non_stream.request.json",
+      "marker": "RM_TEXT_MESSAGES_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/messages/stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "messages",
+      "stream": true,
+      "request": "core/text/messages/stream.request.json",
+      "marker": "RM_TEXT_MESSAGES_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/generate_content/non_stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "core/text/generate_content/non_stream.request.json",
+      "marker": "RM_TEXT_GENERATECONTENT_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/text/generate_content/stream",
+      "suite": "core",
+      "capability": "text",
+      "protocol": "generateContent",
+      "stream": true,
+      "request": "core/text/generate_content/stream.request.json",
+      "marker": "RM_TEXT_GENERATECONTENT_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_call/chat/non_stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "chat",
+      "stream": false,
+      "request": "core/tool_call/chat/non_stream.request.json",
+      "marker": "RM_TOOL_CHAT_NON_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/chat/stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "chat",
+      "stream": true,
+      "request": "core/tool_call/chat/stream.request.json",
+      "marker": "RM_TOOL_CHAT_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/responses/non_stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "responses",
+      "stream": false,
+      "request": "core/tool_call/responses/non_stream.request.json",
+      "marker": "RM_TOOL_RESPONSES_NON_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/responses/stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "responses",
+      "stream": true,
+      "request": "core/tool_call/responses/stream.request.json",
+      "marker": "RM_TOOL_RESPONSES_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/messages/non_stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "messages",
+      "stream": false,
+      "request": "core/tool_call/messages/non_stream.request.json",
+      "marker": "RM_TOOL_MESSAGES_NON_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/messages/stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "messages",
+      "stream": true,
+      "request": "core/tool_call/messages/stream.request.json",
+      "marker": "RM_TOOL_MESSAGES_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/generate_content/non_stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "core/tool_call/generate_content/non_stream.request.json",
+      "marker": "RM_TOOL_GENERATECONTENT_NON_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_call/generate_content/stream",
+      "suite": "core",
+      "capability": "tool_call",
+      "protocol": "generateContent",
+      "stream": true,
+      "request": "core/tool_call/generate_content/stream.request.json",
+      "marker": "RM_TOOL_GENERATECONTENT_STREAM",
+      "assertion": "tool_call"
+    },
+    {
+      "id": "core/tool_result/chat/non_stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "chat",
+      "stream": false,
+      "request": "core/tool_result/chat/non_stream.request.json",
+      "marker": "RM_RESULT_CHAT_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/chat/stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "chat",
+      "stream": true,
+      "request": "core/tool_result/chat/stream.request.json",
+      "marker": "RM_RESULT_CHAT_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/responses/non_stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "responses",
+      "stream": false,
+      "request": "core/tool_result/responses/non_stream.request.json",
+      "marker": "RM_RESULT_RESPONSES_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/responses/stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "responses",
+      "stream": true,
+      "request": "core/tool_result/responses/stream.request.json",
+      "marker": "RM_RESULT_RESPONSES_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/messages/non_stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "messages",
+      "stream": false,
+      "request": "core/tool_result/messages/non_stream.request.json",
+      "marker": "RM_RESULT_MESSAGES_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/messages/stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "messages",
+      "stream": true,
+      "request": "core/tool_result/messages/stream.request.json",
+      "marker": "RM_RESULT_MESSAGES_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/generate_content/non_stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "core/tool_result/generate_content/non_stream.request.json",
+      "marker": "RM_RESULT_GENERATECONTENT_NON_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/tool_result/generate_content/stream",
+      "suite": "core",
+      "capability": "tool_result",
+      "protocol": "generateContent",
+      "stream": true,
+      "request": "core/tool_result/generate_content/stream.request.json",
+      "marker": "RM_RESULT_GENERATECONTENT_STREAM",
+      "assertion": "text"
+    },
+    {
+      "id": "core/structured_output/chat/non_stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "chat",
+      "stream": false,
+      "request": "core/structured_output/chat/non_stream.request.json",
+      "marker": "RM_JSON_CHAT_NON_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/chat/stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "chat",
+      "stream": true,
+      "request": "core/structured_output/chat/stream.request.json",
+      "marker": "RM_JSON_CHAT_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/responses/non_stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "responses",
+      "stream": false,
+      "request": "core/structured_output/responses/non_stream.request.json",
+      "marker": "RM_JSON_RESPONSES_NON_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/responses/stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "responses",
+      "stream": true,
+      "request": "core/structured_output/responses/stream.request.json",
+      "marker": "RM_JSON_RESPONSES_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/messages/non_stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "messages",
+      "stream": false,
+      "request": "core/structured_output/messages/non_stream.request.json",
+      "marker": "RM_JSON_MESSAGES_NON_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/messages/stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "messages",
+      "stream": true,
+      "request": "core/structured_output/messages/stream.request.json",
+      "marker": "RM_JSON_MESSAGES_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/generate_content/non_stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "core/structured_output/generate_content/non_stream.request.json",
+      "marker": "RM_JSON_GENERATECONTENT_NON_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "core/structured_output/generate_content/stream",
+      "suite": "core",
+      "capability": "structured_output",
+      "protocol": "generateContent",
+      "stream": true,
+      "request": "core/structured_output/generate_content/stream.request.json",
+      "marker": "RM_JSON_GENERATECONTENT_STREAM",
+      "assertion": "structured_output"
+    },
+    {
+      "id": "extended/conversation/chat/non_stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "chat",
+      "stream": false,
+      "request": "extended/conversation/chat/non_stream.request.json",
+      "marker": "RM_CONVERSATION_CHAT_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/chat/stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "chat",
+      "stream": true,
+      "request": "extended/conversation/chat/stream.request.json",
+      "marker": "RM_CONVERSATION_CHAT_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/responses/non_stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "responses",
+      "stream": false,
+      "request": "extended/conversation/responses/non_stream.request.json",
+      "marker": "RM_CONVERSATION_RESPONSES_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/responses/stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "responses",
+      "stream": true,
+      "request": "extended/conversation/responses/stream.request.json",
+      "marker": "RM_CONVERSATION_RESPONSES_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/messages/non_stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "messages",
+      "stream": false,
+      "request": "extended/conversation/messages/non_stream.request.json",
+      "marker": "RM_CONVERSATION_MESSAGES_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/messages/stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "messages",
+      "stream": true,
+      "request": "extended/conversation/messages/stream.request.json",
+      "marker": "RM_CONVERSATION_MESSAGES_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/generate_content/non_stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "extended/conversation/generate_content/non_stream.request.json",
+      "marker": "RM_CONVERSATION_GENERATE_CONTENT_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/conversation/generate_content/stream",
+      "suite": "extended",
+      "capability": "conversation",
+      "protocol": "generateContent",
+      "stream": true,
+      "request": "extended/conversation/generate_content/stream.request.json",
+      "marker": "RM_CONVERSATION_GENERATE_CONTENT_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/complex_tool_call/chat/non_stream",
+      "suite": "extended",
+      "capability": "complex_tool_call",
+      "protocol": "chat",
+      "stream": false,
+      "request": "extended/complex_tool_call/chat/non_stream.request.json",
+      "marker": "RM_COMPLEX_TOOL_CHAT_NON_STREAM",
+      "assertion": "complex_tool_call"
+    },
+    {
+      "id": "extended/complex_tool_call/responses/non_stream",
+      "suite": "extended",
+      "capability": "complex_tool_call",
+      "protocol": "responses",
+      "stream": false,
+      "request": "extended/complex_tool_call/responses/non_stream.request.json",
+      "marker": "RM_COMPLEX_TOOL_RESPONSES_NON_STREAM",
+      "assertion": "complex_tool_call"
+    },
+    {
+      "id": "extended/complex_tool_call/messages/non_stream",
+      "suite": "extended",
+      "capability": "complex_tool_call",
+      "protocol": "messages",
+      "stream": false,
+      "request": "extended/complex_tool_call/messages/non_stream.request.json",
+      "marker": "RM_COMPLEX_TOOL_MESSAGES_NON_STREAM",
+      "assertion": "complex_tool_call"
+    },
+    {
+      "id": "extended/complex_tool_call/generate_content/non_stream",
+      "suite": "extended",
+      "capability": "complex_tool_call",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "extended/complex_tool_call/generate_content/non_stream.request.json",
+      "marker": "RM_COMPLEX_TOOL_GENERATE_CONTENT_NON_STREAM",
+      "assertion": "complex_tool_call"
+    },
+    {
+      "id": "extended/parallel_tool_result/chat/non_stream",
+      "suite": "extended",
+      "capability": "parallel_tool_result",
+      "protocol": "chat",
+      "stream": false,
+      "request": "extended/parallel_tool_result/chat/non_stream.request.json",
+      "marker": "RM_PARALLEL_RESULT_CHAT_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/parallel_tool_result/responses/non_stream",
+      "suite": "extended",
+      "capability": "parallel_tool_result",
+      "protocol": "responses",
+      "stream": false,
+      "request": "extended/parallel_tool_result/responses/non_stream.request.json",
+      "marker": "RM_PARALLEL_RESULT_RESPONSES_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/parallel_tool_result/messages/non_stream",
+      "suite": "extended",
+      "capability": "parallel_tool_result",
+      "protocol": "messages",
+      "stream": false,
+      "request": "extended/parallel_tool_result/messages/non_stream.request.json",
+      "marker": "RM_PARALLEL_RESULT_MESSAGES_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/parallel_tool_result/generate_content/non_stream",
+      "suite": "extended",
+      "capability": "parallel_tool_result",
+      "protocol": "generateContent",
+      "stream": false,
+      "request": "extended/parallel_tool_result/generate_content/non_stream.request.json",
+      "marker": "RM_PARALLEL_RESULT_GENERATE_CONTENT_NON_STREAM",
+      "assertion": "exact_text"
+    },
+    {
+      "id": "extended/metadata_service_tier/chat/non_stream",
+      "suite": "extended",
+      "capability": "metadata_service_tier",
+      "protocol": "chat",
+      "stream": false,
+      "request": "extended/metadata_service_tier/chat/non_stream.request.json",
+      "marker": "RM_METADATA_TIER_CHAT_NON_STREAM",
+      "assertion": "metadata_service_tier"
+    },
+    {
+      "id": "extended/metadata_service_tier/responses/non_stream",
+      "suite": "extended",
+      "capability": "metadata_service_tier",
+      "protocol": "responses",
+      "stream": false,
+      "request": "extended/metadata_service_tier/responses/non_stream.request.json",
+      "marker": "RM_METADATA_TIER_RESPONSES_NON_STREAM",
+      "assertion": "metadata_service_tier"
+    },
+    {
+      "id": "tools/custom_tool_call/responses_nonstream",
+      "suite": "tools",
+      "capability": "custom_tool_call",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/custom_tool_call/responses_nonstream.request.json",
+      "marker": "RM_CUSTOM_NATIVE_NONSTREAM",
+      "assertion": "custom_tool_call"
+    },
+    {
+      "id": "tools/custom_tool_call/responses_stream",
+      "suite": "tools",
+      "capability": "custom_tool_call",
+      "protocol": "responses",
+      "stream": true,
+      "request": "tools/custom_tool_call/responses_stream.request.json",
+      "marker": "RM_CUSTOM_NATIVE_STREAM",
+      "assertion": "custom_tool_call"
+    },
+    {
+      "id": "tools/custom_tool_call/chat_nonstream",
+      "suite": "tools",
+      "capability": "custom_tool_call",
+      "protocol": "chat",
+      "stream": false,
+      "request": "tools/custom_tool_call/chat_nonstream.request.json",
+      "marker": "RM_CUSTOM_CHAT_NONSTREAM",
+      "assertion": "custom_tool_call"
+    },
+    {
+      "id": "tools/web_search/responses_nonstream",
+      "suite": "tools",
+      "capability": "web_search",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/web_search/responses_nonstream.request.json",
+      "assertion": "web_search"
+    },
+    {
+      "id": "tools/web_search/responses_stream",
+      "suite": "tools",
+      "capability": "web_search",
+      "protocol": "responses",
+      "stream": true,
+      "request": "tools/web_search/responses_stream.request.json",
+      "assertion": "web_search"
+    },
+    {
+      "id": "tools/web_search/chat_nonstream",
+      "suite": "tools",
+      "capability": "web_search",
+      "protocol": "chat",
+      "stream": false,
+      "request": "tools/web_search/chat_nonstream.request.json",
+      "assertion": "web_search"
+    },
+    {
+      "id": "tools/tool_search/server_responses_nonstream",
+      "suite": "tools",
+      "capability": "tool_search",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/tool_search/server_responses_nonstream.request.json",
+      "marker": "RM_TOOL_SEARCH_SERVER_NONSTREAM",
+      "assertion": "server_tool_search"
+    },
+    {
+      "id": "tools/tool_search/server_responses_stream",
+      "suite": "tools",
+      "capability": "tool_search",
+      "protocol": "responses",
+      "stream": true,
+      "request": "tools/tool_search/server_responses_stream.request.json",
+      "marker": "RM_TOOL_SEARCH_SERVER_STREAM",
+      "assertion": "server_tool_search"
+    },
+    {
+      "id": "tools/tool_search/client_responses_turn1",
+      "suite": "tools",
+      "capability": "tool_search",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/tool_search/client_responses_turn1.request.json",
+      "marker": "RM_TOOL_SEARCH_CLIENT_CONTINUATION",
+      "assertion": "client_tool_search_call"
+    },
+    {
+      "id": "tools/tool_search/client_responses_turn2",
+      "suite": "tools",
+      "capability": "tool_search",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/tool_search/client_responses_turn2.request.json",
+      "marker": "RM_TOOL_SEARCH_CLIENT_CONTINUATION",
+      "assertion": "client_tool_search_continuation",
+      "dynamic": [
+        "CLIENT_TOOL_SEARCH_CALL",
+        "CLIENT_TOOL_SEARCH_CALL_ID"
+      ]
+    },
+    {
+      "id": "tools/custom_tool_call_output/responses_nonstream",
+      "suite": "tools",
+      "capability": "custom_tool_call_output",
+      "protocol": "responses",
+      "stream": false,
+      "request": "tools/custom_tool_call_output/responses_nonstream.request.json",
+      "marker": "RM_CUSTOM_OUTPUT_RESPONSES_NONSTREAM",
+      "assertion": "custom_tool_output"
+    },
+    {
+      "id": "tools/custom_tool_call_output/responses_stream",
+      "suite": "tools",
+      "capability": "custom_tool_call_output",
+      "protocol": "responses",
+      "stream": true,
+      "request": "tools/custom_tool_call_output/responses_stream.request.json",
+      "marker": "RM_CUSTOM_OUTPUT_RESPONSES_STREAM",
+      "assertion": "custom_tool_output"
+    },
+    {
+      "id": "tools/custom_tool_call_output/chat_nonstream",
+      "suite": "tools",
+      "capability": "custom_tool_call_output",
+      "protocol": "chat",
+      "stream": false,
+      "request": "tools/custom_tool_call_output/chat_nonstream.request.json",
+      "marker": "RM_CUSTOM_OUTPUT_CHAT_NONSTREAM",
+      "assertion": "custom_tool_output"
+    }
+  ]
+}

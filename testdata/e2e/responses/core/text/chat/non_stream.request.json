@@ -1,0 +1,11 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return exactly the ASCII token RM_TEXT_CHAT_NON_STREAM."
+    }
+  ],
+  "max_completion_tokens": 256,
+  "stream": false
+}

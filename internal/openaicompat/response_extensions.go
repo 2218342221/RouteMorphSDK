@@ -14,6 +14,15 @@ var commonServiceTiers = map[string]struct{}{
 	"auto": {}, "default": {}, "flex": {}, "scale": {}, "priority": {}, "fast": {},
 }
 
+var responsesServiceTiers = func() map[string]struct{} {
+	result := make(map[string]struct{}, len(commonServiceTiers)+1)
+	for tier := range commonServiceTiers {
+		result[tier] = struct{}{}
+	}
+	result["ultrafast"] = struct{}{}
+	return result
+}()
+
 // ValidateChatServiceTier validates a Chat service tier before it is copied to
 // Responses. Every currently documented Chat tier is also valid in Responses.
 func ValidateChatServiceTier(raw json.RawMessage, path string, upstream bool) error {
@@ -31,7 +40,7 @@ func ValidateChatServiceTier(raw json.RawMessage, path string, upstream bool) er
 // rejects the Responses-only ultrafast tier instead of emitting invalid Chat
 // JSON.
 func ValidateResponsesServiceTierForChat(raw json.RawMessage, path string, upstream bool) error {
-	value, present, err := serviceTier(raw, core.ProtocolResponses, path, upstream)
+	value, present, err := responsesServiceTier(raw, path, upstream)
 	if err != nil || !present {
 		return err
 	}
@@ -42,6 +51,51 @@ func ValidateResponsesServiceTierForChat(raw json.RawMessage, path string, upstr
 		return sourceError(core.ProtocolResponses, path, upstream, "unknown service tier %q", value)
 	}
 	return nil
+}
+
+// IsImplicitResponsesServiceTier reports whether a Responses service tier is
+// provider-selected default metadata. These values may appear even when a
+// cross-protocol request did not select a tier, so targets without a service
+// tier field can omit them with a diagnostic instead of failing the response.
+func IsImplicitResponsesServiceTier(raw json.RawMessage, path string, upstream bool) (bool, error) {
+	value, present, err := responsesServiceTier(raw, path, upstream)
+	if err != nil || !present {
+		return false, err
+	}
+	return value == "auto" || value == "default", nil
+}
+
+// MergeResponsesServiceTierForChat validates stream snapshots and permits the
+// documented lifecycle in which an automatic tier selection is resolved to
+// the concrete tier used by the terminal response. Other changes still fail
+// closed as invalid upstream output.
+func MergeResponsesServiceTierForChat(current, next json.RawMessage, path string) (json.RawMessage, error) {
+	if err := ValidateResponsesServiceTierForChat(next, path, true); err != nil {
+		return nil, err
+	}
+	nextValue, nextPresent, err := responsesServiceTier(next, path, true)
+	if err != nil || !nextPresent {
+		return append(json.RawMessage(nil), current...), err
+	}
+	currentValue, currentPresent, err := responsesServiceTier(current, path, true)
+	if err != nil {
+		return nil, err
+	}
+	if !currentPresent || currentValue == nextValue || currentValue == "auto" {
+		return append(json.RawMessage(nil), next...), nil
+	}
+	return nil, sourceError(core.ProtocolResponses, path, true, "changed during stream")
+}
+
+func responsesServiceTier(raw json.RawMessage, path string, upstream bool) (string, bool, error) {
+	value, present, err := serviceTier(raw, core.ProtocolResponses, path, upstream)
+	if err != nil || !present {
+		return value, present, err
+	}
+	if _, ok := responsesServiceTiers[value]; !ok {
+		return "", false, sourceError(core.ProtocolResponses, path, upstream, "unknown service tier %q", value)
+	}
+	return value, true, nil
 }
 
 func serviceTier(raw json.RawMessage, protocol core.Protocol, path string, upstream bool) (string, bool, error) {

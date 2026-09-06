@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	openaicompat "github.com/2218342221/RouteMorphSDK/internal/openaicompat"
 )
 
 type geminiToResponsesConverter struct {
@@ -192,7 +194,7 @@ func (c *geminiToResponsesConverter) ToUpstreamRequest(_ context.Context, input 
 			if len(ordinary) == 0 {
 				return nil
 			}
-			converted, err := encodeResponsesContent(ordinary, true)
+			converted, err := encodeResponsesContent(ordinary, role != "assistant")
 			if err != nil {
 				return err
 			}
@@ -500,6 +502,7 @@ type responsesToGeminiStreamConverter struct {
 	emittedRefusal           string
 	emittedReasoning         map[string]string
 	reportedReasoningSummary bool
+	reportedLosses           map[string]bool
 	completed                bool
 	finalized                bool
 }
@@ -547,7 +550,7 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		if err := c.setBase(response, "$.response"); err != nil {
 			return nil, nil, err
 		}
-		diagnostics, err := responsesResponseExtensionDiagnostics(response, c.LossPolicy, "$.response")
+		diagnostics, err := c.responseExtensionDiagnostics(response, "$.response")
 		return nil, diagnostics, err
 	case "response.output_text.delta":
 		if err := c.validateKnownItem(event.ItemID, "message"); err != nil {
@@ -706,7 +709,7 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 		if err := c.setBase(response, "$.response"); err != nil {
 			return nil, nil, err
 		}
-		extensionDiagnostics, err := responsesResponseExtensionDiagnostics(response, c.LossPolicy, "$.response")
+		extensionDiagnostics, err := c.responseExtensionDiagnostics(response, "$.response")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -739,6 +742,25 @@ func (c *responsesToGeminiStreamConverter) Convert(_ context.Context, frame stre
 	}
 }
 
+func (c *responsesToGeminiStreamConverter) responseExtensionDiagnostics(source responsesResponse, path string) ([]Diagnostic, error) {
+	diagnostics, err := responsesResponseExtensionDiagnostics(source, c.LossPolicy, path)
+	if err != nil {
+		return nil, err
+	}
+	if c.reportedLosses == nil {
+		c.reportedLosses = make(map[string]bool)
+	}
+	filtered := diagnostics[:0]
+	for _, diagnostic := range diagnostics {
+		if c.reportedLosses[diagnostic.Code] {
+			continue
+		}
+		c.reportedLosses[diagnostic.Code] = true
+		filtered = append(filtered, diagnostic)
+	}
+	return filtered, nil
+}
+
 func responsesResponseExtensionDiagnostics(source responsesResponse, policy lossPolicy, path string) ([]Diagnostic, error) {
 	if source.Usage.InputTokens < 0 || source.Usage.OutputTokens < 0 || source.Usage.TotalTokens < 0 || source.Usage.InputTokenDetails.CacheWriteTokens < 0 || source.Usage.InputTokenDetails.CachedTokens < 0 || source.Usage.OutputTokenDetails.ReasoningTokens < 0 {
 		return nil, upstreamResponseError(ProtocolResponses, path+".usage", "token counts must not be negative")
@@ -749,6 +771,18 @@ func responsesResponseExtensionDiagnostics(source responsesResponse, policy loss
 	if source.Usage.OutputTokenDetails.ReasoningTokens > source.Usage.OutputTokens {
 		return nil, upstreamResponseError(ProtocolResponses, path+".usage.output_tokens_details.reasoning_tokens", "reasoning tokens cannot exceed output_tokens")
 	}
+	var diagnostics []Diagnostic
+	serviceTierPresent := jsonValuePresent(source.ServiceTier)
+	if serviceTierPresent {
+		implicit, err := openaicompat.IsImplicitResponsesServiceTier(source.ServiceTier, path+".service_tier", true)
+		if err != nil {
+			return nil, err
+		}
+		if implicit {
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_service_tier_not_representable", path+".service_tier", "provider-selected Responses service tier was omitted from the Gemini response")
+			serviceTierPresent = false
+		}
+	}
 	fields := []struct {
 		path    string
 		code    string
@@ -757,11 +791,10 @@ func responsesResponseExtensionDiagnostics(source responsesResponse, policy loss
 	}{
 		{path + ".metadata", "responses_metadata_not_representable", len(source.Metadata) > 0, "Responses metadata was omitted"},
 		{path + ".moderation", "responses_moderation_not_representable", jsonValuePresent(source.Moderation), "Responses moderation metadata was omitted"},
-		{path + ".service_tier", "responses_service_tier_not_representable", jsonValuePresent(source.ServiceTier), "Responses service tier was omitted"},
+		{path + ".service_tier", "responses_service_tier_not_representable", serviceTierPresent, "Responses service tier was omitted"},
 		{path + ".prompt_cache_options", "responses_prompt_cache_options_not_representable", jsonValuePresent(source.PromptCacheOptions), "Responses prompt cache options were omitted"},
 		{path + ".usage.input_tokens_details.cache_write_tokens", "responses_cache_write_usage_not_representable", source.Usage.InputTokenDetails.CacheWriteTokens != 0, "Responses cache-write token usage was omitted"},
 	}
-	var diagnostics []Diagnostic
 	for _, field := range fields {
 		if !field.present {
 			continue

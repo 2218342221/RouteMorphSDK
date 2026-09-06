@@ -1,0 +1,26 @@
+{
+  "model": "routemorph-live-client",
+  "input": "Use tool search to find record_marker. After the tool definition is supplied, call record_marker with marker RM_TOOL_SEARCH_CLIENT_CONTINUATION. Do not answer with text.",
+  "tools": [
+    {
+      "type": "tool_search",
+      "execution": "client",
+      "description": "Find a tool by its exact name",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "max_output_tokens": 256,
+  "stream": false,
+  "store": false
+}

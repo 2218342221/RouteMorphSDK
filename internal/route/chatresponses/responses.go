@@ -304,11 +304,12 @@ func validateResponsesItems(items []responsesItem, path string) error {
 			if _, err := customInput(item.Input, ProtocolResponses, itemPath+".input"); err != nil {
 				return err
 			}
-			if item.Status != "" {
-				if path == "$.output" {
-					return upstreamResponseError(ProtocolResponses, itemPath+".status", "custom_tool_call has no status field")
+			if path == "$.output" {
+				if item.Status != "" && item.Status != "in_progress" && item.Status != "completed" && item.Status != "incomplete" {
+					return upstreamResponseError(ProtocolResponses, itemPath+".status", "invalid custom_tool_call status %q", item.Status)
 				}
-				return invalid(ProtocolResponses, itemPath+".status", "custom_tool_call has no status field")
+			} else if item.Status != "" {
+				return invalid(ProtocolResponses, itemPath+".status", "custom_tool_call input history has no status field")
 			}
 		case "custom_tool_call_output":
 			if err := validateResponsesItemProvenance(item, itemPath); err != nil {
