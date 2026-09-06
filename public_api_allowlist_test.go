@@ -87,7 +87,7 @@ func TestPublicAPIAllowlist(t *testing.T) {
 		"const ProtocolChat", "const ProtocolGenerateContent", "const ProtocolMessages", "const ProtocolResponses",
 		"const RouteModeBuffered", "const RouteModeIncremental", "const RouteModeNative",
 		"func EncodeError", "func InspectRequest", "func NewAnthropicMessagesAdapter", "func NewGeminiGenerateContentAdapter",
-		"func NewOpenAIChatCompletionsAdapter", "func NewOpenAIResponsesAdapter", "func ParseProtocol", "func WithModel",
+		"func NewOpenAIChatCompletionsAdapter", "func NewOpenAIResponsesAdapter", "func ParseProtocol", "func WithCodingAgentCompatibility", "func WithModel",
 		"func PrepareRequest",
 		"method Adapter.AnthropicMessages", "method Adapter.GeminiGenerateContent", "method Adapter.HTTPClient", "method Adapter.OpenAIChatCompletions", "method Adapter.OpenAIResponses",
 		"method ConversionError.Error", "method ConversionError.Unwrap", "method Protocol.Valid", "method Response.WriteTo", "method ResponseMeta.Diagnostics",

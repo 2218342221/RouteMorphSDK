@@ -13,7 +13,8 @@ type messagesToResponsesConverter struct {
 func (c *messagesToResponsesConverter) Specification() routeSpec { return c.spec }
 
 func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
-	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier"); err != nil {
+	compatible := codingAgentCompatibility(options)
+	if err := rejectUnknownTopLevel(ProtocolMessages, input, "model", "max_tokens", "messages", "system", "tools", "tool_choice", "temperature", "top_k", "top_p", "stop_sequences", "stream", "thinking", "output_config", "metadata", "container", "cache_control", "inference_geo", "service_tier", "context_management"); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateMessagesOutputConfigFields(ProtocolMessages, input); err != nil {
@@ -25,6 +26,11 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 	if err := validateMessagesContentBlockFields(ProtocolMessages, input); err != nil {
 		return conversionResult{}, err
 	}
+	normalized, diagnostics, err := normalizeClaudeCodeRequest(input, options)
+	if err != nil {
+		return conversionResult{}, err
+	}
+	input = normalized
 	var source messagesRequest
 	if err := decodeJSON(ProtocolMessages, input, &source); err != nil {
 		return conversionResult{}, err
@@ -55,8 +61,8 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 			return conversionResult{}, unsupported(ProtocolMessages, path, "field has no semantically equivalent Responses control")
 		}
 	}
-	if source.Thinking != nil && source.Thinking.Type != "disabled" && options.LossPolicy == rejectSemanticLoss {
-		return conversionResult{}, unsupported(ProtocolMessages, "$.thinking", "Messages thinking configuration is not semantically equivalent to Responses reasoning")
+	if err := validateClaudeCodeThinkingCompatibility(source.Thinking, options); err != nil {
+		return conversionResult{}, err
 	}
 	if err := validateMessagesThinkingBudget(source.Thinking, source.MaxTokens, "$.thinking"); err != nil {
 		return conversionResult{}, err
@@ -74,21 +80,18 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 		TopP:            source.TopP,
 		Stream:          resolveExchangeStream(source.Stream, options.Exchange),
 	}
-	safetyID, err := messagesSafetyIdentifier(source.Metadata, "$.metadata")
+	safetyID, safetyDiagnostics, err := normalizedMessagesSafetyIdentifier(source.Metadata, "$.metadata", options)
 	if err != nil {
 		return conversionResult{}, err
 	}
+	diagnostics = append(diagnostics, safetyDiagnostics...)
 	if safetyID != "" {
 		target.SafetyIdentifier = mustJSON(safetyID)
 	}
 	if options.Exchange.UpstreamModel != "" {
 		target.Model = options.Exchange.UpstreamModel
 	}
-	var diagnostics []Diagnostic
 	if source.Thinking != nil && source.Thinking.Type != "disabled" {
-		if options.LossPolicy == rejectSemanticLoss {
-			return conversionResult{}, unsupported(ProtocolMessages, "$.thinking", "Messages thinking configuration is not semantically equivalent to Responses reasoning")
-		}
 		target.Reasoning = &reasoningConfig{Effort: "medium"}
 		diagnostics = appendDiagnostic(diagnostics, "warning", "thinking_policy_approximated", "$.thinking", "Messages thinking policy was approximated as Responses reasoning")
 		if source.Thinking != nil && source.Thinking.Display != "" {
@@ -256,7 +259,10 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 				}
 				consumedCallIDs[block.ToolUseID] = true
 				if block.IsError {
-					return conversionResult{}, unsupported(ProtocolMessages, path+".is_error", "Responses function_call_output cannot preserve the tool error flag")
+					if !compatible {
+						return conversionResult{}, unsupported(ProtocolMessages, path+".is_error", "Responses function_call_output cannot preserve the tool error flag")
+					}
+					diagnostics = appendDiagnostic(diagnostics, "warning", "tool_result_error_state_not_representable", path+".is_error", "Messages tool-result error state was omitted while preserving its content")
 				}
 				parts, err := decodeMessagesContent(block.Content, path+".content")
 				if err != nil {
@@ -287,11 +293,12 @@ func (c *messagesToResponsesConverter) ToUpstreamRequest(_ context.Context, inpu
 }
 
 func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input []byte, options conversionOptions) (conversionResult, error) {
+	compatible := codingAgentCompatibility(options)
 	var source responsesResponse
 	if err := decodeJSON(ProtocolResponses, input, &source); err != nil {
 		return conversionResult{}, err
 	}
-	if err := validateResponsesTerminal(source); err != nil {
+	if err := validateResponsesTerminalForMessages(source, compatible); err != nil {
 		return conversionResult{}, err
 	}
 	if err := validateResponsesOutputItems(ProtocolResponses, input); err != nil {
@@ -347,7 +354,10 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 				diagnostics = appendDiagnostic(diagnostics, "warning", "responses_item_id_not_representable", path+".id", "Messages preserves call_id as tool_use.id but has no separate output item id")
 			}
 		case "reasoning":
-			return conversionResult{}, unsupported(ProtocolResponses, path, "Responses reasoning summary is not equivalent to signed Messages thinking")
+			if !compatible {
+				return conversionResult{}, unsupported(ProtocolResponses, path, "Responses reasoning summary is not equivalent to signed Messages thinking")
+			}
+			diagnostics = appendDiagnostic(diagnostics, "warning", "responses_reasoning_not_representable", path, "Responses reasoning state was omitted from the Messages response")
 		default:
 			return conversionResult{}, unsupported(ProtocolResponses, path+".type", "output item %q cannot be represented by Messages", item.Type)
 		}
@@ -388,16 +398,17 @@ func (c *messagesToResponsesConverter) ToClientResponse(_ context.Context, input
 
 func (c *messagesToResponsesConverter) NewClientStream(_ context.Context, options conversionOptions) (responseStreamConverter, error) {
 	return &responsesToMessagesStreamConverter{
-		clientModel:    options.Exchange.ClientModel,
-		LossPolicy:     options.LossPolicy,
-		openBlocks:     make(map[int]bool),
-		blockIndexes:   make(map[string]int),
-		itemBlocks:     make(map[string][]int),
-		itemTypes:      make(map[string]string),
-		textByBlock:    make(map[int]string),
-		toolArgs:       make(map[string]string),
-		toolIdentities: make(map[string]streamToolIdentity),
-		completedItems: make(map[string]bool),
-		reportedLosses: make(map[string]bool),
+		clientModel:              options.Exchange.ClientModel,
+		LossPolicy:               options.LossPolicy,
+		CodingAgentCompatibility: codingAgentCompatibility(options),
+		openBlocks:               make(map[int]bool),
+		blockIndexes:             make(map[string]int),
+		itemBlocks:               make(map[string][]int),
+		itemTypes:                make(map[string]string),
+		textByBlock:              make(map[int]string),
+		toolArgs:                 make(map[string]string),
+		toolIdentities:           make(map[string]streamToolIdentity),
+		completedItems:           make(map[string]bool),
+		reportedLosses:           make(map[string]bool),
 	}, nil
 }

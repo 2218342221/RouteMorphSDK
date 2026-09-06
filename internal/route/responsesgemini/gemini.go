@@ -202,7 +202,7 @@ func normalizeGeminiToolArguments(protocol Protocol, path string, raw json.RawMe
 	return normalizeArguments(protocol, path, raw)
 }
 
-func validateGeminiPortableRequest(source *geminiRequest) error {
+func validateGeminiPortableRequest(source *geminiRequest, codingAgentCompatible bool) error {
 	if source == nil || len(source.Contents) == 0 {
 		return invalid(ProtocolGenerateContent, "$.contents", "at least one content is required")
 	}
@@ -303,10 +303,10 @@ func validateGeminiPortableRequest(source *geminiRequest) error {
 			seen[name] = struct{}{}
 		}
 	}
-	return validateGeminiPortableGenerationConfig(source.GenerationConfig)
+	return validateGeminiPortableGenerationConfig(source.GenerationConfig, codingAgentCompatible)
 }
 
-func validateGeminiPortableGenerationConfig(config *geminiGenerationConfig) error {
+func validateGeminiPortableGenerationConfig(config *geminiGenerationConfig, codingAgentCompatible bool) error {
 	if config == nil {
 		return nil
 	}
@@ -314,7 +314,7 @@ func validateGeminiPortableGenerationConfig(config *geminiGenerationConfig) erro
 		path string
 		set  bool
 	}{
-		{"$.generationConfig.topK", config.TopK != nil},
+		{"$.generationConfig.topK", config.TopK != nil && !codingAgentCompatible},
 		{"$.generationConfig.candidateCount", config.CandidateCount != nil && *config.CandidateCount != 1},
 		{"$.generationConfig.presencePenalty", config.PresencePenalty != nil},
 		{"$.generationConfig.frequencyPenalty", config.FrequencyPenalty != nil},

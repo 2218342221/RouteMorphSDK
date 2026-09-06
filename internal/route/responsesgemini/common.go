@@ -25,6 +25,12 @@ const (
 
 var ErrInvalidPlan = core.ErrInvalidPlan
 
+func codingAgentCompatibility(options conversionOptions) bool {
+	// Preserve the internal all-loss characterization mode while allowing the
+	// public adapter to select only the coding-agent compatibility profile.
+	return options.CodingAgentCompatibility || options.LossPolicy != rejectSemanticLoss
+}
+
 func New(spec core.RouteSpec) core.Route {
 	switch {
 	case spec.From == core.ProtocolResponses && spec.To == core.ProtocolGenerateContent:

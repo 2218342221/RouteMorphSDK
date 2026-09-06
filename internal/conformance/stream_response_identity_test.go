@@ -10,6 +10,34 @@ import (
 
 const responsesIdentityCreated = `{"type":"response.created","response":{"id":"resp_1","model":"provider-a","status":"in_progress","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`
 
+func TestResponsesSourceStreamsTreatCancelledAsUpstreamFailure(t *testing.T) {
+	targets := []struct {
+		name      string
+		converter routeConverter
+	}{
+		{"chat", newChatResponsesRoute(routeSpec{From: ProtocolChat, To: ProtocolResponses})},
+		{"gemini", newResponsesGeminiRoute(routeSpec{From: ProtocolGenerateContent, To: ProtocolResponses})},
+		{"messages", newResponsesMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolResponses})},
+	}
+	cancelled := streamFrame{
+		Event: "response.cancelled",
+		Data:  []byte(`{"type":"response.cancelled","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider-a","status":"cancelled","error":{"code":"cancelled","message":"provider cancelled generation"},"output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}`),
+	}
+
+	for _, target := range targets {
+		t.Run(target.name, func(t *testing.T) {
+			stream, err := target.converter.NewClientStream(context.Background(), conversionOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = stream.Convert(context.Background(), cancelled)
+			if !errors.Is(err, ErrUpstreamResponse) || !strings.Contains(err.Error(), "provider cancelled generation") {
+				t.Fatalf("error = %v, want provider cancellation as ErrUpstreamResponse", err)
+			}
+		})
+	}
+}
+
 func TestResponsesSourceStreamsRejectResponseIdentityChanges(t *testing.T) {
 	targets := []struct {
 		name      string

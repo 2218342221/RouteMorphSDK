@@ -60,7 +60,8 @@ small:
   `*http.Client`;
 - `Request`, `Response`, `ResponseMeta` and `Diagnostic`;
 - `InspectRequest`, `PrepareRequest` and `EncodeError`;
-- `WithModel` and the documented error categories.
+- `WithModel`, the explicit `WithCodingAgentCompatibility` policy, and the
+  documented error categories.
 
 `Request` and `Response` are owned by the public package rather than aliases of
 internal relay types. That keeps the API contract stable while transport and

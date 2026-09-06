@@ -416,6 +416,19 @@ func validateResponsesItems(items []responsesItem, path string) error {
 	return nil
 }
 
+func validateResponsesItemsForMessages(items []responsesItem, path string, compatible bool) error {
+	if !compatible {
+		return validateResponsesItems(items, path)
+	}
+	normalized := append([]responsesItem(nil), items...)
+	for index := range normalized {
+		if normalized[index].Type == "reasoning" {
+			normalized[index].EncryptedContent = nil
+		}
+	}
+	return validateResponsesItems(normalized, path)
+}
+
 func validateResponsesMessageContent(raw json.RawMessage, path string, input bool, role string) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		if input {
@@ -519,4 +532,18 @@ func validateResponsesTerminal(source responsesResponse) error {
 		}
 	}
 	return validateResponsesItems(source.Output, "$.output")
+}
+
+func validateResponsesTerminalForMessages(source responsesResponse, compatible bool) error {
+	if !compatible {
+		return validateResponsesTerminal(source)
+	}
+	normalized := source
+	normalized.Output = append([]responsesItem(nil), source.Output...)
+	for index := range normalized.Output {
+		if normalized.Output[index].Type == "reasoning" {
+			normalized.Output[index].EncryptedContent = nil
+		}
+	}
+	return validateResponsesTerminal(normalized)
 }

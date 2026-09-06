@@ -7,25 +7,26 @@ import (
 )
 
 type responsesToMessagesStreamConverter struct {
-	id             string
-	model          string
-	providerModel  string
-	clientModel    string
-	LossPolicy     lossPolicy
-	openBlocks     map[int]bool
-	blockIndexes   map[string]int
-	itemBlocks     map[string][]int
-	itemTypes      map[string]string
-	textByBlock    map[int]string
-	toolArgs       map[string]string
-	toolIdentities map[string]streamToolIdentity
-	completedItems map[string]bool
-	nextBlock      int
-	started        bool
-	identityKnown  bool
-	completed      bool
-	finalized      bool
-	reportedLosses map[string]bool
+	id                       string
+	model                    string
+	providerModel            string
+	clientModel              string
+	LossPolicy               lossPolicy
+	CodingAgentCompatibility bool
+	openBlocks               map[int]bool
+	blockIndexes             map[string]int
+	itemBlocks               map[string][]int
+	itemTypes                map[string]string
+	textByBlock              map[int]string
+	toolArgs                 map[string]string
+	toolIdentities           map[string]streamToolIdentity
+	completedItems           map[string]bool
+	nextBlock                int
+	started                  bool
+	identityKnown            bool
+	completed                bool
+	finalized                bool
+	reportedLosses           map[string]bool
 }
 
 type streamToolIdentity struct {
@@ -111,8 +112,12 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if _, exists := c.itemTypes[event.Item.ID]; exists {
 			return nil, nil, invalid(ProtocolResponses, "$.item.id", "duplicate output item id %q", event.Item.ID)
 		}
-		if err := validateResponsesItems([]responsesItem{event.Item}, "$.output"); err != nil {
+		if err := validateResponsesItemsForMessages([]responsesItem{event.Item}, "$.output", c.CodingAgentCompatibility); err != nil {
 			return nil, nil, err
+		}
+		if event.Item.Type == "reasoning" && c.CodingAgentCompatibility {
+			c.itemTypes[event.Item.ID] = event.Item.Type
+			return startFrames, append(startDiagnostics, c.reasoningOmittedDiagnostic("$.item")...), nil
 		}
 		if event.Item.Type != "message" && event.Item.Type != "function_call" {
 			return nil, nil, unsupported(ProtocolResponses, "$.item.type", "output item %q cannot stream to Messages", event.Item.Type)
@@ -136,9 +141,23 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		if event.ItemID == "" {
 			return nil, nil, invalid(ProtocolResponses, "$.item_id", "content part item id is required")
 		}
-		if itemType, ok := c.itemTypes[event.ItemID]; ok && itemType != "message" {
+		itemType, itemKnown := c.itemTypes[event.ItemID]
+		if itemKnown && itemType == "reasoning" && c.CodingAgentCompatibility {
+			var part responsesContentPart
+			if err := json.Unmarshal(event.Part, &part); err != nil {
+				return nil, nil, invalid(ProtocolResponses, "$.part", "invalid reasoning content part")
+			}
+			if part.Type != "reasoning_text" {
+				return nil, nil, unsupported(ProtocolResponses, "$.part.type", "reasoning item content part %q is not supported", part.Type)
+			}
+			if _, err := decodeResponsesContent([]responsesContentPart{part}, "$.part", false); err != nil {
+				return nil, nil, err
+			}
+			return startFrames, append(startDiagnostics, c.reasoningOmittedDiagnostic("$.part")...), nil
+		}
+		if itemKnown && itemType != "message" {
 			return nil, nil, invalid(ProtocolResponses, "$.item_id", "content part belongs to non-message output item %q", event.ItemID)
-		} else if !ok {
+		} else if !itemKnown {
 			// A few Responses-compatible providers omit output_item.added for
 			// message items. The content_part event still identifies its item
 			// unambiguously, so accept that narrow lifecycle omission.
@@ -227,6 +246,19 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		c.toolArgs[itemID] += suffix
 		return []streamFrame{{Event: "content_block_delta", Data: mustJSON(map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": suffix}})}}, nil, nil
 	case "response.content_part.done":
+		if itemType, ok := c.itemTypes[event.ItemID]; ok && itemType == "reasoning" && c.CodingAgentCompatibility {
+			var part responsesContentPart
+			if err := json.Unmarshal(event.Part, &part); err != nil {
+				return nil, nil, invalid(ProtocolResponses, "$.part", "invalid reasoning content part")
+			}
+			if part.Type != "reasoning_text" {
+				return nil, nil, unsupported(ProtocolResponses, "$.part.type", "reasoning item content part %q is not supported", part.Type)
+			}
+			if _, err := decodeResponsesContent([]responsesContentPart{part}, "$.part", false); err != nil {
+				return nil, nil, err
+			}
+			return nil, c.reasoningOmittedDiagnostic("$.part"), nil
+		}
 		index, ok := c.blockIndexes[streamBlockKey(event.ItemID, event.ContentIndex)]
 		if !ok || !c.openBlocks[index] {
 			return nil, nil, nil
@@ -245,10 +277,10 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 			return nil, nil, invalid(ProtocolResponses, "$.item.id", "duplicate output item completion for %q", itemID)
 		}
 		knownType, known := c.itemTypes[itemID]
-		if !known && event.Item.Type != "function_call" {
+		if !known && event.Item.Type != "function_call" && !(event.Item.Type == "reasoning" && c.CodingAgentCompatibility) {
 			return nil, nil, invalid(ProtocolResponses, "$.item_id", "output item done before output item added")
 		}
-		if err := validateResponsesItems([]responsesItem{event.Item}, "$.output"); err != nil {
+		if err := validateResponsesItemsForMessages([]responsesItem{event.Item}, "$.output", c.CodingAgentCompatibility); err != nil {
 			return nil, nil, err
 		}
 		if event.Item.Type == "function_call" && event.Item.Status != "completed" {
@@ -256,6 +288,11 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		}
 		if known && event.Item.Type != knownType {
 			return nil, nil, invalid(ProtocolResponses, "$.item.type", "output item identity changed from type %q to %q", knownType, event.Item.Type)
+		}
+		if event.Item.Type == "reasoning" && c.CodingAgentCompatibility {
+			c.itemTypes[itemID] = event.Item.Type
+			c.completedItems[itemID] = true
+			return nil, c.reasoningOmittedDiagnostic("$.item"), nil
 		}
 		if event.Item.Type == "function_call" {
 			if err := c.validateToolIdentity(event.Item, "$.item"); err != nil {
@@ -311,12 +348,12 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		}
 		c.completedItems[itemID] = true
 		return frames, nil, nil
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
 		var response responsesResponse
 		if err := json.Unmarshal(event.Response, &response); err != nil {
 			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid terminal response")
 		}
-		if err := validateResponsesTerminal(response); err != nil {
+		if err := validateResponsesTerminalForMessages(response, c.CodingAgentCompatibility); err != nil {
 			return nil, nil, err
 		}
 		diagnostics, err := c.responseExtensionDiagnostics(response, "$.response")
@@ -343,6 +380,10 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		}
 		for index, item := range response.Output {
 			path := fmt.Sprintf("$.response.output[%d]", index)
+			if item.Type == "reasoning" && c.CodingAgentCompatibility {
+				diagnostics = append(diagnostics, c.reasoningOmittedDiagnostic(path)...)
+				continue
+			}
 			if item.Type != "message" && item.Type != "function_call" {
 				return nil, nil, unsupported(ProtocolResponses, path+".type", "output item %q cannot stream to Messages", item.Type)
 			}
@@ -385,11 +426,48 @@ func (c *responsesToMessagesStreamConverter) Convert(_ context.Context, frame st
 		return frames, diagnostics, nil
 	case "response.queued", "response.in_progress", "response.output_text.done", "response.refusal.done":
 		return nil, nil, nil
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done",
+		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
+		"response.reasoning_text.delta", "response.reasoning_text.done":
+		if !c.CodingAgentCompatibility {
+			return nil, nil, unsupported(ProtocolResponses, "$.type", "stream event %q cannot stream to Messages", event.Type)
+		}
+		if err := c.validateKnownItem(event.ItemID, "reasoning"); err != nil {
+			return nil, nil, err
+		}
+		return nil, c.reasoningOmittedDiagnostic("$.type"), nil
 	case "error":
 		return nil, nil, upstreamResponseError(ProtocolResponses, "$", "Responses stream returned an error event")
 	default:
 		return nil, nil, unsupported(ProtocolResponses, "$.type", "stream event %q is not supported", event.Type)
 	}
+}
+
+func (c *responsesToMessagesStreamConverter) validateKnownItem(itemID, wantType string) error {
+	if itemID == "" {
+		return invalid(ProtocolResponses, "$.item_id", "item id is required")
+	}
+	itemType, ok := c.itemTypes[itemID]
+	if !ok {
+		return invalid(ProtocolResponses, "$.item_id", "event refers to unknown output item %q", itemID)
+	}
+	if itemType != wantType {
+		return invalid(ProtocolResponses, "$.item_id", "event for %s item refers to %s item %q", wantType, itemType, itemID)
+	}
+	return nil
+}
+
+func (c *responsesToMessagesStreamConverter) reasoningOmittedDiagnostic(path string) []Diagnostic {
+	if c.reportedLosses["responses_reasoning_not_representable"] {
+		return nil
+	}
+	c.reportedLosses["responses_reasoning_not_representable"] = true
+	return []Diagnostic{{
+		Severity: "warning",
+		Code:     "responses_reasoning_not_representable",
+		Path:     path,
+		Message:  "Responses reasoning state was omitted from the Messages stream",
+	}}
 }
 
 func (c *responsesToMessagesStreamConverter) validateToolIdentity(item responsesItem, path string) error {

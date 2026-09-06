@@ -6,8 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
-	"reflect"
 	"strings"
 
 	core "github.com/2218342221/RouteMorphSDK/internal/core"
@@ -228,6 +228,8 @@ type nativeStreamValidator struct {
 	geminiSawCandidate bool
 
 	responsesCreated      bool
+	responsesID           string
+	responsesModel        string
 	responsesNextSequence int64
 	responsesItems        map[int]*nativeResponsesItemState
 	responsesItemIDs      map[string]int
@@ -381,6 +383,22 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 	if err := decodeKnownNativeFields(v.protocol, frame.Data, &event); err != nil {
 		return err
 	}
+	var responseID, responseModel string
+	if responsesEventCarriesResponseEnvelope(eventType) && rawJSONPresent(event.Response) {
+		var response nativeResponsesResponse
+		if err := json.Unmarshal(event.Response, &response); err != nil {
+			return core.Invalid(v.protocol, "$.response", "invalid response object")
+		}
+		responseID, responseModel = response.ID, response.Model
+		if eventType != "response.created" {
+			if v.responsesID != "" && response.ID != "" && response.ID != v.responsesID {
+				return core.Invalid(v.protocol, "$.response.id", "response id %q does not match created id %q", response.ID, v.responsesID)
+			}
+			if v.responsesModel != "" && response.Model != "" && response.Model != v.responsesModel {
+				return core.Invalid(v.protocol, "$.response.model", "response model %q does not match created model %q", response.Model, v.responsesModel)
+			}
+		}
+	}
 	if event.SequenceNumber == nil {
 		return core.Invalid(v.protocol, "$.sequence_number", "stream event sequence number is required")
 	}
@@ -431,24 +449,27 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 			if err := v.validateResponsesTerminalOutput(raw); err != nil {
 				return err
 			}
-		} else {
-			var terminalObject map[string]json.RawMessage
-			if err := json.Unmarshal(raw, &terminalObject); err != nil || !rawJSONArray(terminalObject["output"]) {
-				return core.Invalid(v.protocol, "$.response.output", "terminal response output array is required")
-			}
 		}
 		v.sawTerminal = true
 		v.responsesNextSequence++
-		if eventType == "response.failed" || eventType == "response.cancelled" {
-			return core.UpstreamResponseError(v.protocol, "$", "Responses stream returned %q", eventType)
-		}
 		return nil
 	}
 	if eventType == "response.created" {
 		v.responsesCreated = true
+		v.responsesID = responseID
+		v.responsesModel = responseModel
 	}
 	v.responsesNextSequence++
 	return nil
+}
+
+func responsesEventCarriesResponseEnvelope(eventType string) bool {
+	switch eventType {
+	case "response.created", "response.queued", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 func (v *nativeStreamValidator) validateResponsesLifecycleEvent(eventType string, event *nativeResponsesEvent) error {
@@ -633,14 +654,60 @@ func (v *nativeStreamValidator) validateResponsesTerminalOutput(raw json.RawMess
 		if identity.id != streamed.id || identity.itemType != streamed.itemType {
 			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d identity %q/%q does not match streamed item %q/%q", index, identity.id, identity.itemType, streamed.id, streamed.itemType)
 		}
-		if !responsesJSONEqual(rawItem, streamed.doneItem) {
-			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d does not match its output_item.done payload", index)
+		if difference := responsesItemDifference(rawItem, streamed.doneItem, streamed.itemType); difference != "" {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d does not match its output_item.done payload: %s", index, difference)
 		}
 	}
 	return nil
 }
 
-func responsesJSONEqual(left, right json.RawMessage) bool {
+// responsesItemDifference verifies that terminal contains every value emitted
+// by response.output_item.done. New top-level provider extensions, message
+// phase, and output-text logprobs are allowed; other nested or known fields
+// cannot first appear in the terminal snapshot. Existing values, array lengths,
+// and array order remain immutable. A reasoning ciphertext is the sole value
+// exception: the provider may refresh that opaque state between snapshots.
+func responsesItemDifference(terminal, done json.RawMessage, itemType string) string {
+	allowChange := func(path string, terminalValue, doneValue any) bool {
+		if itemType != "reasoning" || path != "$.encrypted_content" {
+			return false
+		}
+		_, terminalIsString := terminalValue.(string)
+		_, doneIsString := doneValue.(string)
+		return terminalIsString && doneIsString
+	}
+	allowAddition := func(parentPath, field, path string, parent map[string]any, _ any) bool {
+		if itemType == "message" && (path == "$.phase" || responsesOutputTextLogprobsPath(path)) {
+			if path == "$.phase" {
+				return true
+			}
+			partType, _ := parent["type"].(string)
+			return partType == "output_text"
+		}
+		return parentPath == "$" && !knownResponsesOutputItemField(field)
+	}
+	return responsesJSONDifferenceAllowing(terminal, done, allowChange, allowAddition)
+}
+
+func responsesOutputTextLogprobsPath(path string) bool {
+	const prefix = "$.content["
+	const suffix = "].logprobs"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	index := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if index == "" {
+		return false
+	}
+	for _, character := range index {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func responsesJSONDifferenceAllowing(terminal, done json.RawMessage, allowChange func(string, any, any) bool, allowAddition func(string, string, string, map[string]any, any) bool) string {
 	decode := func(raw json.RawMessage) (any, bool) {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.UseNumber()
@@ -650,9 +717,85 @@ func responsesJSONEqual(left, right json.RawMessage) bool {
 		}
 		return value, true
 	}
-	leftValue, leftOK := decode(left)
-	rightValue, rightOK := decode(right)
-	return leftOK && rightOK && reflect.DeepEqual(leftValue, rightValue)
+	terminalValue, terminalOK := decode(terminal)
+	doneValue, doneOK := decode(done)
+	if !terminalOK || !doneOK {
+		return "$ contains invalid JSON"
+	}
+	return responsesValueDifference(terminalValue, doneValue, "$", allowChange, allowAddition)
+}
+
+func responsesValueDifference(terminal, done any, path string, allowChange func(string, any, any) bool, allowAddition func(string, string, string, map[string]any, any) bool) string {
+	if allowChange != nil && allowChange(path, terminal, done) {
+		return ""
+	}
+	switch doneValue := done.(type) {
+	case map[string]any:
+		terminalValue, ok := terminal.(map[string]any)
+		if !ok {
+			return path + " changed type"
+		}
+		for key, expected := range doneValue {
+			actual, exists := terminalValue[key]
+			childPath := path + "." + key
+			if !exists {
+				return childPath + " is absent"
+			}
+			if difference := responsesValueDifference(actual, expected, childPath, allowChange, allowAddition); difference != "" {
+				return difference
+			}
+		}
+		for key, actual := range terminalValue {
+			if _, exists := doneValue[key]; exists {
+				continue
+			}
+			childPath := path + "." + key
+			if allowAddition != nil && allowAddition(path, key, childPath, terminalValue, actual) {
+				continue
+			}
+			return childPath + " was added after output_item.done"
+		}
+		return ""
+	case []any:
+		terminalValue, ok := terminal.([]any)
+		if !ok {
+			return path + " changed type"
+		}
+		if len(terminalValue) != len(doneValue) {
+			return path + " changed length"
+		}
+		for index := range doneValue {
+			childPath := fmt.Sprintf("%s[%d]", path, index)
+			if difference := responsesValueDifference(terminalValue[index], doneValue[index], childPath, allowChange, allowAddition); difference != "" {
+				return difference
+			}
+		}
+		return ""
+	default:
+		if terminal != done {
+			return fmt.Sprintf("%s changed value (%s to %s)", path, responsesJSONType(done), responsesJSONType(terminal))
+		}
+		return ""
+	}
+}
+
+func responsesJSONType(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case json.Number:
+		return "number"
+	case bool:
+		return "boolean"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	default:
+		return "unknown"
+	}
 }
 
 type responsesItemIdentity struct {

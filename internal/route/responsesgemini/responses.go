@@ -385,6 +385,19 @@ func validateResponsesItems(items []responsesItem, path string) error {
 	return nil
 }
 
+func validateResponsesItemsForGemini(items []responsesItem, path string, codingAgentCompatible bool) error {
+	if !codingAgentCompatible {
+		return validateResponsesItems(items, path)
+	}
+	normalized := append([]responsesItem(nil), items...)
+	for index := range normalized {
+		if normalized[index].Type == "reasoning" {
+			normalized[index].EncryptedContent = nil
+		}
+	}
+	return validateResponsesItems(normalized, path)
+}
+
 func validateResponsesMessageContent(raw json.RawMessage, path string, input bool, role string) error {
 	if len(raw) == 0 || string(raw) == "null" {
 		if input {
@@ -510,4 +523,18 @@ func validateResponsesTerminal(source responsesResponse) error {
 		}
 	}
 	return validateResponsesItems(source.Output, "$.output")
+}
+
+func validateResponsesTerminalForGemini(source responsesResponse, codingAgentCompatible bool) error {
+	if !codingAgentCompatible {
+		return validateResponsesTerminal(source)
+	}
+	normalized := source
+	normalized.Output = append([]responsesItem(nil), source.Output...)
+	for index := range normalized.Output {
+		if normalized.Output[index].Type == "reasoning" {
+			normalized.Output[index].EncryptedContent = nil
+		}
+	}
+	return validateResponsesTerminal(normalized)
 }

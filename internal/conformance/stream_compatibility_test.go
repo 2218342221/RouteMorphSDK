@@ -224,7 +224,6 @@ func TestResponsesClientStreamsFailClosedForUnsupportedEvents(t *testing.T) {
 	}{
 		{"unknown", streamFrame{Event: "response.future.delta", Data: []byte(`{"type":"response.future.delta","delta":"secret"}`)}},
 		{"legacy done", streamFrame{Event: "response.done", Data: []byte(`{"type":"response.done"}`)}},
-		{"legacy cancelled", streamFrame{Event: "response.cancelled", Data: []byte(`{"type":"response.cancelled"}`)}},
 		{"hosted tool", streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fs_1","type":"file_search_call","status":"in_progress"}}`)}},
 		{"audio delta", streamFrame{Event: "response.audio.delta", Data: []byte(`{"type":"response.audio.delta","delta":"AA=="}`)}},
 	}

@@ -244,7 +244,7 @@ func (c *responsesToChatStreamConverter) Convert(_ context.Context, frame stream
 		return nil, nil, nil
 	case "response.queued", "response.in_progress":
 		return nil, nil, nil
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
 		var response responsesResponse
 		if err := json.Unmarshal(event.Response, &response); err != nil {
 			return nil, nil, invalid(ProtocolResponses, "$.response", "invalid terminal response object")

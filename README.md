@@ -45,7 +45,8 @@ The public API is intentionally small:
 - `InspectRequest` and `PrepareRequest` expose the model and streaming flag for
   provider selection without exposing internal protocol DTOs;
 - `EncodeError` creates an ingress-native error envelope;
-- `WithModel` is the only constructor option;
+- `WithModel` fixes the upstream model and `WithCodingAgentCompatibility`
+  explicitly enables documented coding-client approximations;
 - typed error categories, `ConversionError` and `ResponseMeta.Diagnostics()`
   expose failures and non-fatal approximations.
 
@@ -206,10 +207,9 @@ still match. If the caller changes the request, the adapter performs normal
 validation again. Prepared metadata is an optimization, not an authentication
 token.
 
-## Model override
+## Adapter options
 
-`Option` is reserved for constructor-level behavior. `WithModel` is the only
-supported option in this release:
+`WithModel` replaces the client model on the upstream request:
 
 ```go
 adapter, err := routemorph.NewAnthropicMessagesAdapter(
@@ -222,6 +222,27 @@ adapter, err := routemorph.NewAnthropicMessagesAdapter(
 The configured model replaces the client model on the upstream request. Model
 fields in upstream responses and stream events are restored to the original
 client model. If `WithModel` is repeated, the last value wins.
+
+Strict, fail-closed conversion is the default. Claude Code and Gemini CLI add
+provider-specific cache, thinking, and replay controls that have no exact
+Responses equivalent. Enable their narrowly validated, diagnostic-producing
+compatibility path explicitly:
+
+```go
+adapter, err := routemorph.NewOpenAIResponsesAdapter(
+    baseURL,
+    apiKey,
+    routemorph.WithModel("gpt-5.4"),
+    routemorph.WithCodingAgentCompatibility(),
+)
+```
+
+The option does not accept arbitrary provider state. For example, only
+Claude's no-op `clear_thinking_20251015` with `keep:"all"`, exact ephemeral
+cache markers, and its captured `enabled`/`adaptive` thinking shapes with
+omitted display, plus Gemini CLI's exact documented
+`skip_thought_signature_validator` sentinel receive compatibility handling.
+Every approximation is available from `Response.Meta.Diagnostics()`.
 
 ## Response and errors
 
@@ -251,8 +272,10 @@ type Response struct {
 - `Response.Meta.Diagnostics()` is concurrency-safe. Stream diagnostics are
   complete after Body reaches EOF.
 
-Cross-protocol conversion rejects unsupported semantic loss. Native requests
-remain pass-through unless `WithModel` requires model rewriting.
+Cross-protocol conversion rejects unsupported semantic loss by default.
+`WithCodingAgentCompatibility` enables only documented approximations and
+reports each one through diagnostics. Native requests remain pass-through
+unless `WithModel` requires model rewriting.
 
 ## Route matrix: 12 + 4
 
@@ -362,6 +385,8 @@ go run ./examples/direct-call
 UPSTREAM_PROTOCOL=responses \
 UPSTREAM_BASE_URL=https://api.openai.com/v1 \
 UPSTREAM_API_KEY="$OPENAI_API_KEY" \
+UPSTREAM_MODEL=gpt-5.4 \
+CODING_AGENT_COMPATIBILITY=true \
 go run ./examples/minimal-gateway
 
 # The provider SDK examples are an independent module.
@@ -375,7 +400,8 @@ go run ./openai
 
 The direct example accepts `OPENAI_BASE_URL`. The gateway accepts
 `UPSTREAM_PROTOCOL`, `UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`, `LISTEN_ADDR`, and
-optional `UPSTREAM_MODEL`; see its directory README for details.
+optional `UPSTREAM_MODEL` and `CODING_AGENT_COMPATIBILITY`; see its directory
+README for details.
 The provider SDK examples use the same `UPSTREAM_*` settings and additionally
 accept `CLIENT_MODEL`; see their README for supported SDK operations and
 credential behavior.
@@ -398,6 +424,7 @@ make test-live-responses-core      # 32 HTTP calls
 make test-live-responses-extended  # 18 HTTP calls
 make test-live-responses-tools     # 13 HTTP calls in 12 logical cases
 make test-live-responses           # all 63 HTTP calls
+make test-live-coding-agents       # installed Claude/Gemini/Codex, 9 cases (3 each)
 ```
 
 The request files use a fixed client-side model alias and contain no provider

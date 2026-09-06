@@ -5,6 +5,14 @@ The deterministic test suite uses local HTTP fixtures and runs with
 real OpenAI Responses-compatible endpoint. It is billable and never runs as
 part of the default test or CI targets.
 
+An additional opt-in executable-client suite starts an in-process RouteMorph
+gateway and invokes the installed Claude Code, Gemini CLI, and Codex binaries.
+Each client runs bounded exact-output text, successful filesystem-tool, and
+failed filesystem-tool recovery cases against the configured Responses model. All
+three binaries and Linux `bwrap` are required; the target fails rather than
+silently skipping a missing client. Each tool case must make at least two
+gateway requests and contain a correlated tool call and result.
+
 The live catalog contains 63 independently maintained request files under
 `testdata/e2e/responses`, split into core (32), extended (18), and tools (13).
 Each `*.request.json` file is one complete client request and maps to exactly
@@ -148,6 +156,37 @@ Repository-local fixtures provide the following deterministic coverage:
   lifecycles, terminal reconciliation, malformed forms, and byte-preserving
   native relay.
 
+Coding-agent-specific deterministic tests additionally cover the captured
+Claude Code and Gemini CLI wire shapes, strict-versus-compatible behavior,
+cache/thinking/context handling, long identifier pseudonymization, synthetic
+thought-signature handling, tool-error continuations, Responses reasoning
+output, and native Responses terminal enrichment/failure forwarding.
+
+## Executable CLI regression
+
+Set the same live provider variables used by the fixture suite, install the
+three clients, and run:
+
+```bash
+make test-live-coding-agents
+```
+
+The test sends real requests through `claude`, `gemini`, and `codex`, but gives
+the child processes loopback gateway URLs and placeholder credentials. On
+Linux, `bwrap` overlays the user's home directory with an empty per-case state
+directory while leaving the `HOME` environment value unchanged; only that
+state directory and the temporary fixture workspace are writable. Gemini
+extensions, MCP servers, context files, hooks, telemetry, and non-`read_file`
+core tools are disabled. The real provider URL, API key, and optional routing
+header remain inside the Go test process. The suite parses each client request
+and correlates tool call IDs with success/error results before accepting the
+exact final marker.
+
+This is configuration and write isolation, not a complete security sandbox:
+the host filesystem outside the overlaid home is read-only but visible, and
+the clients retain network access. Run billable executable-client tests on a
+disposable host or container when the installed clients are not fully trusted.
+
 The live suite complements rather than replaces deterministic tests. Invalid
 payloads, unsupported fields, error envelopes, cancellation, size limits,
 headers, trailers, malformed streams, and fuzzing stay in the local suite so a
@@ -159,6 +198,10 @@ The current expanded catalog is recorded in the
 all 63 requests passed in one complete live run. The earlier
 [2026-09-05 report](test-reports/2026-09-05-gpt-5.4-responses.md) is retained as
 historical evidence for the preceding 38-call revision.
+
+The installed-client matrix, compatibility-profile changes, exact tool-loop
+evidence, and current limitations are recorded in the
+[2026-09-06 gpt-5.4 coding-agent report](test-reports/2026-09-06-gpt-5.4-coding-agents.md).
 
 ## Running
 
@@ -175,6 +218,7 @@ make test-live-responses-core                # 32 HTTP calls
 make test-live-responses-extended            # 18 HTTP calls
 make test-live-responses-tools               # 13 HTTP calls
 make test-live-responses                      # combined: 63 HTTP calls
+make test-live-coding-agents                  # 3 CLIs x 3 scenarios
 ```
 
 The explicit `integration` build tag and `ROUTEMORPH_LIVE_RESPONSES=1` guard
@@ -182,10 +226,13 @@ prevent accidental provider calls. All four Make targets set the guard after
 checking that the base URL and key are present. `test-live-responses-core` runs
 only the four core matrix tests, `test-live-responses-extended` runs the extended
 integration matrix, `test-live-responses-tools` runs the three tool integration
-tests, and `test-live-responses` runs all three groups. The test client performs
-no automatic retries and applies a three-minute context deadline to each call.
-Every target uses `-failfast` to stop after the first failure. The base URL must
-use HTTPS and cannot contain user info, a query, or a fragment.
+tests, and `test-live-responses` runs all three groups. The coding-agent target
+sets its separate `ROUTEMORPH_LIVE_CLI=1` guard and runs installed client
+binaries through an in-process loopback gateway; missing clients or `bwrap`
+fail the target. The fixture test client
+performs no automatic retries and applies a three-minute context deadline to
+each call. The base URL must use HTTPS and cannot contain user info, a query,
+or a fragment.
 
 `make check` compiles and vets the integration-tagged test without selecting
 any live test, so ordinary CI detects source drift without making provider

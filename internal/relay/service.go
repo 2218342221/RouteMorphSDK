@@ -22,23 +22,25 @@ type Doer interface {
 }
 
 type Config struct {
-	Upstream     core.Protocol
-	BaseURL      *url.URL
-	APIKey       string
-	Model        string
-	Client       Doer
-	Catalog      core.Catalog
-	MaxBodyBytes int64
+	Upstream                 core.Protocol
+	BaseURL                  *url.URL
+	APIKey                   string
+	Model                    string
+	Client                   Doer
+	Catalog                  core.Catalog
+	MaxBodyBytes             int64
+	CodingAgentCompatibility bool
 }
 
 type Service struct {
-	upstream     core.Protocol
-	baseURL      *url.URL
-	apiKey       string
-	model        string
-	client       Doer
-	catalog      core.Catalog
-	maxBodyBytes int64
+	upstream                 core.Protocol
+	baseURL                  *url.URL
+	apiKey                   string
+	model                    string
+	client                   Doer
+	catalog                  core.Catalog
+	maxBodyBytes             int64
+	codingAgentCompatibility bool
 }
 
 type upstreamError struct{ err error }
@@ -55,7 +57,7 @@ func New(config Config) *Service {
 	return &Service{
 		upstream: config.Upstream, baseURL: config.BaseURL, apiKey: config.APIKey,
 		model: config.Model, client: config.Client, catalog: config.Catalog,
-		maxBodyBytes: config.MaxBodyBytes,
+		maxBodyBytes: config.MaxBodyBytes, codingAgentCompatibility: config.CodingAgentCompatibility,
 	}
 }
 
@@ -113,7 +115,8 @@ func (a *Service) Invoke(ctx context.Context, ingress core.Protocol, request *Re
 			ChatStreamIncludeUsage:    chatStreamIncludeUsage,
 			ChatStreamIncludeUsageSet: chatStreamIncludeUsageSet,
 		},
-		LossPolicy: core.RejectSemanticLoss,
+		LossPolicy:               core.RejectSemanticLoss,
+		CodingAgentCompatibility: a.codingAgentCompatibility,
 	}
 	plan, err := a.catalog.Plan(ingress, a.upstream)
 	if err != nil {

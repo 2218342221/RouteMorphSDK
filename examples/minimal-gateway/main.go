@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -71,6 +73,15 @@ func newAdapter() (*routemorph.Adapter, error) {
 	if model := os.Getenv("UPSTREAM_MODEL"); model != "" {
 		options = append(options, routemorph.WithModel(model))
 	}
+	if value := os.Getenv("CODING_AGENT_COMPATIBILITY"); value != "" {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("CODING_AGENT_COMPATIBILITY: %w", err)
+		}
+		if enabled {
+			options = append(options, routemorph.WithCodingAgentCompatibility())
+		}
+	}
 	switch protocol {
 	case routemorph.ProtocolChat:
 		return routemorph.NewOpenAIChatCompletionsAdapter(baseURL, apiKey, options...)
@@ -96,8 +107,20 @@ func relay(call adapterCall) http.HandlerFunc {
 			writeError(writer, adapterErrorStatus(err), err)
 			return
 		}
-		if err := response.WriteTo(writer); err != nil {
-			log.Printf("relay %s: %v", request.URL.Path, err)
+		writeErr := response.WriteTo(writer)
+		for _, diagnostic := range response.Meta.Diagnostics() {
+			// Messages can contain payload-derived details. Log only the stable,
+			// structural fields that operators need for compatibility auditing.
+			log.Printf(
+				"relay diagnostic request_path=%q severity=%q code=%q field_path=%q",
+				request.URL.Path,
+				diagnostic.Severity,
+				diagnostic.Code,
+				diagnostic.Path,
+			)
+		}
+		if writeErr != nil {
+			log.Printf("relay %s: %v", request.URL.Path, writeErr)
 		}
 	}
 }

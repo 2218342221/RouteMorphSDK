@@ -582,6 +582,11 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 		if err := validateKnownResponsesResponse(event.Response, true); err != nil {
 			return err
 		}
+		if eventType == "response.failed" || eventType == "response.cancelled" {
+			if err := validateResponsesFailureOrCancellation(event.Response, eventType); err != nil {
+				return err
+			}
+		}
 	case "response.queued", "response.in_progress":
 		if !rawJSONObject(event.Response) {
 			return core.Invalid(core.ProtocolResponses, "$.response", "response must be an object")
@@ -698,6 +703,55 @@ func validateKnownResponsesEvent(data []byte, eventType string) error {
 			if err := decodeKnownNativeFields(core.ProtocolResponses, event.Error, &streamError); err != nil {
 				return err
 			}
+		}
+	}
+	return nil
+}
+
+func validateResponsesFailureOrCancellation(raw json.RawMessage, eventType string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return core.Invalid(core.ProtocolResponses, "$.response", "invalid terminal response object")
+	}
+	for _, field := range []string{"id", "object", "model", "status"} {
+		fieldRaw, exists := object[field]
+		if !exists {
+			return core.Invalid(core.ProtocolResponses, "$.response."+field, "required string is missing")
+		}
+		value, err := requireJSONString(core.ProtocolResponses, "$.response."+field, fieldRaw)
+		if err != nil {
+			return err
+		}
+		if value == "" {
+			return core.Invalid(core.ProtocolResponses, "$.response."+field, "must not be empty")
+		}
+	}
+	if rawJSONString(object["object"]) != "response" {
+		return core.Invalid(core.ProtocolResponses, "$.response.object", "must be %q", "response")
+	}
+	var createdAt int64
+	if raw, exists := object["created_at"]; !exists || !rawJSONPresent(raw) || json.Unmarshal(raw, &createdAt) != nil || createdAt < 0 {
+		return core.Invalid(core.ProtocolResponses, "$.response.created_at", "required non-negative integer is missing or invalid")
+	}
+	if eventType != "response.failed" {
+		return nil
+	}
+	errorRaw, exists := object["error"]
+	if !exists || !rawJSONObject(errorRaw) {
+		return core.Invalid(core.ProtocolResponses, "$.response.error", "failed response requires an error object")
+	}
+	var errorObject map[string]json.RawMessage
+	if err := json.Unmarshal(errorRaw, &errorObject); err != nil {
+		return core.Invalid(core.ProtocolResponses, "$.response.error", "invalid error object")
+	}
+	for _, field := range []string{"code", "message"} {
+		fieldRaw, exists := errorObject[field]
+		if !exists {
+			return core.Invalid(core.ProtocolResponses, "$.response.error."+field, "required non-empty string is missing or invalid")
+		}
+		value, err := requireJSONString(core.ProtocolResponses, "$.response.error."+field, fieldRaw)
+		if err != nil || value == "" {
+			return core.Invalid(core.ProtocolResponses, "$.response.error."+field, "required non-empty string is missing or invalid")
 		}
 	}
 	return nil
@@ -1051,39 +1105,51 @@ func validatePartialResponsesItem(raw json.RawMessage) error {
 	return streamx.ValidateNativeResponsesOutputItem(item)
 }
 
+var responsesOutputItemFieldsByType = map[string][]string{
+	"message":                 {"type", "id", "role", "content", "status", "phase"},
+	"file_search_call":        {"type", "id", "queries", "results", "status"},
+	"function_call":           {"type", "id", "call_id", "name", "arguments", "async", "namespace", "caller", "status"},
+	"function_call_output":    {"type", "id", "call_id", "name", "namespace", "caller", "status", "output", "created_by"},
+	"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller", "status"},
+	"custom_tool_call_output": {"type", "id", "call_id", "output", "caller", "status", "created_by"},
+	"web_search_call":         {"type", "id", "status", "action"},
+	"computer_call":           {"type", "id", "call_id", "pending_safety_checks", "status", "action", "actions"},
+	"computer_call_output":    {"type", "id", "call_id", "output", "status", "acknowledged_safety_checks", "created_by"},
+	"reasoning":               {"type", "id", "summary", "content", "encrypted_content", "status"},
+	"program":                 {"type", "id", "call_id", "code", "fingerprint"},
+	"program_output":          {"type", "id", "call_id", "result", "status"},
+	"tool_search_call":        {"type", "id", "call_id", "arguments", "execution", "status", "created_by"},
+	"tool_search_output":      {"type", "id", "call_id", "execution", "status", "tools", "created_by"},
+	"additional_tools":        {"type", "id", "role", "tools"},
+	"compaction":              {"type", "id", "encrypted_content", "created_by"},
+	"image_generation_call":   {"type", "id", "result", "status"},
+	"code_interpreter_call":   {"type", "id", "code", "container_id", "outputs", "status"},
+	"local_shell_call":        {"type", "id", "call_id", "action", "status"},
+	"local_shell_call_output": {"type", "id", "output", "status"},
+	"shell_call":              {"type", "id", "call_id", "action", "environment", "status", "caller", "created_by"},
+	"shell_call_output":       {"type", "id", "call_id", "max_output_length", "output", "status", "caller", "created_by"},
+	"apply_patch_call":        {"type", "id", "call_id", "operation", "status", "caller", "created_by"},
+	"apply_patch_call_output": {"type", "id", "call_id", "status", "caller", "created_by", "output"},
+	"mcp_call":                {"type", "id", "arguments", "name", "server_label", "approval_request_id", "error", "output", "status"},
+	"mcp_list_tools":          {"type", "id", "server_label", "tools", "error"},
+	"mcp_approval_request":    {"type", "id", "arguments", "name", "server_label"},
+	"mcp_approval_response":   {"type", "id", "approval_request_id", "approve", "reason"},
+}
+
 func knownResponsesOutputItemFields(itemType string) ([]string, bool) {
-	fieldsByType := map[string][]string{
-		"message":                 {"type", "id", "role", "content", "status", "phase"},
-		"file_search_call":        {"type", "id", "queries", "results", "status"},
-		"function_call":           {"type", "id", "call_id", "name", "arguments", "async", "namespace", "caller", "status"},
-		"function_call_output":    {"type", "id", "call_id", "name", "namespace", "caller", "status", "output", "created_by"},
-		"custom_tool_call":        {"type", "id", "call_id", "name", "input", "async", "namespace", "caller", "status"},
-		"custom_tool_call_output": {"type", "id", "call_id", "output", "caller", "status", "created_by"},
-		"web_search_call":         {"type", "id", "status", "action"},
-		"computer_call":           {"type", "id", "call_id", "pending_safety_checks", "status", "action", "actions"},
-		"computer_call_output":    {"type", "id", "call_id", "output", "status", "acknowledged_safety_checks", "created_by"},
-		"reasoning":               {"type", "id", "summary", "content", "encrypted_content", "status"},
-		"program":                 {"type", "id", "call_id", "code", "fingerprint"},
-		"program_output":          {"type", "id", "call_id", "result", "status"},
-		"tool_search_call":        {"type", "id", "call_id", "arguments", "execution", "status", "created_by"},
-		"tool_search_output":      {"type", "id", "call_id", "execution", "status", "tools", "created_by"},
-		"additional_tools":        {"type", "id", "role", "tools"},
-		"compaction":              {"type", "id", "encrypted_content", "created_by"},
-		"image_generation_call":   {"type", "id", "result", "status"},
-		"code_interpreter_call":   {"type", "id", "code", "container_id", "outputs", "status"},
-		"local_shell_call":        {"type", "id", "call_id", "action", "status"},
-		"local_shell_call_output": {"type", "id", "output", "status"},
-		"shell_call":              {"type", "id", "call_id", "action", "environment", "status", "caller", "created_by"},
-		"shell_call_output":       {"type", "id", "call_id", "max_output_length", "output", "status", "caller", "created_by"},
-		"apply_patch_call":        {"type", "id", "call_id", "operation", "status", "caller", "created_by"},
-		"apply_patch_call_output": {"type", "id", "call_id", "status", "caller", "created_by", "output"},
-		"mcp_call":                {"type", "id", "arguments", "name", "server_label", "approval_request_id", "error", "output", "status"},
-		"mcp_list_tools":          {"type", "id", "server_label", "tools", "error"},
-		"mcp_approval_request":    {"type", "id", "arguments", "name", "server_label"},
-		"mcp_approval_response":   {"type", "id", "approval_request_id", "approve", "reason"},
-	}
-	fields, known := fieldsByType[itemType]
+	fields, known := responsesOutputItemFieldsByType[itemType]
 	return fields, known
+}
+
+func knownResponsesOutputItemField(field string) bool {
+	for _, fields := range responsesOutputItemFieldsByType {
+		for _, candidate := range fields {
+			if candidate == field {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizePartialResponsesItemStatus(filtered, source map[string]json.RawMessage, itemType string) error {

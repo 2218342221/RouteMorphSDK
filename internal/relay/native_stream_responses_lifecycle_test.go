@@ -462,6 +462,10 @@ func TestResponsesNativeStreamReconcilesTerminalOutput(t *testing.T) {
 			"id": "function_1", "type": "function_call", "call_id": "call_function_1",
 			"name": "lookup", "arguments": `{"changed":true}`, "status": "completed",
 		}}, want: "does not match its output_item.done payload"},
+		{name: "dropped done field", terminal: []any{map[string]any{
+			"id": "function_1", "type": "function_call", "call_id": "call_function_1",
+			"name": "lookup", "arguments": `{}`,
+		}}, want: "does not match its output_item.done payload"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -485,21 +489,280 @@ func TestResponsesNativeStreamReconcilesTerminalOutput(t *testing.T) {
 	}
 }
 
+func TestResponsesNativeStreamAcceptsTerminalItemEnrichment(t *testing.T) {
+	done := responsesLifecycleItem("message_1", "message")
+	done["content"] = []any{map[string]any{
+		"type": "output_text", "text": "ok", "annotations": []any{},
+	}}
+	terminal := responsesLifecycleItem("message_1", "message")
+	terminal["phase"] = "final_answer"
+	terminal["future_extension"] = map[string]any{"terminal_only": true}
+	terminal["content"] = []any{map[string]any{
+		"type": "output_text", "text": "ok", "annotations": []any{}, "logprobs": []any{},
+	}}
+	v := newResponsesLifecycleValidator()
+	for index, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		if err := v.validate(context.Background(), event); err != nil {
+			t.Fatalf("event %d (%s): %v", index, event.Event, err)
+		}
+	}
+	if err := v.finalize(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResponsesNativeStreamRejectsNestedKnownFieldAddedAfterItemDone(t *testing.T) {
+	done := responsesLifecycleItem("web_1", "web_search_call")
+	terminal := responsesLifecycleItem("web_1", "web_search_call")
+	terminal["action"] = map[string]any{"type": "open_page", "url": "https://example.com"}
+	v := newResponsesLifecycleValidator()
+	var got error
+	for _, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		got = v.validate(context.Background(), event)
+		if got != nil {
+			break
+		}
+	}
+	if !errors.Is(got, core.ErrInvalidPayload) || !strings.Contains(got.Error(), "$.action.url was added after output_item.done") {
+		t.Fatalf("error = %v, want nested known-field terminal enrichment rejection", got)
+	}
+}
+
+func TestResponsesNativeStreamRejectsNestedUnknownExtensionEnrichment(t *testing.T) {
+	done := responsesLifecycleItem("message_1", "message")
+	done["future_extension"] = map[string]any{"stable": true}
+	terminal := responsesLifecycleItem("message_1", "message")
+	terminal["future_extension"] = map[string]any{"stable": true, "late": true}
+	v := newResponsesLifecycleValidator()
+	var got error
+	for _, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		got = v.validate(context.Background(), event)
+		if got != nil {
+			break
+		}
+	}
+	if !errors.Is(got, core.ErrInvalidPayload) || !strings.Contains(got.Error(), "$.future_extension.late was added after output_item.done") {
+		t.Fatalf("error = %v, want nested extension enrichment rejection", got)
+	}
+}
+
+func TestResponsesNativeStreamRejectsOtherVariantFieldAsTerminalExtension(t *testing.T) {
+	done := responsesLifecycleItem("message_1", "message")
+	terminal := responsesLifecycleItem("message_1", "message")
+	terminal["arguments"] = `{}`
+	v := newResponsesLifecycleValidator()
+	var got error
+	for _, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		got = v.validate(context.Background(), event)
+		if got != nil {
+			break
+		}
+	}
+	if !errors.Is(got, core.ErrInvalidPayload) || !strings.Contains(got.Error(), "$.arguments was added after output_item.done") {
+		t.Fatalf("error = %v, want other-variant known-field rejection", got)
+	}
+}
+
+func TestResponsesNativeStreamAcceptsTerminalReasoningCiphertextRefresh(t *testing.T) {
+	done := responsesLifecycleItem("reasoning_1", "reasoning")
+	done["encrypted_content"] = "done-ciphertext"
+	terminal := responsesLifecycleItem("reasoning_1", "reasoning")
+	terminal["encrypted_content"] = "terminal-ciphertext"
+	v := newResponsesLifecycleValidator()
+	for index, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		if err := v.validate(context.Background(), event); err != nil {
+			t.Fatalf("event %d (%s): %v", index, event.Event, err)
+		}
+	}
+	if err := v.finalize(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResponsesNativeStreamRejectsKnownFieldAddedAfterItemDone(t *testing.T) {
+	done := responsesLifecycleItem("reasoning_1", "reasoning")
+	terminal := responsesLifecycleItem("reasoning_1", "reasoning")
+	terminal["content"] = []any{map[string]any{"type": "reasoning_text", "text": "late reasoning"}}
+	v := newResponsesLifecycleValidator()
+	var got error
+	for _, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		got = v.validate(context.Background(), event)
+		if got != nil {
+			break
+		}
+	}
+	if !errors.Is(got, core.ErrInvalidPayload) || !strings.Contains(got.Error(), "$.content was added after output_item.done") {
+		t.Fatalf("error = %v, want known-field terminal enrichment rejection", got)
+	}
+}
+
+func TestResponsesNativeStreamRejectsTerminalCiphertextChangeOutsideReasoning(t *testing.T) {
+	done := responsesLifecycleItem("message_1", "message")
+	done["encrypted_content"] = "done-ciphertext"
+	terminal := responsesLifecycleItem("message_1", "message")
+	terminal["encrypted_content"] = "terminal-ciphertext"
+	v := newResponsesLifecycleValidator()
+	var got error
+	for _, event := range []core.Frame{
+		responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")}),
+		responsesLifecycleFrame(t, "response.output_item.added", 1, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.output_item.done", 2, map[string]any{"output_index": 0, "item": done}),
+		responsesLifecycleFrame(t, "response.completed", 3, map[string]any{"response": responsesLifecycleResponseWithItems("completed", terminal)}),
+	} {
+		got = v.validate(context.Background(), event)
+		if got != nil {
+			break
+		}
+	}
+	if !errors.Is(got, core.ErrInvalidPayload) || !strings.Contains(got.Error(), "$.encrypted_content changed value") {
+		t.Fatalf("error = %v, want encrypted_content mismatch", got)
+	}
+}
+
 func TestResponsesNativeStreamFailureIsTerminal(t *testing.T) {
 	v := newResponsesLifecycleValidator()
 	if err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")})); err != nil {
 		t.Fatal(err)
 	}
 	err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.failed", 1, map[string]any{"response": map[string]any{
-		"status": "failed", "output": []any{}, "error": map[string]any{"code": "server_error", "message": "failed"},
+		"id": "resp_failed", "object": "response", "created_at": 1, "model": "gpt-5.4",
+		"status": "failed", "error": map[string]any{"code": "server_error", "message": "failed"},
 	}}))
-	if !errors.Is(err, core.ErrUpstreamResponse) {
-		t.Fatalf("failure error = %v, want ErrUpstreamResponse", err)
+	if err != nil {
+		t.Fatalf("failure error = %v, want frame to pass through", err)
 	}
 	err = v.validate(context.Background(), responsesLifecycleFrame(t, "response.in_progress", 2, map[string]any{"response": responsesLifecycleResponse("in_progress")}))
 	if !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), "after the terminal response") {
 		t.Fatalf("post-failure error = %v, want terminal lifecycle error", err)
 	}
+}
+
+func TestResponsesNativeStreamRejectsMalformedFailureAndCancellation(t *testing.T) {
+	base := map[string]any{
+		"id": "resp_failed", "object": "response", "created_at": 1, "model": "gpt-5.4",
+		"status": "failed", "error": map[string]any{"code": "server_error", "message": "failed"},
+	}
+	tests := []struct {
+		name     string
+		event    string
+		response map[string]any
+		wantPath string
+	}{
+		{name: "missing id", event: "response.failed", response: cloneResponsesLifecycleMap(base, "id"), wantPath: "$.response.id"},
+		{name: "wrong object", event: "response.failed", response: mergeResponsesLifecycleMap(base, "object", "response.error"), wantPath: "$.response.object"},
+		{name: "missing created_at", event: "response.failed", response: cloneResponsesLifecycleMap(base, "created_at"), wantPath: "$.response.created_at"},
+		{name: "missing error", event: "response.failed", response: cloneResponsesLifecycleMap(base, "error"), wantPath: "$.response.error"},
+		{name: "empty error code", event: "response.failed", response: mergeResponsesLifecycleMap(base, "error", map[string]any{"code": "", "message": "failed"}), wantPath: "$.response.error.code"},
+		{name: "cancelled missing model", event: "response.cancelled", response: map[string]any{"id": "resp_cancelled", "object": "response", "created_at": 1, "status": "cancelled"}, wantPath: "$.response.model"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			v := newResponsesLifecycleValidator()
+			if err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": responsesLifecycleResponse("in_progress")})); err != nil {
+				t.Fatal(err)
+			}
+			err := v.validate(context.Background(), responsesLifecycleFrame(t, test.event, 1, map[string]any{"response": test.response}))
+			if !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), test.wantPath) {
+				t.Fatalf("error = %v, want ErrInvalidPayload at %s", err, test.wantPath)
+			}
+		})
+	}
+}
+
+func TestResponsesNativeStreamRejectsResponseIdentityChange(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "id", field: "id", value: "resp_changed"},
+		{name: "model", field: "model", value: "gpt-changed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			v := newResponsesLifecycleValidator()
+			created := map[string]any{
+				"id": "resp_original", "object": "response", "created_at": 1, "model": "gpt-5.4",
+				"status": "in_progress", "output": []any{},
+			}
+			if err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": created})); err != nil {
+				t.Fatal(err)
+			}
+			failed := map[string]any{
+				"id": "resp_original", "object": "response", "created_at": 1, "model": "gpt-5.4",
+				"status": "failed", "error": map[string]any{"code": "server_error", "message": "failed"},
+			}
+			failed[test.field] = test.value
+			err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.failed", 1, map[string]any{"response": failed}))
+			if !errors.Is(err, core.ErrInvalidPayload) || !strings.Contains(err.Error(), "$.response."+test.field) {
+				t.Fatalf("error = %v, want response %s mismatch", err, test.field)
+			}
+		})
+	}
+}
+
+func TestResponsesNativeStreamInvalidCreatedDoesNotCommitIdentity(t *testing.T) {
+	v := newResponsesLifecycleValidator()
+	bad := map[string]any{
+		"id": "resp_poison", "object": "response", "created_at": 1, "model": "gpt-poison",
+		"status": "in_progress", "output": []any{},
+	}
+	if err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.created", 1, map[string]any{"response": bad})); !errors.Is(err, core.ErrInvalidPayload) {
+		t.Fatalf("bad created error = %v, want ErrInvalidPayload", err)
+	}
+	good := map[string]any{
+		"id": "resp_good", "object": "response", "created_at": 1, "model": "gpt-5.4",
+		"status": "in_progress", "output": []any{},
+	}
+	if err := v.validate(context.Background(), responsesLifecycleFrame(t, "response.created", 0, map[string]any{"response": good})); err != nil {
+		t.Fatalf("valid created after rejected frame: %v", err)
+	}
+}
+
+func cloneResponsesLifecycleMap(source map[string]any, omit string) map[string]any {
+	result := make(map[string]any, len(source))
+	for key, value := range source {
+		if key != omit {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func mergeResponsesLifecycleMap(source map[string]any, key string, value any) map[string]any {
+	result := cloneResponsesLifecycleMap(source, "")
+	result[key] = value
+	return result
 }
 
 func newResponsesLifecycleValidator() *nativeStreamValidator {

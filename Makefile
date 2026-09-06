@@ -1,7 +1,7 @@
 GO ?= go
 GOWORK ?= off
 
-.PHONY: build test test-race test-integration-compile test-live-responses test-live-responses-core test-live-responses-extended test-live-responses-tools vet provider-sdk-examples fmt-check check
+.PHONY: build test test-race test-integration-compile test-live-responses test-live-responses-core test-live-responses-extended test-live-responses-tools test-live-coding-agents vet provider-sdk-examples fmt-check check
 
 build:
 	GOWORK=$(GOWORK) $(GO) build ./...
@@ -42,6 +42,14 @@ test-live-responses-tools:
 	ROUTEMORPH_LIVE_RESPONSES=1 ROUTEMORPH_LIVE_MODEL="$${ROUTEMORPH_LIVE_MODEL:-gpt-5.4}" \
 		GOWORK=$(GOWORK) $(GO) test -tags=integration -count=1 -failfast -timeout=90m \
 		-run '^TestLiveResponsesProvider(CustomTool|WebSearch|ToolSearch)Integration$$' -v .
+
+test-live-coding-agents:
+	@test "$$(uname -s)" = "Linux" || { echo "test-live-coding-agents requires Linux bwrap" >&2; exit 2; }
+	@test -n "$$ROUTEMORPH_LIVE_BASE_URL" || { echo "ROUTEMORPH_LIVE_BASE_URL is required" >&2; exit 2; }
+	@test -n "$$ROUTEMORPH_LIVE_API_KEY" || { echo "ROUTEMORPH_LIVE_API_KEY is required" >&2; exit 2; }
+	ROUTEMORPH_LIVE_CLI=1 ROUTEMORPH_LIVE_MODEL="$${ROUTEMORPH_LIVE_MODEL:-gpt-5.4}" \
+		GOWORK=$(GOWORK) $(GO) test -tags=integration -count=1 -failfast -timeout=60m \
+		-run '^TestLiveCodingAgentCLICompatibility$$' -v .
 
 vet:
 	GOWORK=$(GOWORK) $(GO) vet ./...

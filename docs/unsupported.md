@@ -19,7 +19,9 @@ cross-protocol restrictions below.
   unversioned Responses `web_search` request subset described below.
 - Opaque reasoning state is not interchangeable. Anthropic signatures and
   redacted-thinking blocks, Responses encrypted reasoning, and Gemini
-  `thoughtSignature` values are never forged or discarded across providers.
+  `thoughtSignature` values are never forged or silently discarded across
+  providers. Narrow diagnostic-producing coding-agent exceptions are listed
+  below.
 - A function call sent *to* Gemini from another protocol has no genuine Gemini
   thought signature. RouteMorph emits
   `gemini_thought_signature_unavailable`; Gemini 3 may reject replayed history.
@@ -280,7 +282,8 @@ ordering cannot be preserved.
 
 ## Reasoning and thinking boundaries
 
-Reasoning is not one transferable field. Four layers are handled separately:
+Reasoning is not one transferable field. Four layers are handled separately.
+Unless explicitly noted, the following describes the default strict policy:
 
 - **Request control:** Chat/Responses effort, Anthropic adaptive/enabled mode
   and token budget/display policy, and Gemini level/budget/`includeThoughts`
@@ -302,7 +305,11 @@ Reasoning is not one transferable field. Four layers are handled separately:
   reclassified as raw reasoning.
 - **Opaque replay state:** Responses `encrypted_content`, Anthropic thinking
   signatures/redacted data, and Gemini `thoughtSignature` are provider-issued
-  state. Cross-provider conversion never forges or silently drops them.
+  state. Cross-provider conversion never forges them. Coding-agent
+  compatibility may omit Responses reasoning from a Messages response with a
+  diagnostic, may omit encrypted Responses reasoning while emitting a summary
+  as unsigned Gemini thought text, and recognizes only Gemini CLI's exact synthetic
+  `skip_thought_signature_validator` value; real opaque signatures still fail.
 - **Usage:** reasoning/thinking token counters map only when accounting
   semantics match. A portable counter does not make request controls or opaque
   state portable.
@@ -334,6 +341,16 @@ The aggregate `cache_creation_input_tokens` value maps exactly to Responses
 `output_tokens_details.thinking_tokens` maps to the equivalent OpenAI reasoning
 or Gemini thought-token counter. `top_k` maps only between Messages and Gemini.
 
+`WithCodingAgentCompatibility()` adds a bounded Claude Code exception for a
+Responses upstream: exact ephemeral cache markers (including nested
+tool-result content) are omitted, `enabled` thinking with absent/`omitted`
+display and `adaptive` thinking with explicit `omitted` display are
+approximated, overlong `metadata.user_id` is pseudonymized, and tool-error
+content is retained while its error bit is omitted. Only the no-op
+`clear_thinking_20251015` edit with `keep:"all"` is accepted. Other context
+edits, other cache policies, summarized thinking, and signed thinking remain
+unsupported.
+
 ## Gemini routes
 
 The following Gemini concepts remain native-only:
@@ -348,6 +365,17 @@ The following Gemini concepts remain native-only:
   schemas;
 - response log probabilities and grounding/citation/URL-context metadata under
   the strict public loss policy.
+
+`WithCodingAgentCompatibility()` may omit `topK`, exact `thinkingBudget`, and
+`includeThoughts` with diagnostics; it also strips only Gemini CLI's exact
+synthetic thought-signature sentinel. A function-response error object is
+serialized into Responses tool output so its content remains available.
+Provider-issued signatures, near-match sentinel values, and hosted-tool
+semantics remain unsupported.
+
+This profile does not enable the SDK's broader internal documented-loss mode.
+Unrelated response metadata, refusal relabeling, and lossy Chat conversions
+remain fail-closed.
 
 On an otherwise valid single-candidate response, candidate safety ratings,
 non-blocking prompt feedback, candidate token count, finish message, model

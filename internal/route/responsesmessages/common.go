@@ -26,6 +26,12 @@ const (
 
 var ErrInvalidPlan = core.ErrInvalidPlan
 
+func codingAgentCompatibility(options conversionOptions) bool {
+	// AllowDocumentedLoss keeps its existing lower-level characterization
+	// behavior. Public adapters enable only the narrow coding-agent profile.
+	return options.CodingAgentCompatibility || options.LossPolicy != rejectSemanticLoss
+}
+
 type BufferedFactory func(core.RouteSpec, core.ConversionOptions, func(context.Context, []byte, core.ConversionOptions) (core.ConversionResult, error)) core.ResponseStream
 
 func New(spec core.RouteSpec, buffered BufferedFactory) core.Route {

@@ -180,10 +180,13 @@ code-interpreter, shell, image-generation, web-search, tool-search, and
 apply-patch fields. An `output_item.added` frame is checked before it is
 released, while still allowing fields that are legitimately absent until the
 item is complete. A terminal response must contain the same indexed items and
-completed payloads observed in the stream, and buffered rendering refuses to
+every value observed in each completed payload. It may add unknown top-level
+provider extension fields, message `phase`, and output-text `logprobs`; other
+semantic fields cannot first appear after `output_item.done`. Existing values
+remain immutable except that a reasoning item's opaque `encrypted_content` may
+be refreshed from one string value to another. Buffered rendering refuses to
 turn an `in_progress`, `searching`, `generating`, `interpreting`, or `calling`
-item into a fabricated `done` event. Unknown top-level provider extension
-fields remain pass-through; unknown tagged variants fail closed.
+item into a fabricated `done` event. Unknown tagged variants fail closed.
 
 Portable function-tool history is validated as a ledger rather than copied as
 unrelated blocks. Call IDs must be unique, every result must reference a
@@ -306,7 +309,7 @@ Reasoning support is intentionally split into four independent layers:
 
 1. **Request control.** Effort, thinking level, exact token budget,
    adaptive/enabled mode, display policy, and `includeThoughts` are not assumed
-   equivalent. The public adapter maps only route-specific audited
+   equivalent. By default, the public adapter maps only route-specific audited
    intersections and rejects a lossy approximation.
 2. **Visible reasoning text.** Chat `reasoning_content` is a non-standard
    extension; Responses summary/reasoning text, Messages thinking text, and
@@ -337,19 +340,26 @@ from any of these effort mappings.
 For visible output, Chat `reasoning_content` maps to Responses raw
 `reasoning_text`, not to `summary_text`; the same raw-text interpretation is
 used for an unsigned Gemini `thought` when converting to or from Responses.
-Responses summaries are therefore rejected by the public strict policy instead
-of being relabeled as hidden chain-of-thought. Provider-issued encrypted text
-or Gemini thought signatures remain native-only.
+Responses summaries are therefore rejected by the default strict policy
+instead of being relabeled as hidden chain-of-thought. In the explicit coding
+agent compatibility profile, Responses reasoning is omitted from Messages
+output with a diagnostic. For a Gemini client, a Responses reasoning summary
+is emitted as unsigned thought text and opaque encrypted reasoning is omitted,
+both with diagnostics. The one special Gemini request-side exception is the
+exact documented CLI sentinel
+`skip_thought_signature_validator`: compatibility mode recognizes and removes
+that synthetic value, but never accepts or fabricates a provider signature.
 
 ## Directed-route boundaries
 
-The public adapter always rejects semantic loss. The following table records
-the important fields that remain intentionally unsupported even when both
-protocols expose similarly named concepts. An omitted field is not implicitly
-supported. Unknown top-level fields and unknown tagged-union variants are
-rejected by the route validators; arbitrary future fields nested inside every
-known object should not be assumed either portable or recursively rejected
-until that object is explicitly audited.
+The public adapter rejects semantic loss by default. An adapter constructed
+with `WithCodingAgentCompatibility()` enables the narrow, documented
+approximations listed below and exposes a warning for each approximation in
+`Response.Meta.Diagnostics()`. An omitted field is not implicitly supported.
+Unknown top-level fields and unknown tagged-union variants are rejected by the
+route validators; arbitrary future fields nested inside every known object
+should not be assumed either portable or recursively rejected until that
+object is explicitly audited.
 
 | Route | Preserved or normalized | Intentionally unsupported |
 |---|---|---|
@@ -361,6 +371,24 @@ until that object is explicitly audited.
 | Messages ↔ Gemini | portable text and shared image/PDF media, function declarations/calls/results including ordered media-only inline image/PDF results, sampling and stop controls, JSON schema, common token counters including thinking tokens | mixed text/media function results and Gemini function-response `fileData`; Messages cache/container/inference/service controls, server tools/caller constraints, provider file IDs and signed thinking; Gemini request safety/cached-content/service/store controls, hosted tools, thought signatures, unsupported MIME/file-URI values and advanced media/code parts; matched stop-sequence identity; response logprobs and grounding metadata under strict loss policy |
 
 Some concepts are only partially equivalent:
+
+- With coding-agent compatibility enabled, Messages→Responses accepts only
+  Claude Code's no-op `clear_thinking_20251015`/`keep:"all"`, omits exact
+  ephemeral cache markers (including nested tool-result content), approximates
+  `enabled` thinking with absent/`omitted` display and `adaptive` thinking with
+  explicit `omitted` display as Responses reasoning, hashes an overlong
+  `metadata.user_id`, and preserves tool-error
+  text while omitting the `is_error` bit. State-changing context edits and
+  other cache policies and summarized thinking display remain unsupported.
+- With coding-agent compatibility enabled, Gemini→Responses omits `topK`, an
+  exact thinking budget, and `includeThoughts`, and strips only the exact CLI
+  synthetic thought-signature sentinel. Tool error objects are serialized into
+  function output so their content survives. Real provider-issued signatures
+  and near-match sentinel values remain unsupported.
+- With coding-agent compatibility enabled, Responses→Gemini may expose a
+  Responses reasoning summary as unsigned Gemini thought text and omits opaque
+  encrypted reasoning state. Refusal conversion and unrelated response
+  metadata remain governed by the strict policy.
 
 - OpenAI Chat successful moderation uses a `moderation_results` collection,
   while Responses uses one `moderation_result`. A single result is wrapped or

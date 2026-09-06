@@ -6,9 +6,8 @@ import (
 )
 
 // LossPolicy is an internal route-conformance control. Its zero value rejects
-// any semantic loss. The public Adapter intentionally always uses that strict
-// policy; AllowDocumentedLoss exists only for characterization and lower-level
-// route tests.
+// any semantic loss. AllowDocumentedLoss remains available to lower-level
+// callers and characterization tests, but the public Adapter does not enable it.
 type LossPolicy uint8
 
 const (
@@ -27,8 +26,9 @@ type ExchangeMetadata struct {
 }
 
 type ConversionOptions struct {
-	Exchange   ExchangeMetadata
-	LossPolicy LossPolicy
+	Exchange                 ExchangeMetadata
+	LossPolicy               LossPolicy
+	CodingAgentCompatibility bool
 }
 
 type ConversionResult struct {
