@@ -1,0 +1,35 @@
+{
+  "model": "routemorph-live-client",
+  "max_tokens": 256,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call record_marker with marker RM_TOOL_MESSAGES_NON_STREAM. Do not answer with text."
+    }
+  ],
+  "tools": [
+    {
+      "name": "record_marker",
+      "description": "Record a test marker",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "marker"
+        ],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "record_marker",
+    "disable_parallel_tool_use": true
+  },
+  "stream": false
+}

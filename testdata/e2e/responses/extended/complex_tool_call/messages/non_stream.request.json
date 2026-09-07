@@ -1,0 +1,74 @@
+{
+  "model": "routemorph-live-client",
+  "max_tokens": 512,
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call record_complex exactly once with marker RM_COMPLEX_TOOL_MESSAGES_NON_STREAM, count 7, enabled true, mode audit, tags alpha then beta, and payload nested=value and score=3. Do not answer with text."
+    }
+  ],
+  "tools": [
+    {
+      "name": "record_complex",
+      "description": "Record a typed regression payload",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "audit"
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "payload": {
+            "type": "object",
+            "properties": {
+              "nested": {
+                "type": "string"
+              },
+              "score": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "nested",
+              "score"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "marker",
+          "count",
+          "enabled",
+          "mode",
+          "tags",
+          "payload"
+        ],
+        "additionalProperties": false
+      },
+      "strict": true
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "record_complex",
+    "disable_parallel_tool_use": true
+  },
+  "stream": false
+}

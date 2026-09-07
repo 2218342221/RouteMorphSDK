@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"unicode"
 
 	"github.com/2218342221/RouteMorphSDK/internal/core"
+	"github.com/2218342221/RouteMorphSDK/internal/openaicompat"
 )
 
 // Options supplies request-side facts that are not present in every Chat SSE
@@ -25,20 +27,25 @@ type Options struct {
 type Converter struct {
 	options Options
 
-	started        bool
-	terminal       bool
-	sequence       int64
-	responseID     string
-	upstreamID     string
-	providerModel  string
-	createdAt      int64
-	finishReason   string
-	reasoning      *reasoningState
-	message        *messageState
-	tools          map[int]*toolState
-	outputs        []*outputSlot
-	usage          *chatUsage
-	sawNormalChunk bool
+	started                   bool
+	terminal                  bool
+	sequence                  int64
+	responseID                string
+	upstreamID                string
+	providerModel             string
+	createdAt                 int64
+	finishReason              string
+	reasoning                 *reasoningState
+	message                   *messageState
+	tools                     map[int]*toolState
+	toolCallIDs               map[string]int
+	outputs                   []*outputSlot
+	usage                     *chatUsage
+	sawNormalChunk            bool
+	serviceTier               json.RawMessage
+	moderation                json.RawMessage
+	reportedSystemFingerprint bool
+	reportedObfuscation       bool
 }
 
 type messageState struct {
@@ -81,14 +88,17 @@ type outputSlot struct {
 }
 
 type chatChunk struct {
-	ID      string          `json:"id"`
-	Object  string          `json:"object"`
-	Created int64           `json:"created"`
-	Model   string          `json:"model"`
-	Choices []chatChoice    `json:"choices"`
-	Usage   *chatUsage      `json:"usage"`
-	Error   *chatError      `json:"error"`
-	Raw     json.RawMessage `json:"-"`
+	ID                string          `json:"id"`
+	Object            string          `json:"object"`
+	Created           int64           `json:"created"`
+	Model             string          `json:"model"`
+	Choices           []chatChoice    `json:"choices"`
+	Usage             *chatUsage      `json:"usage"`
+	Error             *chatError      `json:"error"`
+	Moderation        json.RawMessage `json:"moderation"`
+	ServiceTier       json.RawMessage `json:"service_tier"`
+	SystemFingerprint string          `json:"system_fingerprint"`
+	Obfuscation       string          `json:"obfuscation"`
 }
 
 type chatChoice struct {
@@ -122,10 +132,14 @@ type chatUsage struct {
 	CompletionTokens int64 `json:"completion_tokens"`
 	TotalTokens      int64 `json:"total_tokens"`
 	PromptDetails    struct {
+		AudioTokens  int64 `json:"audio_tokens"`
 		CachedTokens int64 `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
 	CompletionDetails struct {
-		ReasoningTokens int64 `json:"reasoning_tokens"`
+		AcceptedPredictionTokens int64 `json:"accepted_prediction_tokens"`
+		AudioTokens              int64 `json:"audio_tokens"`
+		ReasoningTokens          int64 `json:"reasoning_tokens"`
+		RejectedPredictionTokens int64 `json:"rejected_prediction_tokens"`
 	} `json:"completion_tokens_details"`
 }
 
@@ -138,7 +152,7 @@ type chatError struct {
 
 // New creates an isolated converter for one upstream response stream.
 func New(options Options) *Converter {
-	return &Converter{options: options, tools: make(map[int]*toolState)}
+	return &Converter{options: options, tools: make(map[int]*toolState), toolCallIDs: make(map[string]int)}
 }
 
 // Convert consumes one decoded Chat SSE frame.
@@ -172,25 +186,33 @@ func (c *Converter) Convert(ctx context.Context, frame core.Frame) ([]core.Frame
 		frames, err := c.convertError(chunk.Error)
 		return frames, nil, err
 	}
-	if len(chunk.Choices) == 0 && chunk.Usage == nil {
+	hasModeration := meaningfulJSON(chunk.Moderation)
+	if len(chunk.Choices) == 0 && chunk.Usage == nil && !hasModeration {
 		return nil, nil, core.Invalid(core.ProtocolChat, "$", "chunk has neither choices, usage, nor error")
 	}
 	if len(chunk.Choices) > 1 {
 		return nil, nil, core.Unsupported(core.ProtocolChat, "$.choices", "multiple Chat choices cannot be represented as one Responses output")
 	}
-	if err := c.observeEnvelope(chunk); err != nil {
+	diagnostics, err := c.observeEnvelope(chunk)
+	if err != nil {
 		return nil, nil, err
 	}
 
 	var frames []core.Frame
 	if !c.started {
 		if len(chunk.Choices) == 0 {
+			if hasModeration {
+				return nil, diagnostics, nil
+			}
 			return nil, nil, core.Invalid(core.ProtocolChat, "$.choices", "usage cannot precede the first completion chunk")
 		}
 		frames = append(frames, c.startEvents()...)
 	}
 	c.sawNormalChunk = true
 	if chunk.Usage != nil {
+		if err := validateUsage(chunk.Usage); err != nil {
+			return nil, nil, err
+		}
 		copy := *chunk.Usage
 		c.usage = &copy
 	}
@@ -201,7 +223,7 @@ func (c *Converter) Convert(ctx context.Context, frame core.Frame) ([]core.Frame
 		}
 		frames = append(frames, converted...)
 	}
-	return frames, nil, nil
+	return frames, diagnostics, nil
 }
 
 func validateChunkShape(raw json.RawMessage) error {
@@ -211,7 +233,7 @@ func validateChunkShape(raw json.RawMessage) error {
 	}
 	for name, value := range fields {
 		switch name {
-		case "id", "object", "created", "model", "choices", "usage", "error", "system_fingerprint", "service_tier":
+		case "id", "object", "created", "model", "choices", "usage", "error", "system_fingerprint", "service_tier", "moderation", "obfuscation":
 		default:
 			if meaningfulJSON(value) {
 				return core.Unsupported(core.ProtocolChat, "$."+name, "unknown Chat stream chunk field")
@@ -233,10 +255,11 @@ func (c *Converter) Finalize(ctx context.Context) ([]core.Frame, []core.Diagnost
 	return frames, nil, err
 }
 
-func (c *Converter) observeEnvelope(chunk chatChunk) error {
+func (c *Converter) observeEnvelope(chunk chatChunk) ([]core.Diagnostic, error) {
+	var diagnostics []core.Diagnostic
 	if chunk.ID != "" {
 		if c.upstreamID != "" && c.upstreamID != chunk.ID {
-			return core.Invalid(core.ProtocolChat, "$.id", "changed from %q to %q", c.upstreamID, chunk.ID)
+			return nil, core.Invalid(core.ProtocolChat, "$.id", "changed from %q to %q", c.upstreamID, chunk.ID)
 		}
 		c.upstreamID = chunk.ID
 	}
@@ -245,11 +268,80 @@ func (c *Converter) observeEnvelope(chunk chatChunk) error {
 		c.createdAt = chunk.Created
 		c.providerModel = chunk.Model
 	} else if chunk.Model != "" && c.providerModel != "" && chunk.Model != c.providerModel {
-		return core.Invalid(core.ProtocolChat, "$.model", "changed from %q to %q", c.providerModel, chunk.Model)
+		return nil, core.Invalid(core.ProtocolChat, "$.model", "changed from %q to %q", c.providerModel, chunk.Model)
 	} else if c.providerModel == "" {
 		c.providerModel = chunk.Model
 	}
+	if meaningfulJSON(chunk.ServiceTier) {
+		if err := openaicompat.ValidateChatServiceTier(chunk.ServiceTier, "$.service_tier", true); err != nil {
+			return nil, err
+		}
+		if meaningfulJSON(c.serviceTier) && !jsonValuesEqual(c.serviceTier, chunk.ServiceTier) {
+			return nil, core.Invalid(core.ProtocolChat, "$.service_tier", "changed during stream")
+		}
+		c.serviceTier = append(json.RawMessage(nil), chunk.ServiceTier...)
+	}
+	if meaningfulJSON(chunk.Moderation) {
+		converted, err := openaicompat.ChatModerationToResponses(chunk.Moderation, "$.moderation", true)
+		if err != nil {
+			return nil, err
+		}
+		c.moderation, err = openaicompat.MergeModeration(c.moderation, converted, core.ProtocolChat, "$.moderation", true)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if chunk.SystemFingerprint != "" && !c.reportedSystemFingerprint {
+		c.reportedSystemFingerprint = true
+		diagnostics = append(diagnostics, core.Diagnostic{Severity: "warning", Code: "chat_system_fingerprint_not_representable", Path: "$.system_fingerprint", Message: "Responses has no system_fingerprint field"})
+	}
+	if chunk.Obfuscation != "" && !c.reportedObfuscation {
+		c.reportedObfuscation = true
+		diagnostics = append(diagnostics, core.Diagnostic{Severity: "warning", Code: "chat_stream_obfuscation_not_representable", Path: "$.obfuscation", Message: "Chat chunk padding cannot be preserved across generated Responses events"})
+	}
+	return diagnostics, nil
+}
+
+func validateUsage(usage *chatUsage) error {
+	for path, value := range map[string]int64{
+		"$.usage.prompt_tokens":                                        usage.PromptTokens,
+		"$.usage.completion_tokens":                                    usage.CompletionTokens,
+		"$.usage.total_tokens":                                         usage.TotalTokens,
+		"$.usage.prompt_tokens_details.cached_tokens":                  usage.PromptDetails.CachedTokens,
+		"$.usage.prompt_tokens_details.audio_tokens":                   usage.PromptDetails.AudioTokens,
+		"$.usage.completion_tokens_details.reasoning_tokens":           usage.CompletionDetails.ReasoningTokens,
+		"$.usage.completion_tokens_details.audio_tokens":               usage.CompletionDetails.AudioTokens,
+		"$.usage.completion_tokens_details.accepted_prediction_tokens": usage.CompletionDetails.AcceptedPredictionTokens,
+		"$.usage.completion_tokens_details.rejected_prediction_tokens": usage.CompletionDetails.RejectedPredictionTokens,
+	} {
+		if value < 0 {
+			return core.UpstreamResponseError(core.ProtocolChat, path, "must be non-negative")
+		}
+	}
+	if usage.PromptDetails.CachedTokens > usage.PromptTokens {
+		return core.UpstreamResponseError(core.ProtocolChat, "$.usage.prompt_tokens_details.cached_tokens", "cannot exceed prompt_tokens")
+	}
+	if usage.CompletionDetails.ReasoningTokens > usage.CompletionTokens {
+		return core.UpstreamResponseError(core.ProtocolChat, "$.usage.completion_tokens_details.reasoning_tokens", "cannot exceed completion_tokens")
+	}
+	if usage.PromptDetails.AudioTokens != 0 {
+		return core.Unsupported(core.ProtocolChat, "$.usage.prompt_tokens_details.audio_tokens", "Responses usage has no input audio token field")
+	}
+	if usage.CompletionDetails.AudioTokens != 0 {
+		return core.Unsupported(core.ProtocolChat, "$.usage.completion_tokens_details.audio_tokens", "Responses usage has no output audio token field")
+	}
+	if usage.CompletionDetails.AcceptedPredictionTokens != 0 {
+		return core.Unsupported(core.ProtocolChat, "$.usage.completion_tokens_details.accepted_prediction_tokens", "Responses usage has no accepted prediction token field")
+	}
+	if usage.CompletionDetails.RejectedPredictionTokens != 0 {
+		return core.Unsupported(core.ProtocolChat, "$.usage.completion_tokens_details.rejected_prediction_tokens", "Responses usage has no rejected prediction token field")
+	}
 	return nil
+}
+
+func jsonValuesEqual(left, right json.RawMessage) bool {
+	var a, b any
+	return json.Unmarshal(left, &a) == nil && json.Unmarshal(right, &b) == nil && reflect.DeepEqual(a, b)
 }
 
 func (c *Converter) startEvents() []core.Frame {
@@ -395,15 +487,15 @@ func (c *Converter) appendReasoning(delta string) []core.Frame {
 				"output_index": reasoning.outputIndex,
 				"item":         c.reasoningSnapshot(reasoning, "in_progress"),
 			}),
-			c.event("response.reasoning_summary_part.added", map[string]any{
-				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0,
-				"part": map[string]any{"type": "summary_text", "text": ""},
+			c.event("response.content_part.added", map[string]any{
+				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0,
+				"part": map[string]any{"type": "reasoning_text", "text": ""},
 			}),
 		)
 	}
 	reasoning.text.WriteString(delta)
-	frames = append(frames, c.event("response.reasoning_summary_text.delta", map[string]any{
-		"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0, "delta": delta,
+	frames = append(frames, c.event("response.reasoning_text.delta", map[string]any{
+		"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0, "delta": delta,
 	}))
 	return frames
 }
@@ -476,8 +568,19 @@ func (c *Converter) appendTool(delta chatToolDelta) ([]core.Frame, error) {
 	if tool.closed {
 		return nil, core.Invalid(core.ProtocolChat, "$.choices[0].delta.tool_calls", "received data for a closed tool call")
 	}
+	if delta.ID != "" {
+		if tool.callID != "" && tool.callID != delta.ID {
+			return nil, core.Invalid(core.ProtocolChat, "$.choices[0].delta.tool_calls[].id", "changed during stream")
+		}
+		if priorIndex, duplicate := c.toolCallIDs[delta.ID]; duplicate && priorIndex != *delta.Index {
+			return nil, core.UpstreamResponseError(core.ProtocolChat, "$.choices[0].delta.tool_calls[].id", "tool call id %q is reused at indexes %d and %d", delta.ID, priorIndex, *delta.Index)
+		}
+	}
 	if err := mergeIdentity(&tool.callID, delta.ID, "id"); err != nil {
 		return nil, err
+	}
+	if delta.ID != "" {
+		c.toolCallIDs[delta.ID] = *delta.Index
 	}
 	if err := mergeIdentity(&tool.name, delta.Function.Name, "function.name"); err != nil {
 		return nil, err
@@ -564,18 +667,18 @@ func (c *Converter) closeOutputs(status string) ([]core.Frame, error) {
 	if reasoning := c.reasoning; reasoning != nil && !reasoning.closed {
 		text := reasoning.text.String()
 		frames = append(frames,
-			c.event("response.reasoning_summary_text.done", map[string]any{
-				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0, "text": text,
+			c.event("response.reasoning_text.done", map[string]any{
+				"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0, "text": text,
 			}),
 		)
 		partDone := map[string]any{
-			"item_id": reasoning.id, "output_index": reasoning.outputIndex, "summary_index": 0,
-			"part": map[string]any{"type": "summary_text", "text": text},
+			"item_id": reasoning.id, "output_index": reasoning.outputIndex, "content_index": 0,
+			"part": map[string]any{"type": "reasoning_text", "text": text},
 		}
 		if status == "incomplete" {
 			partDone["status"] = "incomplete"
 		}
-		frames = append(frames, c.event("response.reasoning_summary_part.done", partDone))
+		frames = append(frames, c.event("response.content_part.done", partDone))
 		reasoning.closed = true
 		frames = append(frames, c.event("response.output_item.done", map[string]any{
 			"output_index": reasoning.outputIndex,
@@ -656,6 +759,9 @@ func (c *Converter) finishStream() ([]core.Frame, error) {
 	if c.finishReason == "" {
 		return nil, core.UpstreamResponseError(core.ProtocolChat, "$.choices[0].finish_reason", "stream ended before a finish reason")
 	}
+	if err := openaicompat.ValidateCompleteModeration(c.moderation, core.ProtocolChat, "$.moderation", true); err != nil {
+		return nil, err
+	}
 	status := "completed"
 	eventName := "response.completed"
 	if c.finishReason == "length" || c.finishReason == "content_filter" {
@@ -702,6 +808,12 @@ func (c *Converter) responseObject(status string, terminal bool) map[string]any 
 		"model": c.displayModel(), "output": output,
 		"parallel_tool_calls": true,
 	}
+	if meaningfulJSON(c.serviceTier) {
+		response["service_tier"] = json.RawMessage(c.serviceTier)
+	}
+	if meaningfulJSON(c.moderation) {
+		response["moderation"] = json.RawMessage(c.moderation)
+	}
 	if terminal {
 		response["usage"] = c.usageSnapshot()
 	} else {
@@ -718,13 +830,13 @@ func (c *Converter) responseObject(status string, terminal bool) map[string]any 
 }
 
 func (c *Converter) reasoningSnapshot(reasoning *reasoningState, status string) map[string]any {
-	summary := make([]any, 0, 1)
+	content := make([]any, 0, 1)
 	if reasoning.text.Len() > 0 {
-		summary = append(summary, map[string]any{"type": "summary_text", "text": reasoning.text.String()})
+		content = append(content, map[string]any{"type": "reasoning_text", "text": reasoning.text.String()})
 	}
 	return map[string]any{
 		"id": reasoning.id, "type": "reasoning", "status": status,
-		"summary": summary, "encrypted_content": nil,
+		"summary": []any{}, "content": content, "encrypted_content": nil,
 	}
 }
 

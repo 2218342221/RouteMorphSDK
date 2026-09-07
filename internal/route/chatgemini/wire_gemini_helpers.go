@@ -11,15 +11,9 @@ func appendGeminiContent(target *geminiRequest, role string, parts ...geminiPart
 	target.Contents = append(target.Contents, geminiContent{Role: role, Parts: parts})
 }
 
-func checkGeminiSignature(signature, path string, policy lossPolicy, diagnostics *[]Diagnostic) error {
-	if signature == "" || signature == geminiThoughtSignatureBypass {
+func checkGeminiSignature(signature, path string, _ lossPolicy, _ *[]Diagnostic) error {
+	if signature == "" {
 		return nil
 	}
-	if policy == rejectSemanticLoss {
-		return unsupported(ProtocolGenerateContent, path, "Gemini thought signature cannot be represented by Chat")
-	}
-	if diagnostics != nil {
-		*diagnostics = appendDiagnostic(*diagnostics, "warning", "gemini_thought_signature_not_representable", path, "Gemini thought signature was omitted")
-	}
-	return nil
+	return unsupported(ProtocolGenerateContent, path, "provider-issued Gemini thought signatures cannot be represented by Chat and must not be dropped")
 }

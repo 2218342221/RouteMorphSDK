@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -70,6 +71,140 @@ func TestMessagesThinkingAndEffortValidation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := chatRoute.ToUpstreamRequest(context.Background(), []byte(test.body), conversionOptions{LossPolicy: allowDocumentedLoss}); !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestOpenAIReasoningEffortToMessagesUsesAnthropicIntersection(t *testing.T) {
+	chatRoute := newChatMessagesRoute(routeSpec{From: ProtocolChat, To: ProtocolMessages})
+	responsesRoute := newResponsesMessagesRoute(routeSpec{From: ProtocolResponses, To: ProtocolMessages})
+	for _, effort := range []string{"low", "medium", "high", "xhigh", "max"} {
+		t.Run("accepted_"+effort, func(t *testing.T) {
+			chatBody := fmt.Sprintf(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"reasoning_effort":%q}`, effort)
+			result, err := chatRoute.ToUpstreamRequest(context.Background(), []byte(chatBody), conversionOptions{})
+			if err != nil {
+				t.Fatalf("Chat -> Messages: %v", err)
+			}
+			var converted messagesRequest
+			if err := json.Unmarshal(result.Body, &converted); err != nil {
+				t.Fatal(err)
+			}
+			if converted.Thinking != nil || converted.OutputConfig == nil || converted.OutputConfig.Effort != effort {
+				t.Fatalf("Chat -> Messages invented thinking or lost effort: %s", result.Body)
+			}
+			responsesBody := fmt.Sprintf(`{"model":"gpt","input":"hi","reasoning":{"effort":%q}}`, effort)
+			if _, err := responsesRoute.ToUpstreamRequest(context.Background(), []byte(responsesBody), conversionOptions{LossPolicy: allowDocumentedLoss}); err != nil {
+				t.Fatalf("Responses -> Messages: %v", err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		effort string
+		want   error
+	}{
+		{effort: "none", want: ErrUnsupported},
+		{effort: "minimal", want: ErrUnsupported},
+		{effort: "turbo", want: ErrInvalidPayload},
+	} {
+		t.Run("rejected_"+test.effort, func(t *testing.T) {
+			chatBody := fmt.Sprintf(`{"model":"gpt","messages":[{"role":"user","content":"hi"}],"reasoning_effort":%q}`, test.effort)
+			if _, err := chatRoute.ToUpstreamRequest(context.Background(), []byte(chatBody), conversionOptions{}); !errors.Is(err, test.want) {
+				t.Fatalf("Chat -> Messages error = %v, want %v", err, test.want)
+			}
+			responsesBody := fmt.Sprintf(`{"model":"gpt","input":"hi","reasoning":{"effort":%q}}`, test.effort)
+			if _, err := responsesRoute.ToUpstreamRequest(context.Background(), []byte(responsesBody), conversionOptions{LossPolicy: allowDocumentedLoss}); !errors.Is(err, test.want) {
+				t.Fatalf("Responses -> Messages error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestChatMessagesToolHistoryRequiresMatchedCalls(t *testing.T) {
+	chatToMessages := newChatMessagesRoute(routeSpec{From: ProtocolChat, To: ProtocolMessages})
+	messagesToChat := newChatMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolChat})
+	tests := []struct {
+		name      string
+		converter routeConverter
+		body      string
+		path      string
+	}{
+		{
+			name: "orphan Chat tool result", converter: chatToMessages,
+			body: `{"model":"gpt","messages":[{"role":"tool","tool_call_id":"ghost","content":"x"}]}`,
+			path: "tool_call_id",
+		},
+		{
+			name: "duplicate Chat call id", converter: chatToMessages,
+			body: `{"model":"gpt","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"a","arguments":"{}"}},{"id":"call_1","type":"function","function":{"name":"b","arguments":"{}"}}]}]}`,
+			path: "duplicate tool call id",
+		},
+		{
+			name: "duplicate Chat result", converter: chatToMessages,
+			body: `{"model":"gpt","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"a","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"x"},{"role":"tool","tool_call_id":"call_1","content":"again"}]}`,
+			path: "duplicate tool result",
+		},
+		{
+			name: "mismatched Chat result name", converter: chatToMessages,
+			body: `{"model":"gpt","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"a","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","name":"b","content":"x"}]}`,
+			path: "does not match",
+		},
+		{
+			name: "orphan Messages tool result", converter: messagesToChat,
+			body: `{"model":"claude","max_tokens":64,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"ghost","content":"x"}]}]}`,
+			path: "tool_use_id",
+		},
+		{
+			name: "duplicate Messages call id", converter: messagesToChat,
+			body: `{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"a","input":{}},{"type":"tool_use","id":"call_1","name":"b","input":{}}]}]}`,
+			path: "duplicate tool_use id",
+		},
+		{
+			name: "duplicate Messages result", converter: messagesToChat,
+			body: `{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"a","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"x"},{"type":"tool_result","tool_use_id":"call_1","content":"again"}]}]}`,
+			path: "duplicate tool_result",
+		},
+		{
+			name: "Messages tool use has wrong role", converter: messagesToChat,
+			body: `{"model":"claude","max_tokens":64,"messages":[{"role":"user","content":[{"type":"tool_use","id":"call_1","name":"a","input":{}}]}]}`,
+			path: "assistant role",
+		},
+		{
+			name: "Messages tool result has wrong role", converter: messagesToChat,
+			body: `{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"a","input":{}}]},{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"call_1","content":"x"}]}]}`,
+			path: "user role",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := test.converter.ToUpstreamRequest(context.Background(), []byte(test.body), conversionOptions{})
+			if !errors.Is(err, ErrInvalidPayload) || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("error = %v, want ErrInvalidPayload containing %q", err, test.path)
+			}
+		})
+	}
+
+	validChat := []byte(`{"model":"gpt","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"a","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","name":"a","content":"ok"}]}`)
+	if _, err := chatToMessages.ToUpstreamRequest(context.Background(), validChat, conversionOptions{}); err != nil {
+		t.Fatalf("valid Chat history: %v", err)
+	}
+	validMessages := []byte(`{"model":"claude","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"a","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}]}`)
+	if _, err := messagesToChat.ToUpstreamRequest(context.Background(), validMessages, conversionOptions{}); err != nil {
+		t.Fatalf("valid Messages history: %v", err)
+	}
+	lateInstructions := []struct {
+		name      string
+		converter routeConverter
+		body      string
+	}{
+		{name: "Chat", converter: chatToMessages, body: `{"model":"gpt","messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"}]}`},
+		{name: "Messages", converter: messagesToChat, body: `{"model":"claude","max_tokens":64,"messages":[{"role":"user","content":"hi"},{"role":"system","content":"late"}]}`},
+	}
+	for _, test := range lateInstructions {
+		t.Run("interleaved "+test.name+" instructions", func(t *testing.T) {
+			_, err := test.converter.ToUpstreamRequest(context.Background(), []byte(test.body), conversionOptions{})
+			if !errors.Is(err, ErrUnsupported) || !strings.Contains(err.Error(), ".role") {
+				t.Fatalf("error = %v, want ErrUnsupported at role", err)
 			}
 		})
 	}
@@ -213,7 +348,7 @@ func TestAnthropicAndOpenAIUsageUseTheirNativeCacheAccounting(t *testing.T) {
 
 	toMessages := newResponsesMessagesRoute(routeSpec{From: ProtocolMessages, To: ProtocolResponses})
 	back, err := toMessages.ToClientResponse(context.Background(), []byte(`{
-		"id":"resp_1","object":"response","model":"gpt","status":"completed","output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]}],
+		"id":"resp_1","object":"response","model":"gpt","status":"completed","output":[{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok","annotations":[]}]}],
 		"usage":{"input_tokens":13,"output_tokens":5,"total_tokens":18,"input_tokens_details":{"cached_tokens":3}}
 	}`), conversionOptions{})
 	if err != nil {

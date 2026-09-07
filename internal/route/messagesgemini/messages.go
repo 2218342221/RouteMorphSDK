@@ -13,6 +13,7 @@ type messagesBlock = messageswire.Block
 type messagesTool = messageswire.Tool
 type messagesThinking = messageswire.Thinking
 type messagesOutputConfig = messageswire.OutputConfig
+type messagesOutputTokensDetails = messageswire.OutputTokensDetails
 
 func validateMessagesThinking(thinking *messagesThinking, path string) error {
 	if thinking == nil {
@@ -54,20 +55,36 @@ func rejectMessagesBlockMetadata(block messagesBlock, path string) error {
 	if block.ToolsetName != "" {
 		return unsupported(ProtocolMessages, path+".toolset_name", "toolset membership has no portable cross-protocol equivalent")
 	}
+	if block.Title != "" {
+		return unsupported(ProtocolMessages, path+".title", "document title metadata has no Gemini equivalent")
+	}
+	if block.Context != "" {
+		return unsupported(ProtocolMessages, path+".context", "document context metadata has no Gemini equivalent")
+	}
+	if jsonValuePresent(block.Transformations) {
+		return unsupported(ProtocolMessages, path+".transformations", "document transformations have no Gemini equivalent")
+	}
 	return nil
 }
 
 func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil, nil
+	}
+	if _, err := rejectUnknownObjectFields(ProtocolMessages, trimmed, "$.tool_choice", "type", "name", "disable_parallel_tool_use"); err != nil {
+		return toolChoice{}, nil, err
 	}
 	var value struct {
 		Type                   string `json:"type"`
 		Name                   string `json:"name"`
 		DisableParallelToolUse *bool  `json:"disable_parallel_tool_use"`
 	}
-	if err := json.Unmarshal(raw, &value); err != nil {
+	if err := json.Unmarshal(trimmed, &value); err != nil {
 		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice", "invalid tool choice")
+	}
+	if value.Type == "" {
+		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.type", "non-empty string is required")
 	}
 	var parallel *bool
 	if value.DisableParallelToolUse != nil && value.Type != "none" {
@@ -76,10 +93,19 @@ func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
 	}
 	switch value.Type {
 	case "auto":
+		if value.Name != "" {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.name", "name is only valid for tool choice type tool")
+		}
 		return toolChoice{Mode: toolChoiceAuto}, parallel, nil
 	case "none":
+		if value.Name != "" || value.DisableParallelToolUse != nil {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice", "none choice cannot include name or disable_parallel_tool_use")
+		}
 		return toolChoice{Mode: toolChoiceNone}, nil, nil
 	case "any":
+		if value.Name != "" {
+			return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.name", "name is only valid for tool choice type tool")
+		}
 		return toolChoice{Mode: toolChoiceRequired}, parallel, nil
 	case "tool":
 		if value.Name == "" {
@@ -87,7 +113,7 @@ func decodeMessagesToolChoice(raw json.RawMessage) (toolChoice, *bool, error) {
 		}
 		return toolChoice{Mode: toolChoiceNamed, Name: value.Name}, parallel, nil
 	default:
-		return toolChoice{}, nil, unsupported(ProtocolMessages, "$.tool_choice.type", "tool choice %q is not portable", value.Type)
+		return toolChoice{}, nil, invalid(ProtocolMessages, "$.tool_choice.type", "unknown tool choice type %q", value.Type)
 	}
 }
 
@@ -152,6 +178,12 @@ func validateMessagesResponse(source messagesResponse) error {
 	}
 	if source.Usage.InputTokens < 0 || source.Usage.OutputTokens < 0 || source.Usage.CacheCreationInputTokens < 0 || source.Usage.CacheReadInputTokens < 0 {
 		return upstreamResponseError(ProtocolMessages, "$.usage", "token counts must not be negative")
+	}
+	if source.Usage.CacheCreation != nil && (source.Usage.CacheCreation.Ephemeral1hInputTokens < 0 || source.Usage.CacheCreation.Ephemeral5mInputTokens < 0) {
+		return upstreamResponseError(ProtocolMessages, "$.usage.cache_creation", "cache-creation token counts must not be negative")
+	}
+	if source.Usage.OutputTokensDetails != nil && (source.Usage.OutputTokensDetails.ThinkingTokens < 0 || source.Usage.OutputTokensDetails.ThinkingTokens > source.Usage.OutputTokens) {
+		return upstreamResponseError(ProtocolMessages, "$.usage.output_tokens_details.thinking_tokens", "thinking tokens must be between zero and output_tokens")
 	}
 	if _, err := parseMessagesFinish(source.StopReason); err != nil {
 		return err

@@ -1,0 +1,39 @@
+{
+  "systemInstruction": {
+    "role": "user",
+    "parts": [
+      {
+        "text": "You are a deterministic regression assistant. When the final user asks for a token, output only that ASCII token."
+      }
+    ]
+  },
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "The earlier token is RM_CONVERSATION_OLD_GENERATE_CONTENT_NON_STREAM. Reply with ACK."
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "text": "ACK"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Return exactly the ASCII token RM_CONVERSATION_GENERATE_CONTENT_NON_STREAM."
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "model": "routemorph-live-client",
+  "instructions": "You are a deterministic regression assistant. When the final user asks for a token, output only that ASCII token.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "The earlier token is RM_CONVERSATION_OLD_RESPONSES_STREAM. Reply with ACK."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "ACK"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Return exactly the ASCII token RM_CONVERSATION_RESPONSES_STREAM."
+        }
+      ]
+    }
+  ],
+  "max_output_tokens": 256,
+  "stream": true,
+  "store": false
+}

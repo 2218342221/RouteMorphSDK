@@ -1,0 +1,23 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Use web search to identify the canonical website of the Go programming language. Answer briefly and cite the source."
+    }
+  ],
+  "web_search_options": {
+    "search_context_size": "low",
+    "user_location": {
+      "type": "approximate",
+      "approximate": {
+        "city": "Shanghai",
+        "country": "CN",
+        "region": "Shanghai",
+        "timezone": "Asia/Shanghai"
+      }
+    }
+  },
+  "max_completion_tokens": 512,
+  "stream": false
+}

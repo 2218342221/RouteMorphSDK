@@ -1,0 +1,21 @@
+{
+  "model": "routemorph-live-client",
+  "input": "Invoke record_marker_text with exactly the ASCII token RM_CUSTOM_NATIVE_STREAM as its raw input. Do not answer with text.",
+  "tools": [
+    {
+      "type": "custom",
+      "name": "record_marker_text",
+      "description": "Record the supplied marker verbatim",
+      "format": {
+        "type": "text"
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "custom",
+    "name": "record_marker_text"
+  },
+  "max_output_tokens": 256,
+  "stream": true,
+  "store": false
+}

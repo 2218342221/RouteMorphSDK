@@ -21,6 +21,7 @@ type adapterAPI interface {
 	OpenAIResponses(context.Context, *routemorph.Request) (*routemorph.Response, error)
 	AnthropicMessages(context.Context, *routemorph.Request) (*routemorph.Response, error)
 	GeminiGenerateContent(context.Context, *routemorph.Request) (*routemorph.Response, error)
+	HTTPClient() *http.Client
 }
 
 var (
@@ -31,6 +32,7 @@ var (
 	_ func(string, string, ...routemorph.Option) (*routemorph.Adapter, error)                                           = routemorph.NewAnthropicMessagesAdapter
 	_ func(string, string, ...routemorph.Option) (*routemorph.Adapter, error)                                           = routemorph.NewGeminiGenerateContentAdapter
 	_ func(string) routemorph.Option                                                                                    = routemorph.WithModel
+	_ func() routemorph.Option                                                                                          = routemorph.WithCodingAgentCompatibility
 	_ func(string) (routemorph.Protocol, error)                                                                         = routemorph.ParseProtocol
 	_ func(context.Context, routemorph.Protocol, *url.URL, []byte) (routemorph.RequestInfo, error)                      = routemorph.InspectRequest
 	_ func(context.Context, routemorph.Protocol, *url.URL, []byte) (*routemorph.Request, routemorph.RequestInfo, error) = routemorph.PrepareRequest

@@ -1,0 +1,46 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Record the left and right values."
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_parallel_left",
+          "type": "function",
+          "function": {
+            "name": "record_left",
+            "arguments": "{\"value\":\"left\"}"
+          }
+        },
+        {
+          "id": "call_parallel_right",
+          "type": "function",
+          "function": {
+            "name": "record_right",
+            "arguments": "{\"value\":\"right\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_parallel_left",
+      "content": "left recorded"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_parallel_right",
+      "content": "right recorded"
+    },
+    {
+      "role": "user",
+      "content": "Both calls succeeded. Return exactly the ASCII token RM_PARALLEL_RESULT_CHAT_NON_STREAM."
+    }
+  ],
+  "max_completion_tokens": 256,
+  "stream": false
+}

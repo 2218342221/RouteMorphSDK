@@ -30,6 +30,12 @@ func (c *chatToMessagesConverter) ToUpstreamRequest(_ context.Context, input []b
 		"prompt_cache_key", "prompt_cache_retention", "safety_identifier", "stream_options"); err != nil {
 		return conversionResult{}, err
 	}
+	if err := validateChatResponseFormatFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
+	if err := validateChatMessageContentFields(ProtocolChat, input); err != nil {
+		return conversionResult{}, err
+	}
 	extraDiagnostics, err := validateChatToMessagesRequest(input, options.LossPolicy)
 	if err != nil {
 		return conversionResult{}, err
@@ -51,7 +57,10 @@ func (c *chatToMessagesConverter) ToClientResponse(_ context.Context, input []by
 	if err != nil {
 		return conversionResult{}, err
 	}
-	var diagnostics []Diagnostic
+	diagnostics, err := messagesResponseExtensionDiagnostics(source, options.LossPolicy)
+	if err != nil {
+		return conversionResult{}, err
+	}
 	if source.StopReason == "stop_sequence" {
 		if options.LossPolicy == rejectSemanticLoss {
 			return conversionResult{}, unsupported(ProtocolMessages, "$.stop_sequence", "Chat responses cannot preserve the matched stop sequence")
@@ -90,6 +99,9 @@ func (c *chatToMessagesConverter) ToClientResponse(_ context.Context, input []by
 	target.Usage.CompletionTokens = source.Usage.OutputTokens
 	target.Usage.TotalTokens = target.Usage.PromptTokens + target.Usage.CompletionTokens
 	target.Usage.PromptDetails.CachedTokens = source.Usage.CacheReadInputTokens
+	if source.Usage.OutputTokensDetails != nil {
+		target.Usage.CompletionDetails.ReasoningTokens = source.Usage.OutputTokensDetails.ThinkingTokens
+	}
 	body, err := marshal(ProtocolChat, target)
 	return conversionResult{Body: body, Diagnostics: diagnostics}, err
 }

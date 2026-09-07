@@ -39,11 +39,14 @@ The public API is intentionally small:
 
 - four constructors select the upstream protocol;
 - four methods on `*Adapter` select the ingress/client protocol;
+- `Adapter.HTTPClient` exposes the same routes as a standard `*http.Client` for
+  injection into official provider SDKs;
 - `Request` and `Response` are public-owned HTTP boundary types;
 - `InspectRequest` and `PrepareRequest` expose the model and streaming flag for
   provider selection without exposing internal protocol DTOs;
 - `EncodeError` creates an ingress-native error envelope;
-- `WithModel` is the only constructor option;
+- `WithModel` fixes the upstream model and `WithCodingAgentCompatibility`
+  explicitly enables documented coding-client approximations;
 - typed error categories, `ConversionError` and `ResponseMeta.Diagnostics()`
   expose failures and non-fatal approximations.
 
@@ -79,6 +82,46 @@ defer response.Body.Close()
 _, err = io.Copy(os.Stdout, response.Body)
 return err
 ```
+
+## Provider SDK injection
+
+Official provider SDKs can use the same conversion path without a local HTTP
+gateway. Inject the client returned by `Adapter.HTTPClient`; the provider SDK
+continues to own typed request and response objects while RouteMorph handles
+the wire conversion:
+
+```go
+adapter, err := routemorph.NewAnthropicMessagesAdapter(
+    "https://api.anthropic.com",
+    os.Getenv("ANTHROPIC_API_KEY"),
+    routemorph.WithModel("your-anthropic-model"),
+)
+if err != nil {
+    return err
+}
+
+client := openai.NewClient(
+    option.WithBaseURL("https://routemorph.invalid/v1"),
+    option.WithAPIKey("intercepted-by-routemorph"),
+    option.WithHTTPClient(adapter.HTTPClient()),
+    option.WithMaxRetries(0),
+)
+completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+    Model:    "client-model",
+    Messages: []openai.ChatCompletionMessageParamUnion{openai.UserMessage("Hello")},
+})
+```
+
+The bridge recognizes OpenAI Chat Completions and Responses, Anthropic
+Messages, and Gemini Developer API `generateContent`/`streamGenerateContent`
+requests. It fails closed with `ErrUnsupported` for other SDK endpoints instead
+of sending them to the network. The adapter's upstream credential replaces any
+credential added by the ingress SDK.
+
+See [`examples/provider-sdks`](examples/provider-sdks) for compiling OpenAI,
+Anthropic, and Gemini examples and a local end-to-end test using all three
+official SDKs. The examples are a nested module so this main module keeps its
+standard-library-only dependency contract.
 
 For an HTTP handler, `Response.WriteTo` relays the status, headers, body, stream
 flushes, and trailers, and closes the response body:
@@ -164,10 +207,9 @@ still match. If the caller changes the request, the adapter performs normal
 validation again. Prepared metadata is an optimization, not an authentication
 token.
 
-## Model override
+## Adapter options
 
-`Option` is reserved for constructor-level behavior. `WithModel` is the only
-supported option in this release:
+`WithModel` replaces the client model on the upstream request:
 
 ```go
 adapter, err := routemorph.NewAnthropicMessagesAdapter(
@@ -180,6 +222,27 @@ adapter, err := routemorph.NewAnthropicMessagesAdapter(
 The configured model replaces the client model on the upstream request. Model
 fields in upstream responses and stream events are restored to the original
 client model. If `WithModel` is repeated, the last value wins.
+
+Strict, fail-closed conversion is the default. Claude Code and Gemini CLI add
+provider-specific cache, thinking, and replay controls that have no exact
+Responses equivalent. Enable their narrowly validated, diagnostic-producing
+compatibility path explicitly:
+
+```go
+adapter, err := routemorph.NewOpenAIResponsesAdapter(
+    baseURL,
+    apiKey,
+    routemorph.WithModel("gpt-5.4"),
+    routemorph.WithCodingAgentCompatibility(),
+)
+```
+
+The option does not accept arbitrary provider state. For example, only
+Claude's no-op `clear_thinking_20251015` with `keep:"all"`, exact ephemeral
+cache markers, and its captured `enabled`/`adaptive` thinking shapes with
+omitted display, plus Gemini CLI's exact documented
+`skip_thought_signature_validator` sentinel receive compatibility handling.
+Every approximation is available from `Response.Meta.Diagnostics()`.
 
 ## Response and errors
 
@@ -202,13 +265,17 @@ type Response struct {
 - Redirects are not followed and return a 502 client-protocol response.
 - Invalid input, unsupported semantic conversion, transport failure, and
   invalid successful upstream output return a Go error.
-- A conversion failure after streaming begins emits the client protocol's error
-  event and is also returned by `Body.Read` or `WriteTo`.
+- A conversion failure after streaming begins is returned by `Body.Read` or
+  `WriteTo`. Chat, Responses, and Messages also receive their protocol error
+  event; Gemini has no SDK-recognized in-band error event, so its stream closes
+  with the read error without emitting a fake response chunk.
 - `Response.Meta.Diagnostics()` is concurrency-safe. Stream diagnostics are
   complete after Body reaches EOF.
 
-Cross-protocol conversion rejects unsupported semantic loss. Native requests
-remain pass-through unless `WithModel` requires model rewriting.
+Cross-protocol conversion rejects unsupported semantic loss by default.
+`WithCodingAgentCompatibility` enables only documented approximations and
+reports each one through diagnostics. Native requests remain pass-through
+unless `WithModel` requires model rewriting.
 
 ## Route matrix: 12 + 4
 
@@ -228,7 +295,32 @@ buffered routes enforce terminal validation and a 32 MiB aggregate bound before
 rendering the target stream.
 
 See [Cross-protocol compatibility](docs/compatibility.md) for field-level
-behavior and fail-closed cases.
+behavior and the [unsupported feature inventory](docs/unsupported.md) for
+explicit fail-closed and diagnostic-only boundaries.
+
+Important protocol boundaries in this release:
+
+- ordinary function declarations, calls, and results use the portable common
+  subset on every cross-protocol route;
+- OpenAI Chat and Responses additionally share a **non-streaming** custom-tool
+  subset. The official Responses item names are `custom_tool_call` and
+  `custom_tool_call_output` (not `customized_tool_call`). Native Responses
+  streams preserve the custom input delta/done lifecycle, but Chat has no
+  official equivalent streaming delta;
+- Chat `web_search_options` and the unversioned Responses `web_search` tool map
+  only for their common non-streaming request fields. Responses `tool_search`
+  and `additional_tools` remain Responses-native. Server tool search is
+  provider-executed discovery; client tool search requires the caller to return
+  `tool_search_output` and the discovered definitions before the model can
+  continue. Responses `configuration_update` is also native-only because it
+  updates persisted conversation state rather than the current request's
+  top-level reasoning;
+- multimodal input is converted only when role, source, MIME type, URL/file
+  provenance, and detail controls all have a destination equivalent. In
+  particular, Responses Create message content has no `input_audio` member;
+- reasoning request controls, visible reasoning text, opaque provider replay
+  state, and reasoning-token usage are separate capabilities. Opaque state is
+  never fabricated or silently discarded across providers.
 
 ## Resource limits and failure policy
 
@@ -281,6 +373,9 @@ whether its callers may set even these allowlisted values.
 - [`examples/minimal-gateway`](examples/minimal-gateway) is a runnable minimal
   conversion service. It exposes all four client endpoints and can target any
   one of the four upstream protocols.
+- [`examples/provider-sdks`](examples/provider-sdks) injects
+  `Adapter.HTTPClient()` into the official OpenAI, Anthropic, and Gemini Go
+  SDKs without running a local gateway.
 
 ```bash
 export OPENAI_API_KEY='...'
@@ -290,12 +385,26 @@ go run ./examples/direct-call
 UPSTREAM_PROTOCOL=responses \
 UPSTREAM_BASE_URL=https://api.openai.com/v1 \
 UPSTREAM_API_KEY="$OPENAI_API_KEY" \
+UPSTREAM_MODEL=gpt-5.4 \
+CODING_AGENT_COMPATIBILITY=true \
 go run ./examples/minimal-gateway
+
+# The provider SDK examples are an independent module.
+cd examples/provider-sdks
+UPSTREAM_PROTOCOL=responses \
+UPSTREAM_BASE_URL=https://api.openai.com/v1 \
+UPSTREAM_API_KEY="$OPENAI_API_KEY" \
+UPSTREAM_MODEL='your-upstream-model' \
+go run ./openai
 ```
 
 The direct example accepts `OPENAI_BASE_URL`. The gateway accepts
 `UPSTREAM_PROTOCOL`, `UPSTREAM_BASE_URL`, `UPSTREAM_API_KEY`, `LISTEN_ADDR`, and
-optional `UPSTREAM_MODEL`; see its directory README for details.
+optional `UPSTREAM_MODEL` and `CODING_AGENT_COMPATIBILITY`; see its directory
+README for details.
+The provider SDK examples use the same `UPSTREAM_*` settings and additionally
+accept `CLIENT_MODEL`; see their README for supported SDK operations and
+credential behavior.
 
 ## Development
 
@@ -304,6 +413,29 @@ All commands run from this directory without the parent repository:
 ```bash
 make check
 ```
+
+Live Responses-provider regression tests are opt-in and billable. Their
+file-backed catalog contains 63 independently maintained JSON request fixtures
+under `testdata/e2e/responses`: core 32, extended 18, and tools 13. Each fixture
+represents one provider HTTP request. Run a group or the complete catalog:
+
+```bash
+make test-live-responses-core      # 32 HTTP calls
+make test-live-responses-extended  # 18 HTTP calls
+make test-live-responses-tools     # 13 HTTP calls in 12 logical cases
+make test-live-responses           # all 63 HTTP calls
+make test-live-coding-agents       # installed Claude/Gemini/Codex, 9 cases (3 each)
+```
+
+The request files use a fixed client-side model alias and contain no provider
+base URL, API key, authorization header, or deployment model. The live loader
+supplies those values from `ROUTEMORPH_LIVE_*` environment variables at runtime.
+The tool matrix verifies native Responses lifecycles and the supported
+non-streaming Chat↔Responses subset; it does not imply that native discovery
+items can be converted to Messages or Gemini. See
+[Live provider testing](docs/live-testing.md) for the exact matrix, local and
+live reproduction commands, known cross-protocol boundaries, and credential
+handling rules.
 
 `BenchmarkBuiltinRoutes` measures request and response conversion for all 12
 ordered cross-protocol routes. `BenchmarkBuiltinRouteStreams` measures their

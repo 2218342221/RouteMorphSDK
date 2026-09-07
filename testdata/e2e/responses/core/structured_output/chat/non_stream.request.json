@@ -1,0 +1,30 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Return an object whose marker field is exactly RM_JSON_CHAT_NON_STREAM."
+    }
+  ],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "marker_result",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "marker"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "max_completion_tokens": 256,
+  "stream": false
+}

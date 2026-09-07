@@ -60,7 +60,7 @@ func TestRefusalLifecycle(t *testing.T) {
 	}
 }
 
-func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
+func TestReasoningTextLifecycleAndTerminalOutput(t *testing.T) {
 	converter := New(Options{})
 	frames := convertAll(t, converter,
 		frame(`{"id":"chatcmpl-reason","created":8,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"plan "},"finish_reason":null}]}`),
@@ -69,9 +69,9 @@ func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
 	)
 	wantEvents := []string{
 		"response.created", "response.in_progress", "response.output_item.added",
-		"response.reasoning_summary_part.added", "response.reasoning_summary_text.delta",
-		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done",
-		"response.reasoning_summary_part.done", "response.output_item.done", "response.completed",
+		"response.content_part.added", "response.reasoning_text.delta",
+		"response.reasoning_text.delta", "response.reasoning_text.done",
+		"response.content_part.done", "response.output_item.done", "response.completed",
 	}
 	assertEvents(t, frames, wantEvents)
 	assertSequence(t, frames)
@@ -85,9 +85,12 @@ func TestReasoningSummaryLifecycleAndTerminalOutput(t *testing.T) {
 	if reasoning["type"] != "reasoning" || reasoning["status"] != "completed" {
 		t.Fatalf("reasoning item = %#v", reasoning)
 	}
-	summary := reasoning["summary"].([]any)
-	if len(summary) != 1 || summary[0].(map[string]any)["text"] != "plan done" {
+	if summary := reasoning["summary"].([]any); len(summary) != 0 {
 		t.Fatalf("reasoning summary = %#v", summary)
+	}
+	content := reasoning["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["type"] != "reasoning_text" || content[0].(map[string]any)["text"] != "plan done" {
+		t.Fatalf("reasoning content = %#v", content)
 	}
 }
 
@@ -115,6 +118,29 @@ func TestToolCallLifecycle(t *testing.T) {
 	if tool["call_id"] != "call_1" || tool["status"] != "completed" {
 		t.Fatalf("tool output = %#v", tool)
 	}
+}
+
+func TestToolCallIDCannotBeReusedAcrossIndexes(t *testing.T) {
+	converter := New(Options{})
+	first, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"chatcmpl-duplicate","created":9,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"first","arguments":"{}"}}]},"finish_reason":null}]}`))
+	if err != nil || len(diagnostics) != 0 || len(first) == 0 {
+		t.Fatalf("first Convert() frames=%#v diagnostics=%#v error=%v", first, diagnostics, err)
+	}
+
+	frames, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"chatcmpl-duplicate","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"second","arguments":"{}"}}]},"finish_reason":null}]}`))
+	if !errors.Is(err, core.ErrUpstreamResponse) || !strings.Contains(err.Error(), `tool call id "call_1" is reused at indexes 0 and 1`) {
+		t.Fatalf("second Convert() frames=%#v diagnostics=%#v error=%v, want duplicate call-id error", frames, diagnostics, err)
+	}
+}
+
+func TestToolCallIDMayRepeatAtSameIndex(t *testing.T) {
+	converter := New(Options{})
+	frames := convertAll(t, converter,
+		frame(`{"id":"chatcmpl-repeat","created":9,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{"}}]},"finish_reason":null}]}`),
+		frame(`{"id":"chatcmpl-repeat","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}`),
+		doneFrame(),
+	)
+	assertContainsEvents(t, frames, "response.function_call_arguments.done", "response.completed")
 }
 
 func TestEmptyToolArgumentsBecomeJSONObject(t *testing.T) {
@@ -236,6 +262,58 @@ func TestKnownChatChunkMetadataIsAccepted(t *testing.T) {
 	_, _, err := converter.Convert(context.Background(), frame(`{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","system_fingerprint":"fp","service_tier":"default","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`))
 	if err != nil {
 		t.Fatalf("Convert() error = %v", err)
+	}
+}
+
+func TestOpenAIV355ChunkEnvelopeIsMappedOrDiagnosed(t *testing.T) {
+	converter := New(Options{})
+	frames, diagnostics, err := converter.Convert(context.Background(), frame(`{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","service_tier":"priority","moderation":{"input":{"type":"moderation_results","model":"omni-moderation-latest","results":[{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false}]}},"system_fingerprint":"fp","obfuscation":"padding","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 2 || diagnostics[0].Code != "chat_system_fingerprint_not_representable" || diagnostics[1].Code != "chat_stream_obfuscation_not_representable" {
+		t.Fatalf("diagnostics = %#v", diagnostics)
+	}
+	if len(frames) == 0 || !strings.Contains(streamText(frames), `"service_tier":"priority"`) || !strings.Contains(streamText(frames), `"moderation":`) {
+		t.Fatalf("Responses events did not preserve envelope fields: %s", streamText(frames))
+	}
+}
+
+func TestOpenAIV355ModerationOnlyChunksAreAccumulated(t *testing.T) {
+	converter := New(Options{})
+	result := `{"type":"moderation_result","model":"omni-moderation-latest","categories":{},"category_applied_input_types":{},"category_scores":{},"flagged":false}`
+	for _, side := range []string{"input", "output"} {
+		chunk := `{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"moderation":{"` + side + `":{"type":"moderation_results","model":"omni-moderation-latest","results":[` + result + `]}}}`
+		frames, _, err := converter.Convert(context.Background(), frame(chunk))
+		if err != nil || len(frames) != 0 {
+			t.Fatalf("%s moderation-only chunk frames=%#v error=%v", side, frames, err)
+		}
+	}
+	if _, _, err := converter.Convert(context.Background(), frame(`{"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	frames, _, err := converter.Convert(context.Background(), core.Frame{Done: true, Data: []byte("[DONE]")})
+	if err != nil || !strings.Contains(streamText(frames), `"moderation":{"input":`) || !strings.Contains(streamText(frames), `"output":`) {
+		t.Fatalf("terminal moderation frames=%s error=%v", streamText(frames), err)
+	}
+}
+
+func TestOpenAIV355ChunkUsageFailsClosed(t *testing.T) {
+	converter := New(Options{})
+	if _, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"completion_tokens_details":{"accepted_prediction_tokens":1}}}`))
+	if !errors.Is(err, core.ErrUnsupported) {
+		t.Fatalf("Convert() error = %v, want ErrUnsupported", err)
+	}
+}
+
+func TestOpenAIV355ChunkCommonUsageIsValidated(t *testing.T) {
+	converter := New(Options{})
+	_, _, err := converter.Convert(context.Background(), frame(`{"id":"x","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"prompt_tokens_details":{"cached_tokens":2}}}`))
+	if !errors.Is(err, core.ErrUpstreamResponse) {
+		t.Fatalf("Convert() error = %v, want ErrUpstreamResponse", err)
 	}
 }
 

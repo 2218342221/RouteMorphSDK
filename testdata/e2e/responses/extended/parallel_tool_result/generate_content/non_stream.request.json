@@ -1,0 +1,64 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Record the left and right values."
+        }
+      ]
+    },
+    {
+      "role": "model",
+      "parts": [
+        {
+          "functionCall": {
+            "id": "call_parallel_left",
+            "name": "record_left",
+            "args": {
+              "value": "left"
+            }
+          }
+        },
+        {
+          "functionCall": {
+            "id": "call_parallel_right",
+            "name": "record_right",
+            "args": {
+              "value": "right"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "parts": [
+        {
+          "functionResponse": {
+            "id": "call_parallel_left",
+            "name": "record_left",
+            "response": {
+              "result": "left recorded"
+            }
+          }
+        },
+        {
+          "functionResponse": {
+            "id": "call_parallel_right",
+            "name": "record_right",
+            "response": {
+              "result": "right recorded"
+            }
+          }
+        },
+        {
+          "text": "Both calls succeeded. Return exactly the ASCII token RM_PARALLEL_RESULT_GENERATE_CONTENT_NON_STREAM."
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256
+  }
+}

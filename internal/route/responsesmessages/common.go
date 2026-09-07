@@ -26,6 +26,12 @@ const (
 
 var ErrInvalidPlan = core.ErrInvalidPlan
 
+func codingAgentCompatibility(options conversionOptions) bool {
+	// AllowDocumentedLoss keeps its existing lower-level characterization
+	// behavior. Public adapters enable only the narrow coding-agent profile.
+	return options.CodingAgentCompatibility || options.LossPolicy != rejectSemanticLoss
+}
+
 type BufferedFactory func(core.RouteSpec, core.ConversionOptions, func(context.Context, []byte, core.ConversionOptions) (core.ConversionResult, error)) core.ResponseStream
 
 func New(spec core.RouteSpec, buffered BufferedFactory) core.Route {
@@ -49,10 +55,19 @@ func upstreamResponseError(protocol Protocol, path, format string, args ...any) 
 }
 
 var (
-	jsonValuePresent      = routekit.ValuePresent
-	rawJSONValuePresent   = routekit.ValuePresent
-	mustJSONString        = routekit.MustJSONString
-	resolveExchangeStream = routekit.ResolveExchangeStream
+	jsonValuePresent                  = routekit.ValuePresent
+	rawJSONValuePresent               = routekit.ValuePresent
+	nonNullJSON                       = routekit.NonNullValue
+	mustJSONString                    = routekit.MustJSONString
+	resolveExchangeStream             = routekit.ResolveExchangeStream
+	rejectUnknownResponsesObject      = routekit.RejectUnknownObjectFields
+	validateResponsesContentArray     = routekit.ValidateResponsesContentArray
+	validateResponsesInputItems       = routekit.ValidateResponsesInputItems
+	validateResponsesOutputItems      = routekit.ValidateResponsesOutputItems
+	validateResponsesReasoningConfig  = routekit.ValidateResponsesReasoningConfig
+	validateResponsesTextConfigFields = routekit.ValidateResponsesTextConfigFields
+	validateResponsesToolOutput       = routekit.ValidateResponsesToolOutput
+	validateResponsesToolsShape       = routekit.ValidateResponsesTools
 )
 
 func consumeStreamPrefix(emitted, complete, path string) (suffix, remaining string, err error) {

@@ -53,14 +53,14 @@ func TestDirectChatToGeminiRichRequest(t *testing.T) {
 		t.Fatalf("media = %#v", got.Contents[0].Parts)
 	}
 	callParts := got.Contents[1].Parts
-	if len(callParts) != 2 || !callParts[0].Thought || callParts[0].ThoughtSignature != geminiThoughtSignatureBypass {
+	if len(callParts) != 2 || !callParts[0].Thought || callParts[0].ThoughtSignature != "" {
 		t.Fatalf("reasoning parts = %#v", callParts)
 	}
 	if callParts[1].FunctionCall == nil || callParts[1].FunctionCall.ID != "call_1" || callParts[1].FunctionCall.Name != "get_weather" || string(callParts[1].FunctionCall.Args) != `{}` {
 		t.Fatalf("functionCall = %#v", callParts[1])
 	}
 	response := got.Contents[2].Parts[0].FunctionResponse
-	if response == nil || response.ID != "call_1" || response.Name != "get_weather" || string(response.Response) != `{"temperature":15}` {
+	if response == nil || response.ID != "call_1" || response.Name != "get_weather" || string(response.Response) != `{"output":"{\"temperature\":15}"}` {
 		t.Fatalf("functionResponse = %#v", response)
 	}
 }
@@ -71,7 +71,7 @@ func TestDirectGeminiToChatRichRequest(t *testing.T) {
   "systemInstruction":{"parts":[{"text":"be concise"}]},
   "contents":[
     {"role":"user","parts":[{"text":"weather?"},{"inlineData":{"mimeType":"image/png","data":"aW1n"}}]},
-    {"role":"model","parts":[{"text":"need tool","thought":true,"thoughtSignature":"context_engineering_is_the_way_to_go"},{"functionCall":{"id":"call_1","name":"get_weather","args":{}},"thoughtSignature":"context_engineering_is_the_way_to_go"}]},
+    {"role":"model","parts":[{"text":"need tool","thought":true},{"functionCall":{"id":"call_1","name":"get_weather","args":{}}}]},
     {"role":"user","parts":[{"functionResponse":{"id":"call_1","name":"get_weather","response":{"temperature":15}}}]}
   ],
   "tools":[{"functionDeclarations":[{"name":"get_weather","description":"weather lookup"}]}],
@@ -112,7 +112,7 @@ func TestDirectGeminiToChatRichRequest(t *testing.T) {
 
 func TestDirectChatGeminiResponses(t *testing.T) {
 	chatToGemini := newChatGeminiRoute(routeSpec{ID: "chat_to_gemini", From: ProtocolChat, To: ProtocolGenerateContent})
-	geminiResponseBody := []byte(`{"responseId":"resp_1","modelVersion":"gemini-upstream","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"thinking","thought":true,"thoughtSignature":"context_engineering_is_the_way_to_go"},{"text":"answer"},{"functionCall":{"id":"call_1","name":"lookup","args":{}},"thoughtSignature":"context_engineering_is_the_way_to_go"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"toolUsePromptTokenCount":2,"candidatesTokenCount":3,"thoughtsTokenCount":4,"cachedContentTokenCount":1,"totalTokenCount":14}}`)
+	geminiResponseBody := []byte(`{"responseId":"resp_1","modelVersion":"gemini-upstream","candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"thinking","thought":true},{"text":"answer"},{"functionCall":{"id":"call_1","name":"lookup","args":{}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"toolUsePromptTokenCount":2,"candidatesTokenCount":3,"thoughtsTokenCount":4,"cachedContentTokenCount":1,"totalTokenCount":14}}`)
 	converted, err := chatToGemini.ToClientResponse(context.Background(), geminiResponseBody, conversionOptions{Exchange: exchangeMetadata{ClientModel: "client-model"}})
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +141,7 @@ func TestDirectChatGeminiResponses(t *testing.T) {
 	if gemini.ModelVersion != "client-model" || gemini.Candidates[0].FinishReason != "STOP" || len(gemini.Candidates[0].Content.Parts) != 3 {
 		t.Fatalf("Gemini response = %#v", gemini)
 	}
-	if !gemini.Candidates[0].Content.Parts[0].Thought || gemini.Candidates[0].Content.Parts[0].ThoughtSignature != geminiThoughtSignatureBypass {
+	if !gemini.Candidates[0].Content.Parts[0].Thought || gemini.Candidates[0].Content.Parts[0].ThoughtSignature != "" {
 		t.Fatalf("thought = %#v", gemini.Candidates[0].Content.Parts[0])
 	}
 	if call := gemini.Candidates[0].Content.Parts[2].FunctionCall; call == nil || call.ID != "call_1" || call.Name != "lookup" {
@@ -149,6 +149,28 @@ func TestDirectChatGeminiResponses(t *testing.T) {
 	}
 	if gemini.UsageMetadata.CandidatesTokenCount != 3 || gemini.UsageMetadata.ThoughtsTokenCount != 4 || gemini.UsageMetadata.TotalTokenCount != 14 {
 		t.Fatalf("Gemini usage = %#v", gemini.UsageMetadata)
+	}
+}
+
+func TestDirectChatGeminiProviderOnlyUsageFailsClosed(t *testing.T) {
+	converter := newChatGeminiRoute(routeSpec{From: ProtocolGenerateContent, To: ProtocolChat})
+	body := []byte(`{"id":"chat_1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"audio_tokens":1},"completion_tokens_details":{"audio_tokens":1,"accepted_prediction_tokens":1,"rejected_prediction_tokens":1}}}`)
+	if _, err := converter.ToClientResponse(context.Background(), body, conversionOptions{}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("strict error = %v, want ErrUnsupported", err)
+	}
+	result, err := converter.ToClientResponse(context.Background(), body, conversionOptions{LossPolicy: allowDocumentedLoss})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, code := range []string{
+		"chat_input_audio_usage_not_representable",
+		"chat_output_audio_usage_not_representable",
+		"chat_accepted_prediction_usage_not_representable",
+		"chat_rejected_prediction_usage_not_representable",
+	} {
+		if !directHasDiagnostic(result.Diagnostics, code) {
+			t.Errorf("missing diagnostic %q: %#v", code, result.Diagnostics)
+		}
 	}
 }
 

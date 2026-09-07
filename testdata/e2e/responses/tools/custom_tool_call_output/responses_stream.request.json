@@ -1,0 +1,29 @@
+{
+  "model": "routemorph-live-client",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Invoke record_marker_text with exactly the ASCII token RM_CUSTOM_OUTPUT_RESPONSES_STREAM as its raw input."
+        }
+      ]
+    },
+    {
+      "type": "custom_tool_call",
+      "call_id": "call_routemorph_custom_output_stream",
+      "name": "record_marker_text",
+      "input": "RM_CUSTOM_OUTPUT_RESPONSES_STREAM"
+    },
+    {
+      "type": "custom_tool_call_output",
+      "call_id": "call_routemorph_custom_output_stream",
+      "output": "The marker was recorded. Return exactly the ASCII token RM_CUSTOM_OUTPUT_RESPONSES_STREAM."
+    }
+  ],
+  "max_output_tokens": 256,
+  "stream": true,
+  "store": false
+}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -225,6 +226,34 @@ type nativeStreamValidator struct {
 
 	geminiCandidates   map[int]bool
 	geminiSawCandidate bool
+
+	responsesCreated      bool
+	responsesID           string
+	responsesModel        string
+	responsesNextSequence int64
+	responsesItems        map[int]*nativeResponsesItemState
+	responsesItemIDs      map[string]int
+	responsesStreams      map[string]bool
+}
+
+type nativeResponsesItemState struct {
+	id          string
+	itemType    string
+	done        bool
+	doneItem    json.RawMessage
+	content     map[int]*nativeResponsesPartState
+	summary     map[int]*nativeResponsesPartState
+	streams     map[string]bool
+	streamSeen  map[string]bool
+	commands    map[int]bool
+	shellOutput map[int]bool
+}
+
+type nativeResponsesPartState struct {
+	partType   string
+	done       bool
+	streamSeen bool
+	streamDone bool
 }
 
 func (v *nativeStreamValidator) validate(ctx context.Context, frame core.Frame) error {
@@ -232,7 +261,7 @@ func (v *nativeStreamValidator) validate(ctx context.Context, frame core.Frame) 
 		return core.Invalid(v.protocol, "$", "stream event arrived after the terminal marker")
 	}
 	if frame.Done || string(frame.Data) == "[DONE]" {
-		if v.protocol != core.ProtocolChat && !(v.protocol == core.ProtocolResponses && v.sawTerminal) {
+		if v.protocol != core.ProtocolChat {
 			return core.Invalid(v.protocol, "$", "unexpected [DONE] terminal marker")
 		}
 		if v.protocol == core.ProtocolChat && !v.sawTerminal {
@@ -342,10 +371,53 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 	if v.sawTerminal {
 		return core.Invalid(v.protocol, "$.type", "event %q arrived after the terminal response", eventType)
 	}
+	if eventType == "response.created" {
+		if v.responsesCreated {
+			return core.Invalid(v.protocol, "$.type", "duplicate response.created event")
+		}
+	} else if !v.responsesCreated {
+		return core.Invalid(v.protocol, "$.type", "response.created must be the first stream event")
+	}
+
+	var event nativeResponsesEvent
+	if err := decodeKnownNativeFields(v.protocol, frame.Data, &event); err != nil {
+		return err
+	}
+	var responseID, responseModel string
+	if responsesEventCarriesResponseEnvelope(eventType) && rawJSONPresent(event.Response) {
+		var response nativeResponsesResponse
+		if err := json.Unmarshal(event.Response, &response); err != nil {
+			return core.Invalid(v.protocol, "$.response", "invalid response object")
+		}
+		responseID, responseModel = response.ID, response.Model
+		if eventType != "response.created" {
+			if v.responsesID != "" && response.ID != "" && response.ID != v.responsesID {
+				return core.Invalid(v.protocol, "$.response.id", "response id %q does not match created id %q", response.ID, v.responsesID)
+			}
+			if v.responsesModel != "" && response.Model != "" && response.Model != v.responsesModel {
+				return core.Invalid(v.protocol, "$.response.model", "response model %q does not match created model %q", response.Model, v.responsesModel)
+			}
+		}
+	}
+	if event.SequenceNumber == nil {
+		return core.Invalid(v.protocol, "$.sequence_number", "stream event sequence number is required")
+	}
+	if *event.SequenceNumber != v.responsesNextSequence {
+		return core.Invalid(v.protocol, "$.sequence_number", "got %d, want the next contiguous sequence number %d", *event.SequenceNumber, v.responsesNextSequence)
+	}
+	if err := v.validateResponsesLifecycleEvent(eventType, &event); err != nil {
+		return err
+	}
+	if eventType == "response.output_item.done" {
+		if err := validateCompleteResponsesItem(event.Item); err != nil {
+			return err
+		}
+	}
+
 	switch eventType {
-	case "error", "response.failed", "response.cancelled":
+	case "error":
 		return core.UpstreamResponseError(v.protocol, "$", "Responses stream returned %q", eventType)
-	case "response.completed", "response.incomplete":
+	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
 		raw := object["response"]
 		if !rawJSONObject(raw) {
 			return core.Invalid(v.protocol, "$.response", "terminal response object is required")
@@ -360,10 +432,711 @@ func (v *nativeStreamValidator) validateResponses(ctx context.Context, frame cor
 		if terminal.Status != wantStatus {
 			return core.Invalid(v.protocol, "$.response.status", "terminal event %q does not match status %q", eventType, terminal.Status)
 		}
-		if err := v.wire.ValidateResponse(ctx, raw); err != nil {
-			return err
+		if eventType == "response.completed" || eventType == "response.incomplete" {
+			if err := v.validateResponsesItemsClosed(); err != nil {
+				return err
+			}
+			for stream, done := range v.responsesStreams {
+				if !done {
+					return core.Invalid(v.protocol, "$.type", "terminal response arrived while %s stream is still open", stream)
+				}
+			}
+		}
+		if eventType == "response.completed" || eventType == "response.incomplete" {
+			if err := v.wire.ValidateResponse(ctx, raw); err != nil {
+				return err
+			}
+			if err := v.validateResponsesTerminalOutput(raw); err != nil {
+				return err
+			}
 		}
 		v.sawTerminal = true
+		v.responsesNextSequence++
+		return nil
+	}
+	if eventType == "response.created" {
+		v.responsesCreated = true
+		v.responsesID = responseID
+		v.responsesModel = responseModel
+	}
+	v.responsesNextSequence++
+	return nil
+}
+
+func responsesEventCarriesResponseEnvelope(eventType string) bool {
+	switch eventType {
+	case "response.created", "response.queued", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+func (v *nativeStreamValidator) validateResponsesLifecycleEvent(eventType string, event *nativeResponsesEvent) error {
+	switch eventType {
+	case "response.output_item.added":
+		return v.addResponsesItem(event)
+	case "response.output_item.done":
+		return v.finishResponsesItem(event)
+	case "response.content_part.added":
+		return v.addResponsesContentPart(event)
+	case "response.content_part.done":
+		return v.finishResponsesContentPart(event)
+	case "response.reasoning_summary_part.added":
+		return v.addResponsesSummaryPart(event)
+	case "response.reasoning_summary_part.done":
+		return v.finishResponsesSummaryPart(event)
+	case "response.output_text.delta":
+		return v.validateResponsesContentStream(event, "output_text", false)
+	case "response.output_text.done":
+		return v.validateResponsesContentStream(event, "output_text", true)
+	case "response.output_text.annotation.added":
+		return v.validateResponsesContentStream(event, "output_text", false)
+	case "response.refusal.delta":
+		return v.validateResponsesContentStream(event, "refusal", false)
+	case "response.refusal.done":
+		return v.validateResponsesContentStream(event, "refusal", true)
+	case "response.reasoning_text.delta":
+		return v.validateResponsesContentStream(event, "reasoning_text", false)
+	case "response.reasoning_text.done":
+		return v.validateResponsesContentStream(event, "reasoning_text", true)
+	case "response.reasoning_summary_text.delta":
+		return v.validateResponsesSummaryStream(event, false)
+	case "response.reasoning_summary_text.done":
+		return v.validateResponsesSummaryStream(event, true)
+	case "response.function_call_arguments.delta":
+		return v.validateResponsesItemStream(event, "function_call_arguments", false, "function_call")
+	case "response.function_call_arguments.done":
+		return v.validateResponsesItemStream(event, "function_call_arguments", true, "function_call")
+	case "response.custom_tool_call_input.delta":
+		return v.validateResponsesItemStream(event, "custom_tool_call_input", false, "custom_tool_call")
+	case "response.custom_tool_call_input.done":
+		return v.validateResponsesItemStream(event, "custom_tool_call_input", true, "custom_tool_call")
+	case "response.code_interpreter_call_code.delta":
+		return v.validateResponsesItemStream(event, "code_interpreter_call_code", false, "code_interpreter_call")
+	case "response.code_interpreter_call_code.done":
+		return v.validateResponsesItemStream(event, "code_interpreter_call_code", true, "code_interpreter_call")
+	case "response.mcp_call_arguments.delta":
+		return v.validateResponsesItemStream(event, "mcp_call_arguments", false, "mcp_call")
+	case "response.mcp_call_arguments.done":
+		return v.validateResponsesItemStream(event, "mcp_call_arguments", true, "mcp_call")
+	case "response.code_interpreter_call.in_progress", "response.code_interpreter_call.interpreting":
+		return v.validateResponsesItemStream(event, "code_interpreter_call_status", false, "code_interpreter_call")
+	case "response.code_interpreter_call.completed":
+		return v.validateResponsesItemStream(event, "code_interpreter_call_status", true, "code_interpreter_call")
+	case "response.file_search_call.in_progress", "response.file_search_call.searching":
+		return v.validateResponsesItemStream(event, "file_search_call_status", false, "file_search_call")
+	case "response.file_search_call.completed":
+		return v.validateResponsesItemStream(event, "file_search_call_status", true, "file_search_call")
+	case "response.web_search_call.in_progress", "response.web_search_call.searching":
+		return v.validateResponsesItemStream(event, "web_search_call_status", false, "web_search_call")
+	case "response.web_search_call.completed":
+		return v.validateResponsesItemStream(event, "web_search_call_status", true, "web_search_call")
+	case "response.image_generation_call.in_progress", "response.image_generation_call.generating", "response.image_generation_call.partial_image":
+		return v.validateResponsesItemStream(event, "image_generation_call_status", false, "image_generation_call")
+	case "response.image_generation_call.completed":
+		return v.validateResponsesItemStream(event, "image_generation_call_status", true, "image_generation_call")
+	case "response.mcp_call.in_progress":
+		return v.validateResponsesItemStream(event, "mcp_call_status", false, "mcp_call")
+	case "response.mcp_call.completed", "response.mcp_call.failed":
+		return v.validateResponsesItemStream(event, "mcp_call_status", true, "mcp_call")
+	case "response.mcp_list_tools.in_progress":
+		return v.validateResponsesItemStream(event, "mcp_list_tools_status", false, "mcp_list_tools")
+	case "response.mcp_list_tools.completed", "response.mcp_list_tools.failed":
+		return v.validateResponsesItemStream(event, "mcp_list_tools_status", true, "mcp_list_tools")
+	case "response.shell_call_command.added", "response.shell_call_command.delta", "response.shell_call_command.done":
+		return v.validateResponsesShellCommand(eventType, event)
+	case "response.shell_call_output_content.delta", "response.shell_call_output_content.done":
+		return v.validateResponsesShellOutput(eventType, event)
+	case "response.audio.delta":
+		return v.validateResponsesGlobalStream("audio", false)
+	case "response.audio.done":
+		return v.validateResponsesGlobalStream("audio", true)
+	case "response.audio.transcript.delta":
+		return v.validateResponsesGlobalStream("audio_transcript", false)
+	case "response.audio.transcript.done":
+		return v.validateResponsesGlobalStream("audio_transcript", true)
+	default:
+		return nil
+	}
+}
+
+func (v *nativeStreamValidator) addResponsesItem(event *nativeResponsesEvent) error {
+	identity, err := decodeResponsesItemIdentity(v.protocol, event.Item)
+	if err != nil {
+		return err
+	}
+	if event.OutputIndex == nil {
+		return core.Invalid(v.protocol, "$.output_index", "output item index is required")
+	}
+	if v.responsesItems == nil {
+		v.responsesItems = make(map[int]*nativeResponsesItemState)
+		v.responsesItemIDs = make(map[string]int)
+	}
+	if _, exists := v.responsesItems[*event.OutputIndex]; exists {
+		return core.Invalid(v.protocol, "$.output_index", "duplicate output item index %d", *event.OutputIndex)
+	}
+	if index, exists := v.responsesItemIDs[identity.id]; exists {
+		return core.Invalid(v.protocol, "$.item.id", "duplicate output item id %q already belongs to output index %d", identity.id, index)
+	}
+	v.responsesItems[*event.OutputIndex] = &nativeResponsesItemState{
+		id: identity.id, itemType: identity.itemType,
+		content: make(map[int]*nativeResponsesPartState), summary: make(map[int]*nativeResponsesPartState),
+		streams: make(map[string]bool), streamSeen: make(map[string]bool), commands: make(map[int]bool), shellOutput: make(map[int]bool),
+	}
+	v.responsesItemIDs[identity.id] = *event.OutputIndex
+	return nil
+}
+
+func (v *nativeStreamValidator) finishResponsesItem(event *nativeResponsesEvent) error {
+	identity, err := decodeResponsesItemIdentity(v.protocol, event.Item)
+	if err != nil {
+		return err
+	}
+	item, err := v.openResponsesItem(event.OutputIndex, identity.id)
+	if err != nil {
+		return err
+	}
+	if identity.itemType != item.itemType {
+		return core.Invalid(v.protocol, "$.item.type", "output item type %q does not match added type %q", identity.itemType, item.itemType)
+	}
+	for index, part := range item.content {
+		if !part.done {
+			return core.Invalid(v.protocol, "$.output_index", "output item completed while content index %d is still open", index)
+		}
+	}
+	for index, part := range item.summary {
+		if !part.done {
+			return core.Invalid(v.protocol, "$.output_index", "output item completed while summary index %d is still open", index)
+		}
+	}
+	for stream, seen := range item.streamSeen {
+		if seen && !item.streams[stream] && responsesItemStreamRequiresDone(stream) {
+			return core.Invalid(v.protocol, "$.output_index", "output item completed while %s stream is still open", stream)
+		}
+	}
+	for index, done := range item.commands {
+		if !done {
+			return core.Invalid(v.protocol, "$.output_index", "output item completed while shell command index %d is still open", index)
+		}
+	}
+	for index, done := range item.shellOutput {
+		if !done {
+			return core.Invalid(v.protocol, "$.output_index", "output item completed while shell output index %d is still open", index)
+		}
+	}
+	item.done = true
+	item.doneItem = append(json.RawMessage(nil), event.Item...)
+	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesTerminalOutput(raw json.RawMessage) error {
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return core.Invalid(v.protocol, "$.response", "invalid terminal response object")
+	}
+	var output []json.RawMessage
+	if err := json.Unmarshal(response["output"], &output); err != nil || output == nil {
+		return core.Invalid(v.protocol, "$.response.output", "terminal response output array is required")
+	}
+	if len(output) != len(v.responsesItems) {
+		return core.Invalid(v.protocol, "$.response.output", "terminal output has %d items, but the stream completed %d items", len(output), len(v.responsesItems))
+	}
+	for index, rawItem := range output {
+		streamed, exists := v.responsesItems[index]
+		if !exists {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d was not emitted by output_item events", index)
+		}
+		identity, err := decodeResponsesItemIdentity(v.protocol, rawItem)
+		if err != nil {
+			return err
+		}
+		if identity.id != streamed.id || identity.itemType != streamed.itemType {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d identity %q/%q does not match streamed item %q/%q", index, identity.id, identity.itemType, streamed.id, streamed.itemType)
+		}
+		if difference := responsesItemDifference(rawItem, streamed.doneItem, streamed.itemType); difference != "" {
+			return core.Invalid(v.protocol, "$.response.output", "terminal output index %d does not match its output_item.done payload: %s", index, difference)
+		}
+	}
+	return nil
+}
+
+// responsesItemDifference verifies that terminal contains every value emitted
+// by response.output_item.done. New top-level provider extensions, message
+// phase, and output-text logprobs are allowed; other nested or known fields
+// cannot first appear in the terminal snapshot. Existing values, array lengths,
+// and array order remain immutable. A reasoning ciphertext is the sole value
+// exception: the provider may refresh that opaque state between snapshots.
+func responsesItemDifference(terminal, done json.RawMessage, itemType string) string {
+	allowChange := func(path string, terminalValue, doneValue any) bool {
+		if itemType != "reasoning" || path != "$.encrypted_content" {
+			return false
+		}
+		_, terminalIsString := terminalValue.(string)
+		_, doneIsString := doneValue.(string)
+		return terminalIsString && doneIsString
+	}
+	allowAddition := func(parentPath, field, path string, parent map[string]any, _ any) bool {
+		if itemType == "message" && (path == "$.phase" || responsesOutputTextLogprobsPath(path)) {
+			if path == "$.phase" {
+				return true
+			}
+			partType, _ := parent["type"].(string)
+			return partType == "output_text"
+		}
+		return parentPath == "$" && !knownResponsesOutputItemField(field)
+	}
+	return responsesJSONDifferenceAllowing(terminal, done, allowChange, allowAddition)
+}
+
+func responsesOutputTextLogprobsPath(path string) bool {
+	const prefix = "$.content["
+	const suffix = "].logprobs"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	index := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if index == "" {
+		return false
+	}
+	for _, character := range index {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func responsesJSONDifferenceAllowing(terminal, done json.RawMessage, allowChange func(string, any, any) bool, allowAddition func(string, string, string, map[string]any, any) bool) string {
+	decode := func(raw json.RawMessage) (any, bool) {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		return value, true
+	}
+	terminalValue, terminalOK := decode(terminal)
+	doneValue, doneOK := decode(done)
+	if !terminalOK || !doneOK {
+		return "$ contains invalid JSON"
+	}
+	return responsesValueDifference(terminalValue, doneValue, "$", allowChange, allowAddition)
+}
+
+func responsesValueDifference(terminal, done any, path string, allowChange func(string, any, any) bool, allowAddition func(string, string, string, map[string]any, any) bool) string {
+	if allowChange != nil && allowChange(path, terminal, done) {
+		return ""
+	}
+	switch doneValue := done.(type) {
+	case map[string]any:
+		terminalValue, ok := terminal.(map[string]any)
+		if !ok {
+			return path + " changed type"
+		}
+		for key, expected := range doneValue {
+			actual, exists := terminalValue[key]
+			childPath := path + "." + key
+			if !exists {
+				return childPath + " is absent"
+			}
+			if difference := responsesValueDifference(actual, expected, childPath, allowChange, allowAddition); difference != "" {
+				return difference
+			}
+		}
+		for key, actual := range terminalValue {
+			if _, exists := doneValue[key]; exists {
+				continue
+			}
+			childPath := path + "." + key
+			if allowAddition != nil && allowAddition(path, key, childPath, terminalValue, actual) {
+				continue
+			}
+			return childPath + " was added after output_item.done"
+		}
+		return ""
+	case []any:
+		terminalValue, ok := terminal.([]any)
+		if !ok {
+			return path + " changed type"
+		}
+		if len(terminalValue) != len(doneValue) {
+			return path + " changed length"
+		}
+		for index := range doneValue {
+			childPath := fmt.Sprintf("%s[%d]", path, index)
+			if difference := responsesValueDifference(terminalValue[index], doneValue[index], childPath, allowChange, allowAddition); difference != "" {
+				return difference
+			}
+		}
+		return ""
+	default:
+		if terminal != done {
+			return fmt.Sprintf("%s changed value (%s to %s)", path, responsesJSONType(done), responsesJSONType(terminal))
+		}
+		return ""
+	}
+}
+
+func responsesJSONType(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case json.Number:
+		return "number"
+	case bool:
+		return "boolean"
+	case map[string]any:
+		return "object"
+	case []any:
+		return "array"
+	default:
+		return "unknown"
+	}
+}
+
+type responsesItemIdentity struct {
+	id       string
+	itemType string
+}
+
+func decodeResponsesItemIdentity(protocol core.Protocol, raw json.RawMessage) (responsesItemIdentity, error) {
+	if !rawJSONObject(raw) {
+		return responsesItemIdentity{}, core.Invalid(protocol, "$.item", "item object is required")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return responsesItemIdentity{}, core.Invalid(protocol, "$.item", "invalid item object")
+	}
+	id, err := requireJSONString(protocol, "$.item.id", object["id"])
+	if err != nil || id == "" {
+		if err != nil {
+			return responsesItemIdentity{}, err
+		}
+		return responsesItemIdentity{}, core.Invalid(protocol, "$.item.id", "must not be empty")
+	}
+	itemType, err := requireJSONString(protocol, "$.item.type", object["type"])
+	if err != nil || itemType == "" {
+		if err != nil {
+			return responsesItemIdentity{}, err
+		}
+		return responsesItemIdentity{}, core.Invalid(protocol, "$.item.type", "must not be empty")
+	}
+	return responsesItemIdentity{id: id, itemType: itemType}, nil
+}
+
+func (v *nativeStreamValidator) openResponsesItem(outputIndex *int, itemID string, expectedTypes ...string) (*nativeResponsesItemState, error) {
+	if outputIndex == nil {
+		return nil, core.Invalid(v.protocol, "$.output_index", "output item index is required")
+	}
+	item, exists := v.responsesItems[*outputIndex]
+	if !exists {
+		return nil, core.Invalid(v.protocol, "$.output_index", "event arrived before output item %d was added", *outputIndex)
+	}
+	if item.done {
+		return nil, core.Invalid(v.protocol, "$.output_index", "event arrived after output item %d was done", *outputIndex)
+	}
+	if itemID != "" && itemID != item.id {
+		return nil, core.Invalid(v.protocol, "$.item_id", "item id %q does not match output item %q at index %d", itemID, item.id, *outputIndex)
+	}
+	if len(expectedTypes) > 0 {
+		matched := false
+		for _, expected := range expectedTypes {
+			matched = matched || item.itemType == expected
+		}
+		if !matched {
+			return nil, core.Invalid(v.protocol, "$.type", "event does not apply to output item type %q", item.itemType)
+		}
+	}
+	return item, nil
+}
+
+func (v *nativeStreamValidator) addResponsesContentPart(event *nativeResponsesEvent) error {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID)
+	if err != nil {
+		return err
+	}
+	if event.ContentIndex == nil {
+		return core.Invalid(v.protocol, "$.content_index", "content index is required")
+	}
+	partType, err := decodeResponsesPartType(v.protocol, event.Part)
+	if err != nil {
+		return err
+	}
+	if err := validateResponsesPartOwner(v.protocol, item.itemType, partType); err != nil {
+		return err
+	}
+	if _, exists := item.content[*event.ContentIndex]; exists {
+		return core.Invalid(v.protocol, "$.content_index", "duplicate content index %d for output item %q", *event.ContentIndex, item.id)
+	}
+	item.content[*event.ContentIndex] = &nativeResponsesPartState{partType: partType}
+	return nil
+}
+
+func (v *nativeStreamValidator) finishResponsesContentPart(event *nativeResponsesEvent) error {
+	_, part, err := v.openResponsesContentPart(event)
+	if err != nil {
+		return err
+	}
+	partType, err := decodeResponsesPartType(v.protocol, event.Part)
+	if err != nil {
+		return err
+	}
+	if partType != part.partType {
+		return core.Invalid(v.protocol, "$.part.type", "content part type %q does not match added type %q", partType, part.partType)
+	}
+	if part.streamSeen && !part.streamDone {
+		return core.Invalid(v.protocol, "$.content_index", "content part completed before its %s stream was done", part.partType)
+	}
+	part.done = true
+	return nil
+}
+
+func (v *nativeStreamValidator) openResponsesContentPart(event *nativeResponsesEvent) (*nativeResponsesItemState, *nativeResponsesPartState, error) {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if event.ContentIndex == nil {
+		return nil, nil, core.Invalid(v.protocol, "$.content_index", "content index is required")
+	}
+	part, exists := item.content[*event.ContentIndex]
+	if !exists {
+		return nil, nil, core.Invalid(v.protocol, "$.content_index", "event arrived before content index %d was added", *event.ContentIndex)
+	}
+	if part.done {
+		return nil, nil, core.Invalid(v.protocol, "$.content_index", "event arrived after content index %d was done", *event.ContentIndex)
+	}
+	return item, part, nil
+}
+
+func (v *nativeStreamValidator) validateResponsesContentStream(event *nativeResponsesEvent, expectedPart string, done bool) error {
+	_, part, err := v.openResponsesContentPart(event)
+	if err != nil {
+		return err
+	}
+	if part.partType != expectedPart {
+		return core.Invalid(v.protocol, "$.type", "event for %s does not match content part type %q", expectedPart, part.partType)
+	}
+	if part.streamDone {
+		return core.Invalid(v.protocol, "$.type", "event arrived after the %s stream was done", expectedPart)
+	}
+	part.streamSeen = true
+	if done {
+		part.streamDone = true
+	}
+	return nil
+}
+
+func (v *nativeStreamValidator) addResponsesSummaryPart(event *nativeResponsesEvent) error {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID, "reasoning")
+	if err != nil {
+		return err
+	}
+	if event.SummaryIndex == nil {
+		return core.Invalid(v.protocol, "$.summary_index", "summary index is required")
+	}
+	partType, err := decodeResponsesPartType(v.protocol, event.Part)
+	if err != nil {
+		return err
+	}
+	if partType != "summary_text" {
+		return core.Invalid(v.protocol, "$.part.type", "reasoning summary part must have type summary_text")
+	}
+	if _, exists := item.summary[*event.SummaryIndex]; exists {
+		return core.Invalid(v.protocol, "$.summary_index", "duplicate summary index %d for output item %q", *event.SummaryIndex, item.id)
+	}
+	item.summary[*event.SummaryIndex] = &nativeResponsesPartState{partType: partType}
+	return nil
+}
+
+func (v *nativeStreamValidator) finishResponsesSummaryPart(event *nativeResponsesEvent) error {
+	_, part, err := v.openResponsesSummaryPart(event)
+	if err != nil {
+		return err
+	}
+	partType, err := decodeResponsesPartType(v.protocol, event.Part)
+	if err != nil {
+		return err
+	}
+	if partType != part.partType {
+		return core.Invalid(v.protocol, "$.part.type", "summary part type %q does not match added type %q", partType, part.partType)
+	}
+	if part.streamSeen && !part.streamDone {
+		return core.Invalid(v.protocol, "$.summary_index", "summary part completed before its text stream was done")
+	}
+	part.done = true
+	return nil
+}
+
+func (v *nativeStreamValidator) openResponsesSummaryPart(event *nativeResponsesEvent) (*nativeResponsesItemState, *nativeResponsesPartState, error) {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID, "reasoning")
+	if err != nil {
+		return nil, nil, err
+	}
+	if event.SummaryIndex == nil {
+		return nil, nil, core.Invalid(v.protocol, "$.summary_index", "summary index is required")
+	}
+	part, exists := item.summary[*event.SummaryIndex]
+	if !exists {
+		return nil, nil, core.Invalid(v.protocol, "$.summary_index", "event arrived before summary index %d was added", *event.SummaryIndex)
+	}
+	if part.done {
+		return nil, nil, core.Invalid(v.protocol, "$.summary_index", "event arrived after summary index %d was done", *event.SummaryIndex)
+	}
+	return item, part, nil
+}
+
+func (v *nativeStreamValidator) validateResponsesSummaryStream(event *nativeResponsesEvent, done bool) error {
+	_, part, err := v.openResponsesSummaryPart(event)
+	if err != nil {
+		return err
+	}
+	if part.streamDone {
+		return core.Invalid(v.protocol, "$.type", "event arrived after the reasoning summary text stream was done")
+	}
+	part.streamSeen = true
+	if done {
+		part.streamDone = true
+	}
+	return nil
+}
+
+func decodeResponsesPartType(protocol core.Protocol, raw json.RawMessage) (string, error) {
+	if !rawJSONObject(raw) {
+		return "", core.Invalid(protocol, "$.part", "part object is required")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return "", core.Invalid(protocol, "$.part", "invalid part object")
+	}
+	partType, err := requireJSONString(protocol, "$.part.type", object["type"])
+	if err != nil {
+		return "", err
+	}
+	if partType == "" {
+		return "", core.Invalid(protocol, "$.part.type", "must not be empty")
+	}
+	return partType, nil
+}
+
+func validateResponsesPartOwner(protocol core.Protocol, itemType, partType string) error {
+	switch partType {
+	case "output_text", "refusal":
+		if itemType != "message" {
+			return core.Invalid(protocol, "$.part.type", "%s content requires a message output item", partType)
+		}
+	case "reasoning_text":
+		if itemType != "reasoning" {
+			return core.Invalid(protocol, "$.part.type", "reasoning_text content requires a reasoning output item")
+		}
+	}
+	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesItemStream(event *nativeResponsesEvent, stream string, done bool, expectedTypes ...string) error {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID, expectedTypes...)
+	if err != nil {
+		return err
+	}
+	if item.streams[stream] {
+		return core.Invalid(v.protocol, "$.type", "event arrived after the %s stream was done", stream)
+	}
+	item.streamSeen[stream] = true
+	if done {
+		item.streams[stream] = true
+	}
+	return nil
+}
+
+func responsesItemStreamRequiresDone(stream string) bool {
+	switch stream {
+	case "function_call_arguments", "custom_tool_call_input", "code_interpreter_call_code", "mcp_call_arguments":
+		return true
+	default:
+		return false
+	}
+}
+
+func (v *nativeStreamValidator) validateResponsesItemsClosed() error {
+	for index, item := range v.responsesItems {
+		if !item.done {
+			return core.Invalid(v.protocol, "$.type", "terminal response arrived before output item %d was done", index)
+		}
+	}
+	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesShellCommand(eventType string, event *nativeResponsesEvent) error {
+	item, err := v.openResponsesItem(event.OutputIndex, "", "shell_call", "local_shell_call")
+	if err != nil {
+		return err
+	}
+	return v.validateResponsesShellCommandIndex(eventType, event, item)
+}
+
+func (v *nativeStreamValidator) validateResponsesShellCommandIndex(eventType string, event *nativeResponsesEvent, item *nativeResponsesItemState) error {
+	if event.CommandIndex == nil {
+		return core.Invalid(v.protocol, "$.command_index", "command index is required")
+	}
+	commandIndex := *event.CommandIndex
+	done, exists := item.commands[commandIndex]
+	switch eventType {
+	case "response.shell_call_command.added":
+		if exists {
+			return core.Invalid(v.protocol, "$.command_index", "duplicate shell command index %d", commandIndex)
+		}
+		item.commands[commandIndex] = false
+	case "response.shell_call_command.delta", "response.shell_call_command.done":
+		if !exists {
+			return core.Invalid(v.protocol, "$.command_index", "event arrived before shell command index %d was added", commandIndex)
+		}
+		if done {
+			return core.Invalid(v.protocol, "$.command_index", "event arrived after shell command index %d was done", commandIndex)
+		}
+		if eventType == "response.shell_call_command.done" {
+			item.commands[commandIndex] = true
+		}
+	}
+	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesShellOutput(eventType string, event *nativeResponsesEvent) error {
+	item, err := v.openResponsesItem(event.OutputIndex, event.ItemID, "shell_call", "local_shell_call")
+	if err != nil {
+		return err
+	}
+	if event.CommandIndex == nil {
+		return core.Invalid(v.protocol, "$.command_index", "command index is required")
+	}
+	commandIndex := *event.CommandIndex
+	if item.shellOutput[commandIndex] {
+		return core.Invalid(v.protocol, "$.command_index", "event arrived after shell output index %d was done", commandIndex)
+	}
+	if _, seen := item.shellOutput[commandIndex]; !seen {
+		item.shellOutput[commandIndex] = false
+	}
+	if eventType == "response.shell_call_output_content.done" {
+		item.shellOutput[commandIndex] = true
+	}
+	return nil
+}
+
+func (v *nativeStreamValidator) validateResponsesGlobalStream(stream string, done bool) error {
+	if v.responsesStreams == nil {
+		v.responsesStreams = make(map[string]bool)
+	}
+	if v.responsesStreams[stream] {
+		return core.Invalid(v.protocol, "$.type", "event arrived after the %s stream was done", stream)
+	}
+	if _, seen := v.responsesStreams[stream]; !seen {
+		v.responsesStreams[stream] = false
+	}
+	if done {
+		v.responsesStreams[stream] = true
 	}
 	return nil
 }
@@ -406,6 +1179,9 @@ func (v *nativeStreamValidator) validateMessages(frame core.Frame, data []byte, 
 				return core.Invalid(v.protocol, "$.message.content[]", "content block must be an object")
 			}
 		}
+		if len(*message.Content) != 0 {
+			return core.Invalid(v.protocol, "$.message.content", "message_start content must be empty")
+		}
 		if err := validateMessagesUsage(v.protocol, "$.message.usage", message.Usage); err != nil {
 			return err
 		}
@@ -413,6 +1189,12 @@ func (v *nativeStreamValidator) validateMessages(frame core.Frame, data []byte, 
 			return err
 		}
 		if err := validateOptionalNullableString(v.protocol, "$.message.stop_sequence", message.StopSequence); err != nil {
+			return err
+		}
+		if rawJSONPresent(message.StopReason) || rawJSONPresent(message.StopSequence) || rawJSONPresent(message.StopDetails) {
+			return core.Invalid(v.protocol, "$.message", "message_start stop fields must be null")
+		}
+		if err := validateOptionalNullableObject(v.protocol, "$.message.container", message.Container); err != nil {
 			return err
 		}
 		v.messageStarted = true
@@ -509,6 +1291,15 @@ func (v *nativeStreamValidator) validateMessages(frame core.Frame, data []byte, 
 		}
 		if err := validateMessagesUsage(v.protocol, "$.usage", event.Usage); err != nil {
 			return err
+		}
+		if err := validateOptionalNullableObject(v.protocol, "$.delta.container", delta.Container); err != nil {
+			return err
+		}
+		if err := validateOptionalNullableObject(v.protocol, "$.delta.stop_details", delta.StopDetails); err != nil {
+			return err
+		}
+		if rawJSONPresent(delta.StopDetails) && stopReason != "refusal" {
+			return core.Invalid(v.protocol, "$.delta.stop_details", "is only valid when stop_reason is refusal")
 		}
 		v.sawTerminal = true
 	case "message_stop":

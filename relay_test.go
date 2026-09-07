@@ -135,6 +135,106 @@ func TestGatewayAdapterStreamingMatrix(t *testing.T) {
 	}
 }
 
+func TestResponsesProviderImplicitServiceTierRegression(t *testing.T) {
+	protocols := []Protocol{ProtocolChat, ProtocolResponses, ProtocolMessages, ProtocolGenerateContent}
+	for _, ingressProtocol := range protocols {
+		ingressProtocol := ingressProtocol
+		t.Run(string(ingressProtocol)+"_non_stream", func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assertAdapterUpstreamRequest(t, request, ProtocolResponses, false, "client-model")
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(writer, `{"id":"resp_live","object":"response","created_at":1,"model":"provider-model","status":"completed","service_tier":"default","output":[{"id":"msg_live","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}`)
+			}))
+			defer upstream.Close()
+
+			adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "secret")
+			response, err := invokeAdapter(context.Background(), adapter, ingressProtocol, adapterRequest(ingressProtocol, false))
+			if err != nil {
+				t.Fatalf("invoke adapter: %v", err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				t.Fatalf("read response: %v", readErr)
+			}
+			if err := codec.New(core.Protocol(ingressProtocol)).ValidateResponse(context.Background(), body); err != nil {
+				t.Fatalf("invalid %s response %s: %v", ingressProtocol, body, err)
+			}
+			assertImplicitResponsesTierDiagnostic(t, ingressProtocol, response.Meta.Diagnostics())
+		})
+
+		t.Run(string(ingressProtocol)+"_stream", func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				assertAdapterUpstreamRequest(t, request, ProtocolResponses, true, "client-model")
+				writer.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(writer, responsesProviderTierResolutionStream)
+			}))
+			defer upstream.Close()
+
+			adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "secret")
+			response, err := invokeAdapter(context.Background(), adapter, ingressProtocol, adapterRequest(ingressProtocol, true))
+			if err != nil {
+				t.Fatalf("invoke adapter: %v", err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				t.Fatalf("read stream: %v body=%s", readErr, body)
+			}
+			if !bytes.Contains(body, []byte("hello")) {
+				t.Fatalf("converted stream omitted text: %s", body)
+			}
+			assertImplicitResponsesTierDiagnostic(t, ingressProtocol, response.Meta.Diagnostics())
+		})
+	}
+}
+
+func assertImplicitResponsesTierDiagnostic(t *testing.T, ingress Protocol, diagnostics []Diagnostic) {
+	t.Helper()
+	count := 0
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == "responses_service_tier_not_representable" {
+			count++
+		}
+	}
+	want := 0
+	if ingress == ProtocolMessages || ingress == ProtocolGenerateContent {
+		want = 1
+	}
+	if count != want {
+		t.Fatalf("service-tier diagnostic count=%d, want %d: %#v", count, want, diagnostics)
+	}
+}
+
+const responsesProviderTierResolutionStream = `event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_live","object":"response","created_at":1,"model":"provider-model","status":"in_progress","service_tier":"auto","output":[],"usage":null}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_live","object":"response","created_at":1,"model":"provider-model","status":"in_progress","service_tier":"auto","output":[],"usage":null}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_live","type":"message","role":"assistant","status":"in_progress","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_live","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_live","output_index":0,"content_index":0,"delta":"hello","logprobs":[]}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":5,"item_id":"msg_live","output_index":0,"content_index":0,"text":"hello","logprobs":[]}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","sequence_number":6,"item_id":"msg_live","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":7,"output_index":0,"item":{"id":"msg_live","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":8,"response":{"id":"resp_live","object":"response","created_at":1,"model":"provider-model","status":"completed","service_tier":"default","output":[{"id":"msg_live","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[],"logprobs":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+
+`
+
 func expectedRouteMode(from, to Protocol) RouteMode {
 	if from == to {
 		return RouteModeNative
@@ -481,7 +581,7 @@ func TestAdapterMetadataOverwritesSpoofedDiagnosticCount(t *testing.T) {
 func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: not-json\n\n")
+		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"late\",\"logprobs\":[]}\n\n")
 	}))
 	defer upstream.Close()
 	adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "")
@@ -491,7 +591,7 @@ func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	}
 	body, readErr := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	if readErr == nil || !bytes.Contains(body, []byte("stream_conversion_error")) || !bytes.Contains(body, []byte("[DONE]")) {
+	if readErr == nil || !bytes.Contains(body, []byte("stream_validation_error")) || !bytes.Contains(body, []byte("response.created must be the first")) || !bytes.Contains(body, []byte("[DONE]")) {
 		t.Fatalf("body=%s err=%v", body, readErr)
 	}
 	var conversion *ConversionError
@@ -503,6 +603,27 @@ func TestGatewayAdapterStreamFailureEmitsProtocolError(t *testing.T) {
 	}
 	if !errors.Is(readErr, ErrInvalidPayload) {
 		t.Fatalf("stream error %v does not preserve its conversion category", readErr)
+	}
+	if len(response.Meta.Diagnostics()) == 0 {
+		t.Fatal("stream diagnostic was not retained")
+	}
+}
+
+func TestGatewayAdapterGeminiStreamFailureDoesNotEmitEmptySuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":0,\"output_index\":0,\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"late\",\"logprobs\":[]}\n\n")
+	}))
+	defer upstream.Close()
+	adapter := mustNewAdapter(t, ProtocolResponses, upstream.URL, "")
+	response, err := adapter.GeminiGenerateContent(context.Background(), adapterRequest(ProtocolGenerateContent, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if len(body) != 0 || !errors.Is(readErr, ErrUpstreamResponse) || !errors.Is(readErr, ErrInvalidPayload) {
+		t.Fatalf("body=%q error=%v, want no Gemini success chunk and typed upstream error", body, readErr)
 	}
 	if len(response.Meta.Diagnostics()) == 0 {
 		t.Fatal("stream diagnostic was not retained")
@@ -728,6 +849,117 @@ func TestGatewayAdapterRejectsInvalidNativeStreamWithModelOverride(t *testing.T)
 	}
 }
 
+func TestAdapterNativeResponsesStreamPreservesProviderToolSearchOptionalFields(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		assertAdapterUpstreamRequest(t, request, ProtocolResponses, true, "provider-model")
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, responsesProviderToolSearchStream)
+	}))
+	defer upstream.Close()
+
+	adapter, err := NewOpenAIResponsesAdapter(upstream.URL, "secret", WithModel("provider-model"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := adapter.OpenAIResponses(context.Background(), adapterRequest(ProtocolResponses, true))
+	if err != nil {
+		t.Fatalf("invoke adapter: %v", err)
+	}
+	decoder, err := codec.New(core.ProtocolResponses).NewStreamDecoder(response.Body, core.StreamOptions{MaxFrameBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frames []core.Frame
+	for {
+		frame, decodeErr := decoder.Next(context.Background())
+		if decodeErr == io.EOF {
+			break
+		}
+		if decodeErr != nil {
+			_ = response.Body.Close()
+			t.Fatalf("decode native Responses stream: %v", decodeErr)
+		}
+		frames = append(frames, frame)
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(frame.Data, &event); err != nil {
+			t.Fatal(err)
+		}
+		if rawResponse := event["response"]; len(rawResponse) > 0 {
+			var snapshot struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(rawResponse, &snapshot); err != nil || snapshot.Model != "client-model" {
+				t.Fatalf("response model = %q, error = %v", snapshot.Model, err)
+			}
+		}
+		if rawItem := event["item"]; len(rawItem) > 0 {
+			var item map[string]json.RawMessage
+			if err := json.Unmarshal(rawItem, &item); err != nil {
+				t.Fatal(err)
+			}
+			var itemType string
+			_ = json.Unmarshal(item["type"], &itemType)
+			if itemType == "tool_search_call" || itemType == "tool_search_output" {
+				if _, present := item["call_id"]; present {
+					t.Fatalf("%s unexpectedly gained call_id: %s", itemType, rawItem)
+				}
+				if _, present := item["execution"]; present {
+					t.Fatalf("%s unexpectedly gained execution: %s", itemType, rawItem)
+				}
+			}
+		}
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+	terminal, diagnostics, err := streamx.CollectNativeResponse(core.ProtocolResponses, frames, core.RejectSemanticLoss)
+	if err != nil {
+		t.Fatalf("collect native Responses stream: %v", err)
+	}
+	if len(diagnostics) != 0 || len(response.Meta.Diagnostics()) != 0 {
+		t.Fatalf("unexpected diagnostics: collect=%#v adapter=%#v", diagnostics, response.Meta.Diagnostics())
+	}
+	if response.Meta.RouteMode != RouteModeNative || !bytes.Contains(terminal, []byte(`"model":"client-model"`)) ||
+		!bytes.Contains(terminal, []byte(`"defer_loading":true`)) {
+		t.Fatalf("native tool-search stream was not preserved: meta=%#v body=%s", response.Meta, terminal)
+	}
+}
+
+const responsesProviderToolSearchStream = `event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_tool_search","object":"response","created_at":1,"model":"provider-model","status":"in_progress","output":[],"usage":null}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_tool_search","object":"response","created_at":1,"model":"provider-model","status":"in_progress","output":[],"usage":null}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"tsc_1","type":"tool_search_call","arguments":{"query":"weather"},"status":"in_progress"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"tsc_1","type":"tool_search_call","arguments":{"query":"weather"},"status":"completed"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":4,"output_index":1,"item":{"id":"tso_1","type":"tool_search_output","status":"in_progress","tools":[{"type":"function","name":"weather","description":"Look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true,"defer_loading":true}]}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":5,"output_index":1,"item":{"id":"tso_1","type":"tool_search_output","status":"completed","tools":[{"type":"function","name":"weather","description":"Look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true,"defer_loading":true}]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":6,"output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"weather","arguments":"","status":"in_progress"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":7,"output_index":2,"item_id":"fc_1","delta":"{\"city\":\"Beijing\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":8,"output_index":2,"item_id":"fc_1","arguments":"{\"city\":\"Beijing\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":9,"output_index":2,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Beijing\"}","status":"completed"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":10,"response":{"id":"resp_tool_search","object":"response","created_at":1,"model":"provider-model","status":"completed","output":[{"id":"tsc_1","type":"tool_search_call","arguments":{"query":"weather"},"status":"completed"},{"id":"tso_1","type":"tool_search_output","status":"completed","tools":[{"type":"function","name":"weather","description":"Look up weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false},"strict":true,"defer_loading":true}]},{"id":"fc_1","type":"function_call","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Beijing\"}","status":"completed"}],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}
+
+`
+
 func TestGatewayAdapterModelOverrideRejectsNullNestedStreamObjects(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -737,7 +969,7 @@ func TestGatewayAdapterModelOverrideRejectsNullNestedStreamObjects(t *testing.T)
 		{
 			name:     "responses",
 			protocol: ProtocolResponses,
-			payload:  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":null}\n\n",
+			payload:  "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":0,\"response\":null}\n\n",
 		},
 		{
 			name:     "messages",

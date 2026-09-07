@@ -1,6 +1,7 @@
 package chatmessages
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -15,8 +16,12 @@ type chatToolCall = chatwire.ToolCall
 
 func decodeChatMessage(source chatMessage, index int) (portableMessage, error) {
 	path := fmt.Sprintf("$.messages[%d]", index)
-	if rawJSONValuePresent(source.FunctionCall) {
-		return portableMessage{}, unsupported(ProtocolChat, path+".function_call", "deprecated function_call cannot be represented without semantic loss")
+	return decodeChatMessageAtPath(source, path)
+}
+
+func decodeChatMessageAtPath(source chatMessage, path string) (portableMessage, error) {
+	if err := validateChatMessageMetadata(source, path); err != nil {
+		return portableMessage{}, err
 	}
 	message := portableMessage{Role: semanticRole(source.Role), Name: source.Name}
 	switch message.Role {
@@ -32,11 +37,17 @@ func decodeChatMessage(source chatMessage, index int) (portableMessage, error) {
 		if err != nil {
 			return portableMessage{}, err
 		}
+		if err := validateChatContentRole(source.Role, content, path+".content"); err != nil {
+			return portableMessage{}, err
+		}
 		message.Parts = []portablePart{{Kind: partToolResult, ToolResult: &portableToolResult{CallID: source.ToolCallID, Name: source.Name, Content: content}}}
 		return message, nil
 	}
 	parts, err := decodeChatContent(source.Content, path+".content")
 	if err != nil {
+		return portableMessage{}, err
+	}
+	if err := validateChatContentRole(source.Role, parts, path+".content"); err != nil {
 		return portableMessage{}, err
 	}
 	message.Parts = append(message.Parts, parts...)
@@ -62,6 +73,43 @@ func decodeChatMessage(source chatMessage, index int) (portableMessage, error) {
 	return message, nil
 }
 
+func validateChatMessageMetadata(source chatMessage, path string) error {
+	if rawJSONValuePresent(source.FunctionCall) {
+		return unsupported(ProtocolChat, path+".function_call", "deprecated function_call cannot be represented without semantic loss")
+	}
+	if source.Role == "assistant" {
+		if source.ToolCallID != "" {
+			return invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is only valid on tool messages")
+		}
+		return nil
+	}
+	if source.ToolCallID != "" && source.Role != "tool" {
+		return invalid(ProtocolChat, path+".tool_call_id", "tool_call_id is only valid on tool messages")
+	}
+	if len(source.ToolCalls) > 0 {
+		return invalid(ProtocolChat, path+".tool_calls", "tool_calls are only valid on assistant messages")
+	}
+	if source.Refusal != "" {
+		return invalid(ProtocolChat, path+".refusal", "refusal is only valid on assistant messages")
+	}
+	if source.ReasoningContent != "" {
+		return invalid(ProtocolChat, path+".reasoning_content", "reasoning_content is only valid on assistant messages")
+	}
+	return nil
+}
+
+func validateChatContentRole(role string, parts []portablePart, path string) error {
+	if role == "user" {
+		return nil
+	}
+	for index, part := range parts {
+		if part.Kind != partText {
+			return unsupported(ProtocolChat, fmt.Sprintf("%s[%d]", path, index), "Chat %s messages only support text content across protocols", role)
+		}
+	}
+	return nil
+}
+
 func decodeChatContent(raw json.RawMessage, path string) ([]portablePart, error) {
 	if len(raw) == 0 || string(raw) == "null" {
 		return nil, nil
@@ -79,26 +127,33 @@ func decodeChatContent(raw json.RawMessage, path string) ([]portablePart, error)
 	}
 	parts := make([]portablePart, 0, len(source))
 	for i, part := range source {
+		if rawJSONValuePresent(part.PromptCacheBreakpoint) {
+			return nil, unsupported(ProtocolChat, fmt.Sprintf("%s[%d].prompt_cache_breakpoint", path, i), "OpenAI prompt cache breakpoints have no exact Messages cache-control equivalent")
+		}
 		switch part.Type {
-		case "text", "input_text":
+		case "text":
 			parts = append(parts, portablePart{Kind: partText, Text: part.Text})
-		case "image_url", "input_image":
-			var value string
-			detail := ""
-			if len(part.ImageURL) > 0 && part.ImageURL[0] == '"' {
-				_ = json.Unmarshal(part.ImageURL, &value)
-			} else {
-				var image struct {
-					URL    string `json:"url"`
-					Detail string `json:"detail"`
-				}
-				_ = json.Unmarshal(part.ImageURL, &image)
-				value = image.URL
-				detail = image.Detail
+		case "image_url":
+			var image struct {
+				URL    string `json:"url"`
+				Detail string `json:"detail"`
 			}
-			media := parseDataURL(value)
+			if err := json.Unmarshal(part.ImageURL, &image); err != nil {
+				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].image_url", path, i), "must be an image-url object")
+			}
+			value, detail := image.URL, image.Detail
 			if value == "" {
 				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].image_url", path, i), "image URL is required")
+			}
+			if detail != "" && detail != "auto" && detail != "low" && detail != "high" {
+				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].image_url.detail", path, i), "detail must be auto, low, or high")
+			}
+			media, err := parseDataURL(value)
+			if err != nil {
+				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].image_url", path, i), "%v", err)
+			}
+			if media.Data != "" && !validImageMIMEType(media.MIMEType) {
+				return nil, unsupported(ProtocolChat, fmt.Sprintf("%s[%d].image_url.url", path, i), "Chat image data URLs require JPEG, PNG, GIF, or WebP")
 			}
 			media.Detail = detail
 			parts = append(parts, portablePart{Kind: partImage, Media: media})
@@ -106,12 +161,30 @@ func decodeChatContent(raw json.RawMessage, path string) ([]portablePart, error)
 			if part.InputAudio == nil {
 				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].input_audio", path, i), "input_audio is required")
 			}
-			parts = append(parts, portablePart{Kind: partAudio, Media: &portableMedia{Data: part.InputAudio.Data, MIMEType: "audio/" + part.InputAudio.Format}})
+			if !validBase64(part.InputAudio.Data) {
+				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].input_audio.data", path, i), "must be non-empty standard base64")
+			}
+			mimeType, ok := chatAudioMIMEType(part.InputAudio.Format)
+			if !ok {
+				return nil, unsupported(ProtocolChat, fmt.Sprintf("%s[%d].input_audio.format", path, i), "only wav and mp3 input audio are portable")
+			}
+			parts = append(parts, portablePart{Kind: partAudio, Media: &portableMedia{Data: part.InputAudio.Data, MIMEType: mimeType}})
 		case "file":
 			if part.File == nil {
 				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].file", path, i), "file is required")
 			}
-			parts = append(parts, portablePart{Kind: partFile, Media: &portableMedia{FileID: part.File.FileID, Data: part.File.FileData, Filename: part.File.Filename}})
+			if (part.File.FileID == "") == (part.File.FileData == "") {
+				return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].file", path, i), "exactly one of file_id or file_data is required")
+			}
+			media := &portableMedia{FileID: part.File.FileID, Filename: part.File.Filename}
+			if part.File.FileData != "" {
+				var err error
+				media, err = parseFileData(part.File.FileData, part.File.Filename)
+				if err != nil {
+					return nil, invalid(ProtocolChat, fmt.Sprintf("%s[%d].file.file_data", path, i), "%v", err)
+				}
+			}
+			parts = append(parts, portablePart{Kind: partFile, Media: media})
 		default:
 			return nil, unsupported(ProtocolChat, fmt.Sprintf("%s[%d].type", path, i), "content part %q is not portable", part.Type)
 		}
@@ -123,6 +196,9 @@ func encodeChatMessage(message portableMessage, index int) ([]chatMessage, error
 	path := fmt.Sprintf("$.messages[%d]", index)
 	if message.Role == roleTool && len(message.Parts) == 1 && message.Parts[0].ToolResult != nil {
 		result := message.Parts[0].ToolResult
+		if err := validateChatContentRole("tool", result.Content, path+".content"); err != nil {
+			return nil, err
+		}
 		content, err := encodeChatContent(result.Content)
 		if err != nil {
 			return nil, err
@@ -153,6 +229,9 @@ func encodeChatMessage(message portableMessage, index int) ([]chatMessage, error
 			content = append(content, part)
 		}
 	}
+	if err := validateChatContentRole(string(message.Role), content, path+".content"); err != nil {
+		return nil, err
+	}
 	encoded, err := encodeChatContent(content)
 	if err != nil {
 		return nil, err
@@ -180,6 +259,9 @@ func encodeChatContent(parts []portablePart) (json.RawMessage, error) {
 			if part.Media.URL == "" && part.Media.Data == "" {
 				return nil, unsupported(ProtocolChat, "$.messages.content.image_url", "file-id-only images cannot be represented by Chat image_url")
 			}
+			if part.Media.Detail != "" && part.Media.Detail != "auto" && part.Media.Detail != "low" && part.Media.Detail != "high" {
+				return nil, unsupported(ProtocolChat, "$.messages.content.image_url.detail", "Chat image detail supports only auto, low, or high")
+			}
 			image := map[string]any{"url": dataURL(part.Media)}
 			if part.Media != nil && part.Media.Detail != "" {
 				image["detail"] = part.Media.Detail
@@ -189,9 +271,9 @@ func encodeChatContent(parts []portablePart) (json.RawMessage, error) {
 			if part.Media == nil || part.Media.Data == "" {
 				return nil, unsupported(ProtocolChat, "$.messages.content", "chat audio requires inline data")
 			}
-			format := "wav"
-			if part.Media.MIMEType == "audio/mp3" || part.Media.MIMEType == "audio/mpeg" {
-				format = "mp3"
+			format, ok := chatAudioFormat(part.Media.MIMEType)
+			if !ok {
+				return nil, unsupported(ProtocolChat, "$.messages.content.input_audio", "Chat input audio supports only WAV and MP3")
 			}
 			converted = append(converted, map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": part.Media.Data, "format": format}})
 		case partFile:
@@ -201,10 +283,22 @@ func encodeChatContent(parts []portablePart) (json.RawMessage, error) {
 			if part.Media.URL != "" {
 				return nil, unsupported(ProtocolChat, "$.messages.content.file", "file URLs cannot be represented by Chat file content")
 			}
+			if part.Media.Detail != "" {
+				return nil, unsupported(ProtocolChat, "$.messages.content.file", "file detail cannot be represented by Chat file content")
+			}
 			if part.Media.FileID == "" && part.Media.Data == "" {
 				return nil, invalid(ProtocolChat, "$.messages.content.file", "file_id or file_data is required")
 			}
-			converted = append(converted, map[string]any{"type": "file", "file": map[string]any{"file_id": part.Media.FileID, "file_data": part.Media.Data, "filename": part.Media.Filename}})
+			file := map[string]any{}
+			if part.Media.FileID != "" {
+				file["file_id"] = part.Media.FileID
+			} else {
+				file["file_data"] = openAIFileData(part.Media)
+				if part.Media.Filename != "" {
+					file["filename"] = part.Media.Filename
+				}
+			}
+			converted = append(converted, map[string]any{"type": "file", "file": file})
 		default:
 			return nil, unsupported(ProtocolChat, "$.messages.content", "part %q cannot be encoded as chat content", part.Kind)
 		}
@@ -231,29 +325,110 @@ func decodeStop(protocol Protocol, raw json.RawMessage) ([]string, error) {
 }
 
 func decodeChatToolChoice(raw json.RawMessage) (toolChoice, error) {
-	if len(raw) == 0 || string(raw) == "null" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return toolChoice{}, nil
 	}
-	if raw[0] == '"' {
+	if trimmed[0] == '"' {
 		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
+		if err := json.Unmarshal(trimmed, &value); err != nil {
 			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "invalid string choice")
 		}
 		if value != string(toolChoiceAuto) && value != string(toolChoiceNone) && value != string(toolChoiceRequired) {
-			return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "tool choice %q is not portable", value)
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "unknown tool choice %q", value)
 		}
 		return toolChoice{Mode: toolChoiceMode(value)}, nil
 	}
-	var value struct {
-		Type     string `json:"type"`
-		Function struct {
-			Name string `json:"name"`
-		} `json:"function"`
+	fields, err := rejectUnknownObjectFields(ProtocolChat, trimmed, "$.tool_choice", "type", "function", "custom", "allowed_tools")
+	if err != nil {
+		return toolChoice{}, err
 	}
-	if err := json.Unmarshal(raw, &value); err != nil || value.Type != "function" || value.Function.Name == "" {
-		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice", "only function tool choices are portable")
+	var kind string
+	if err := json.Unmarshal(fields["type"], &kind); err != nil || kind == "" {
+		return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.type", "non-empty string is required")
 	}
-	return toolChoice{Mode: toolChoiceNamed, Name: value.Function.Name}, nil
+	switch kind {
+	case "function":
+		if jsonValuePresent(fields["custom"]) || jsonValuePresent(fields["allowed_tools"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "function choice contains fields for another choice type")
+		}
+		function, err := rejectUnknownObjectFields(ProtocolChat, fields["function"], "$.tool_choice.function", "name")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var name string
+		if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.function.name", "non-empty string is required")
+		}
+		return toolChoice{Mode: toolChoiceNamed, Name: name}, nil
+	case "allowed_tools":
+		if jsonValuePresent(fields["function"]) || jsonValuePresent(fields["custom"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "allowed_tools choice contains fields for another choice type")
+		}
+		allowed, err := rejectUnknownObjectFields(ProtocolChat, fields["allowed_tools"], "$.tool_choice.allowed_tools", "mode", "tools")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var mode string
+		if err := json.Unmarshal(allowed["mode"], &mode); err != nil || (mode != string(toolChoiceAuto) && mode != string(toolChoiceRequired)) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.mode", "must be %q or %q", toolChoiceAuto, toolChoiceRequired)
+		}
+		var references []json.RawMessage
+		if err := json.Unmarshal(allowed["tools"], &references); err != nil || len(references) == 0 {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.allowed_tools.tools", "non-empty array is required")
+		}
+		names := make([]string, 0, len(references))
+		seen := make(map[string]struct{}, len(references))
+		for index, reference := range references {
+			path := fmt.Sprintf("$.tool_choice.allowed_tools.tools[%d]", index)
+			item, err := rejectUnknownObjectFields(ProtocolChat, reference, path, "type", "function", "custom")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var itemType string
+			if err := json.Unmarshal(item["type"], &itemType); err != nil || itemType == "" {
+				return toolChoice{}, invalid(ProtocolChat, path+".type", "non-empty string is required")
+			}
+			if itemType != "function" {
+				return toolChoice{}, unsupported(ProtocolChat, path+".type", "allowed tool type %q has no Messages equivalent", itemType)
+			}
+			if jsonValuePresent(item["custom"]) {
+				return toolChoice{}, invalid(ProtocolChat, path+".custom", "is not valid for a function reference")
+			}
+			function, err := rejectUnknownObjectFields(ProtocolChat, item["function"], path+".function", "name")
+			if err != nil {
+				return toolChoice{}, err
+			}
+			var name string
+			if err := json.Unmarshal(function["name"], &name); err != nil || name == "" {
+				return toolChoice{}, invalid(ProtocolChat, path+".function.name", "non-empty string is required")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return toolChoice{}, invalid(ProtocolChat, path+".function.name", "duplicate allowed function %q", name)
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return toolChoice{Mode: toolChoiceAllowed, AllowedMode: toolChoiceMode(mode), AllowedNames: names}, nil
+	case "custom":
+		if jsonValuePresent(fields["function"]) || jsonValuePresent(fields["allowed_tools"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice", "custom choice contains fields for another choice type")
+		}
+		if !jsonValuePresent(fields["custom"]) {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.custom", "is required")
+		}
+		custom, err := rejectUnknownObjectFields(ProtocolChat, fields["custom"], "$.tool_choice.custom", "name")
+		if err != nil {
+			return toolChoice{}, err
+		}
+		var name string
+		if err := json.Unmarshal(custom["name"], &name); err != nil || name == "" {
+			return toolChoice{}, invalid(ProtocolChat, "$.tool_choice.custom.name", "non-empty string is required")
+		}
+		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice.type", "custom tool choice has no Messages equivalent")
+	default:
+		return toolChoice{}, unsupported(ProtocolChat, "$.tool_choice.type", "tool choice type %q has no Messages equivalent", kind)
+	}
 }
 
 func encodeChatToolChoice(choice toolChoice) json.RawMessage {

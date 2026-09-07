@@ -34,6 +34,13 @@ internal/relay ───────── request lifetime and response ownersh
                             provider HTTP API
 ```
 
+Provider SDKs have a second ingress path: `Adapter.HTTPClient` installs an
+unexported `http.RoundTripper` that classifies a supported inference endpoint
+and invokes the same public adapter route. It maps the converted `Response`
+back to `http.Response` without pre-reading streaming bodies. Unsupported SDK
+endpoints fail before network I/O; this layer does not turn RouteMorph into a
+general-purpose provider transport.
+
 The response follows the reverse route. Non-streaming responses are converted
 before the adapter method returns. Streaming responses are converted as the
 caller reads `Response.Body`, except for routes whose compatibility policy
@@ -49,15 +56,25 @@ small:
   `NewAnthropicMessagesAdapter` and `NewGeminiGenerateContentAdapter`;
 - `Adapter.OpenAIChatCompletions`, `OpenAIResponses`,
   `AnthropicMessages` and `GeminiGenerateContent`;
+- `Adapter.HTTPClient` for injection into provider SDKs that accept a custom
+  `*http.Client`;
 - `Request`, `Response`, `ResponseMeta` and `Diagnostic`;
 - `InspectRequest`, `PrepareRequest` and `EncodeError`;
-- `WithModel` and the documented error categories.
+- `WithModel`, the explicit `WithCodingAgentCompatibility` policy, and the
+  documented error categories.
 
 `Request` and `Response` are owned by the public package rather than aliases of
 internal relay types. That keeps the API contract stable while transport and
 conversion internals evolve. Callers that use `Response.WriteTo` transfer body
 copying, streaming flushes, trailer publication and body closure to the SDK.
 Other callers must close `Response.Body` themselves.
+
+The HTTP client bridge owns and closes the provider SDK request body, as
+required by `http.RoundTripper`, while ownership of the returned response body
+passes to the provider SDK. It recognizes only POST requests for the four
+supported inference endpoint families. The returned client deliberately has no
+whole-request timeout; request contexts bound both non-streaming and streaming
+calls.
 
 ## Request inspection and prepared requests
 
@@ -136,6 +153,10 @@ callers can observe the latency tradeoff.
 The default HTTP client waits at most 30 minutes for response headers. That
 setting does not impose a total duration on a streaming body. Closing the
 public response body or cancelling the context cancels the upstream request.
+After a stream has started, Chat, Responses, and Messages can carry a
+protocol-native error event. Gemini cannot; its body closes with the typed read
+error and does not emit a JSON error envelope that the official SDK would
+misread as an empty successful chunk.
 
 ## Transport and header trust
 

@@ -23,12 +23,21 @@ func TestInspectRelayRequestReturnsChatStreamOptions(t *testing.T) {
 	}
 }
 
-func TestInspectRelayRequestRejectsUnsupportedChatStreamOption(t *testing.T) {
+func TestInspectRelayRequestAcceptsObfuscationAndRejectsUnknownChatStreamOption(t *testing.T) {
 	_, _, _, err := InspectRelayRequest(
 		context.Background(),
 		core.ProtocolChat,
 		nil,
-		[]byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream_options":{"include_obfuscation":true}}`),
+		[]byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_obfuscation":true}}`),
+	)
+	if err != nil {
+		t.Fatalf("include_obfuscation error=%v", err)
+	}
+	_, _, _, err = InspectRelayRequest(
+		context.Background(),
+		core.ProtocolChat,
+		nil,
+		[]byte(`{"model":"client-model","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"future_option":true}}`),
 	)
 	if !errors.Is(err, core.ErrUnsupported) {
 		t.Fatalf("error=%v, want ErrUnsupported", err)

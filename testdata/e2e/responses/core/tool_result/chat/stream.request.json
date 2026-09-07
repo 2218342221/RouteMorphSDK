@@ -1,0 +1,32 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Record marker RM_RESULT_CHAT_STREAM with record_marker."
+    },
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_routemorph_regression",
+          "type": "function",
+          "function": {
+            "name": "record_marker",
+            "arguments": "{\"marker\":\"RM_RESULT_CHAT_STREAM\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_routemorph_regression",
+      "content": "The marker was recorded. Return exactly the ASCII token RM_RESULT_CHAT_STREAM."
+    }
+  ],
+  "max_completion_tokens": 256,
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  }
+}

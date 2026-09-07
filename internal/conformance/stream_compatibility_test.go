@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-const terminalOnlyResponsesEvent = `{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello"}]},{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`
+const terminalOnlyResponsesEvent = `{"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":1,"model":"provider","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`
 
 func TestResponsesTerminalOnlyStreamReplaysOutput(t *testing.T) {
 	tests := []struct {
@@ -224,8 +224,7 @@ func TestResponsesClientStreamsFailClosedForUnsupportedEvents(t *testing.T) {
 	}{
 		{"unknown", streamFrame{Event: "response.future.delta", Data: []byte(`{"type":"response.future.delta","delta":"secret"}`)}},
 		{"legacy done", streamFrame{Event: "response.done", Data: []byte(`{"type":"response.done"}`)}},
-		{"legacy cancelled", streamFrame{Event: "response.cancelled", Data: []byte(`{"type":"response.cancelled"}`)}},
-		{"hosted tool", streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}`)}},
+		{"hosted tool", streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fs_1","type":"file_search_call","status":"in_progress"}}`)}},
 		{"audio delta", streamFrame{Event: "response.audio.delta", Data: []byte(`{"type":"response.audio.delta","delta":"AA=="}`)}},
 	}
 	for _, target := range []struct {
@@ -279,11 +278,11 @@ func TestResponsesClientStreamsValidatePartAndItemIdentity(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			added := streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`)}
+			added := streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"","status":"in_progress"}}`)}
 			if _, _, err := stream.Convert(context.Background(), added); err != nil {
 				t.Fatal(err)
 			}
-			done := streamFrame{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_2","name":"lookup","arguments":"{}"}}`)}
+			done := streamFrame{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_2","name":"lookup","arguments":"{}","status":"completed"}}`)}
 			_, _, err = stream.Convert(context.Background(), done)
 			if !errors.Is(err, ErrInvalidPayload) || !strings.Contains(err.Error(), "identity") {
 				t.Fatalf("error = %v, want identity error", err)
@@ -299,11 +298,11 @@ func TestResponsesClientStreamsRequireCompletedToolArguments(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			added := streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`)}
+			added := streamFrame{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"","status":"in_progress"}}`)}
 			if _, _, err := stream.Convert(context.Background(), added); err != nil {
 				t.Fatal(err)
 			}
-			done := streamFrame{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup"}}`)}
+			done := streamFrame{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","status":"completed"}}`)}
 			_, _, err = stream.Convert(context.Background(), done)
 			if !errors.Is(err, ErrInvalidPayload) || !strings.Contains(err.Error(), "arguments") {
 				t.Fatalf("error = %v, want missing arguments error", err)
@@ -320,16 +319,16 @@ func TestResponsesClientStreamsRevalidateCompletedToolAtTerminal(t *testing.T) {
 				t.Fatal(err)
 			}
 			events := []streamFrame{
-				{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`)},
+				{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"","status":"in_progress"}}`)},
 				{Event: "response.function_call_arguments.delta", Data: []byte(`{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"q\":1}"}`)},
-				{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}}`)},
+				{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}","status":"completed"}}`)},
 			}
 			for _, event := range events {
 				if _, _, err := stream.Convert(context.Background(), event); err != nil {
 					t.Fatalf("Convert(%s): %v", event.Event, err)
 				}
 			}
-			terminal := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"provider","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":2}"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)}
+			terminal := streamFrame{Event: "response.completed", Data: []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"provider","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":2}","status":"completed"}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`)}
 			_, _, err = stream.Convert(context.Background(), terminal)
 			if !errors.Is(err, ErrUpstreamResponse) || !strings.Contains(err.Error(), "arguments") {
 				t.Fatalf("error = %v, want terminal argument mismatch", err)
@@ -346,8 +345,8 @@ func TestResponsesClientStreamsRequireStreamedItemsAtTerminal(t *testing.T) {
 				t.Fatal(err)
 			}
 			events := []streamFrame{
-				{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}`)},
-				{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"}}`)},
+				{Event: "response.output_item.added", Data: []byte(`{"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"","status":"in_progress"}}`)},
+				{Event: "response.output_item.done", Data: []byte(`{"type":"response.output_item.done","item_id":"fc_1","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}","status":"completed"}}`)},
 			}
 			for _, event := range events {
 				if _, _, err := stream.Convert(context.Background(), event); err != nil {

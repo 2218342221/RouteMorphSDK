@@ -1,0 +1,33 @@
+{
+  "model": "routemorph-live-client",
+  "input": "Use tool search to find record_marker, then call record_marker with marker RM_TOOL_SEARCH_SERVER_NONSTREAM. Do not answer with text.",
+  "tools": [
+    {
+      "type": "function",
+      "name": "record_marker",
+      "description": "Record a regression-test marker",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "marker"
+        ],
+        "additionalProperties": false
+      },
+      "strict": true,
+      "defer_loading": true
+    },
+    {
+      "type": "tool_search",
+      "execution": "server"
+    }
+  ],
+  "tool_choice": "required",
+  "max_output_tokens": 512,
+  "stream": false,
+  "store": false
+}

@@ -1,0 +1,29 @@
+{
+  "model": "routemorph-live-client",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Invoke record_marker_text with exactly the ASCII token RM_CUSTOM_CHAT_NONSTREAM as its raw input. Do not answer with text."
+    }
+  ],
+  "tools": [
+    {
+      "type": "custom",
+      "custom": {
+        "name": "record_marker_text",
+        "description": "Record the supplied marker verbatim",
+        "format": {
+          "type": "text"
+        }
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "custom",
+    "custom": {
+      "name": "record_marker_text"
+    }
+  },
+  "max_completion_tokens": 256,
+  "stream": false
+}

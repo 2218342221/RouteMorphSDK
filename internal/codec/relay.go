@@ -21,17 +21,22 @@ func inspectChatStreamIncludeUsageObject(object map[string]json.RawMessage) (boo
 	}
 	includeUsage, includeUsageSet := false, false
 	for name, value := range fields {
-		if name != "include_usage" {
-			return false, false, core.Unsupported(ProtocolChat, "$.stream_options."+name, "stream option has no Responses equivalent")
-		}
 		if !rawJSONValuePresent(value) {
-			return false, false, invalid(ProtocolChat, "$.stream_options.include_usage", "must be a boolean")
+			return false, false, invalid(ProtocolChat, "$.stream_options."+name, "must be a boolean")
 		}
 		var enabled bool
 		if err := json.Unmarshal(value, &enabled); err != nil {
-			return false, false, invalid(ProtocolChat, "$.stream_options.include_usage", "must be a boolean")
+			return false, false, invalid(ProtocolChat, "$.stream_options."+name, "must be a boolean")
 		}
-		includeUsage, includeUsageSet = enabled, true
+		switch name {
+		case "include_usage":
+			includeUsage, includeUsageSet = enabled, true
+		case "include_obfuscation":
+			// The directed converter preserves this option. Relay metadata only needs
+			// include_usage because that changes the client-facing Chat stream shape.
+		default:
+			return false, false, core.Unsupported(ProtocolChat, "$.stream_options."+name, "stream option has no Responses equivalent")
+		}
 	}
 	return includeUsage, includeUsageSet, nil
 }

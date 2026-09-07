@@ -141,6 +141,9 @@ func (a *Codec) validateRequestObject(object map[string]json.RawMessage) error {
 		if err := requireJSONArray(a.protocol, object, "messages"); err != nil {
 			return err
 		}
+		if len(bytes.TrimSpace(object["max_tokens"])) == 0 || bytes.Equal(bytes.TrimSpace(object["max_tokens"]), []byte("null")) {
+			return invalid(a.protocol, "$.max_tokens", "is required")
+		}
 		var maxTokens int
 		if err := json.Unmarshal(object["max_tokens"], &maxTokens); err != nil || maxTokens < 0 {
 			return invalid(a.protocol, "$.max_tokens", "must be a non-negative integer")

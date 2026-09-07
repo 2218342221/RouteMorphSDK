@@ -1,0 +1,84 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Call record_complex exactly once with marker RM_COMPLEX_TOOL_GENERATE_CONTENT_NON_STREAM, count 7, enabled true, mode audit, tags alpha then beta, and payload nested=value and score=3. Do not answer with text."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "functionDeclarations": [
+        {
+          "name": "record_complex",
+          "description": "Record a typed regression payload",
+          "parametersJsonSchema": {
+            "type": "object",
+            "properties": {
+              "marker": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "audit"
+                ]
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "nested": {
+                    "type": "string"
+                  },
+                  "score": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "nested",
+                  "score"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "marker",
+              "count",
+              "enabled",
+              "mode",
+              "tags",
+              "payload"
+            ],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  ],
+  "toolConfig": {
+    "functionCallingConfig": {
+      "mode": "ANY",
+      "allowedFunctionNames": [
+        "record_complex"
+      ]
+    }
+  },
+  "generationConfig": {
+    "maxOutputTokens": 512
+  }
+}

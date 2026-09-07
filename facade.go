@@ -31,8 +31,8 @@ type Adapter struct {
 	relay *relayx.Service
 }
 
-// Option is intentionally sealed. WithModel is the only supported option in
-// this release; the interface leaves room for compatible additions later.
+// Option is intentionally sealed so adapter behavior can evolve without
+// exposing its mutable configuration.
 type Option interface {
 	apply(*adapterConfig) error
 }
@@ -56,8 +56,21 @@ func WithModel(model string) Option {
 	})
 }
 
+// WithCodingAgentCompatibility enables documented, diagnostic-producing
+// approximations needed by coding-agent clients such as Claude Code and Gemini
+// CLI when their native request controls have no exact Responses equivalent.
+// Strict, fail-closed conversion remains the default when this option is not
+// supplied.
+func WithCodingAgentCompatibility() Option {
+	return optionFunc(func(config *adapterConfig) error {
+		config.codingAgentCompatibility = true
+		return nil
+	})
+}
+
 type adapterConfig struct {
-	model string
+	model                    string
+	codingAgentCompatibility bool
 }
 
 // NewOpenAIChatCompletionsAdapter creates an adapter whose upstream speaks the
@@ -105,6 +118,7 @@ func newAdapter(upstream Protocol, rawBaseURL, apiKey string, options ...Option)
 	service := relayx.New(relayx.Config{
 		Upstream: toCoreProtocol(upstream), BaseURL: baseURL, APIKey: apiKey, Model: config.model,
 		Client: defaultAdapterHTTPClient, Catalog: router, MaxBodyBytes: defaultAdapterMaxBodyBytes,
+		CodingAgentCompatibility: config.codingAgentCompatibility,
 	})
 	return &Adapter{relay: service}, nil
 }

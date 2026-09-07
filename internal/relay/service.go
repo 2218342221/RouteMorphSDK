@@ -22,23 +22,25 @@ type Doer interface {
 }
 
 type Config struct {
-	Upstream     core.Protocol
-	BaseURL      *url.URL
-	APIKey       string
-	Model        string
-	Client       Doer
-	Catalog      core.Catalog
-	MaxBodyBytes int64
+	Upstream                 core.Protocol
+	BaseURL                  *url.URL
+	APIKey                   string
+	Model                    string
+	Client                   Doer
+	Catalog                  core.Catalog
+	MaxBodyBytes             int64
+	CodingAgentCompatibility bool
 }
 
 type Service struct {
-	upstream     core.Protocol
-	baseURL      *url.URL
-	apiKey       string
-	model        string
-	client       Doer
-	catalog      core.Catalog
-	maxBodyBytes int64
+	upstream                 core.Protocol
+	baseURL                  *url.URL
+	apiKey                   string
+	model                    string
+	client                   Doer
+	catalog                  core.Catalog
+	maxBodyBytes             int64
+	codingAgentCompatibility bool
 }
 
 type upstreamError struct{ err error }
@@ -55,7 +57,7 @@ func New(config Config) *Service {
 	return &Service{
 		upstream: config.Upstream, baseURL: config.BaseURL, apiKey: config.APIKey,
 		model: config.Model, client: config.Client, catalog: config.Catalog,
-		maxBodyBytes: config.MaxBodyBytes,
+		maxBodyBytes: config.MaxBodyBytes, codingAgentCompatibility: config.CodingAgentCompatibility,
 	}
 }
 
@@ -113,7 +115,8 @@ func (a *Service) Invoke(ctx context.Context, ingress core.Protocol, request *Re
 			ChatStreamIncludeUsage:    chatStreamIncludeUsage,
 			ChatStreamIncludeUsageSet: chatStreamIncludeUsageSet,
 		},
-		LossPolicy: core.RejectSemanticLoss,
+		LossPolicy:               core.RejectSemanticLoss,
+		CodingAgentCompatibility: a.codingAgentCompatibility,
 	}
 	plan, err := a.catalog.Plan(ingress, a.upstream)
 	if err != nil {
@@ -304,12 +307,13 @@ func (a *Service) streamResponse(ctx context.Context, cancel context.CancelFunc,
 	}
 	response.Body = transportx.NewManagedBodyWithPeer(reader, upstream.Body, cancel)
 
-	go a.runStream(ctx, writer, upstream, ingress, clientModel, options.Exchange.RequestID, target, decoder, converter, response)
+	go a.runStream(ctx, writer, upstream, ingress, clientModel, options.Exchange.RequestID, source, target, decoder, converter, response)
 	return response, nil
 }
 
-func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream *http.Response, ingress core.Protocol, clientModel, requestID string, target core.Codec, decoder core.StreamDecoder, converter core.ResponseStream, response *Response) {
+func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream *http.Response, ingress core.Protocol, clientModel, requestID string, source, target core.Codec, decoder core.StreamDecoder, converter core.ResponseStream, response *Response) {
 	defer upstream.Body.Close()
+	sourceValidator := nativeStreamValidator{protocol: a.upstream, wire: source}
 	encoder, err := target.NewStreamEncoder(writer, core.StreamOptions{MaxFrameBytes: int(a.maxBodyBytes)})
 	if err != nil {
 		writer.CloseWithError(err)
@@ -335,20 +339,26 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 	}
 	fail := func(code string, streamErr error) {
 		response.Meta.diagnostics.add(core.Diagnostic{Severity: "error", Code: code, Path: "$", Message: streamErr.Error()})
-		frame, encodeErr := target.EncodeStreamError(core.ProtocolError{
-			Type: "upstream_error", Code: code, Message: streamErr.Error(), RequestID: requestID, StatusCode: http.StatusBadGateway,
-		})
-		if encodeErr == nil {
-			frames := []core.Frame{frame}
-			if ingress == core.ProtocolChat {
-				frames = append(frames, core.Frame{Data: []byte("[DONE]"), Done: true})
-			}
-			errorContext := context.Background()
-			for _, errorFrame := range frames {
-				if encoder.Write(errorContext, errorFrame) != nil {
-					break
+		// Gemini's streaming API has no SDK-recognized in-band error event.
+		// A data frame containing its ordinary JSON error envelope is decoded by
+		// google.golang.org/genai as an empty successful response. Preserve the
+		// failure solely as the body read error instead of fabricating a chunk.
+		if ingress != core.ProtocolGenerateContent {
+			frame, encodeErr := target.EncodeStreamError(core.ProtocolError{
+				Type: "upstream_error", Code: code, Message: streamErr.Error(), RequestID: requestID, StatusCode: http.StatusBadGateway,
+			})
+			if encodeErr == nil {
+				frames := []core.Frame{frame}
+				if ingress == core.ProtocolChat {
+					frames = append(frames, core.Frame{Data: []byte("[DONE]"), Done: true})
 				}
-				_ = encoder.Flush()
+				errorContext := context.Background()
+				for _, errorFrame := range frames {
+					if encoder.Write(errorContext, errorFrame) != nil {
+						break
+					}
+					_ = encoder.Flush()
+				}
 			}
 		}
 		finalizeAdapterTrailers(response, upstream.Trailer)
@@ -363,6 +373,10 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 			fail("stream_decode_error", classifyStreamUpstreamError(readErr))
 			return
 		}
+		if err := sourceValidator.validate(ctx, frame); err != nil {
+			fail("stream_validation_error", classifyStreamUpstreamError(err))
+			return
+		}
 		frames, diagnostics, convertErr := converter.Convert(ctx, frame)
 		response.Meta.diagnostics.add(diagnostics...)
 		if convertErr != nil {
@@ -373,6 +387,10 @@ func (a *Service) runStream(ctx context.Context, writer *io.PipeWriter, upstream
 			fail("stream_write_error", err)
 			return
 		}
+	}
+	if err := sourceValidator.finalize(); err != nil {
+		fail("stream_validation_error", classifyStreamUpstreamError(err))
+		return
 	}
 	frames, diagnostics, err := converter.Finalize(ctx)
 	response.Meta.diagnostics.add(diagnostics...)

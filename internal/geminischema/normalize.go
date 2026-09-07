@@ -1,5 +1,5 @@
-// Package geminischema converts ordinary JSON Schema documents into the
-// OpenAPI Schema subset accepted by Gemini function declarations.
+// Package geminischema validates either Gemini's legacy OpenAPI Schema subset
+// or its lossless parametersJsonSchema JSON Schema field.
 package geminischema
 
 import (
@@ -121,6 +121,79 @@ func NormalizeParameters(raw json.RawMessage, limits Limits) (json.RawMessage, e
 		return nil, nil
 	}
 	return normalized, nil
+}
+
+// PreserveParametersJSONSchema validates the JSON envelope used by Gemini's
+// parametersJsonSchema field without translating it to the older OpenAPI
+// Schema dialect. Keeping the original JSON Schema keywords and value types is
+// important: parametersJsonSchema is the lossless bridge for function schemas
+// coming from OpenAI and Anthropic protocols.
+//
+// Parameterless object schemas are omitted because the Gemini API explicitly
+// permits a function declaration with no parameters.
+func PreserveParametersJSONSchema(raw json.RawMessage, limits Limits) (json.RawMessage, error) {
+	limits, err := resolvedLimits(limits)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+	if len(trimmed) > limits.MaxBytes {
+		return nil, violation(ErrLimitExceeded, "$", "input is %d bytes; maximum is %d", len(trimmed), limits.MaxBytes)
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.UseNumber()
+	var document any
+	if err := decoder.Decode(&document); err != nil {
+		return nil, invalid("$", "decode: %v", err)
+	}
+	if err := requireEOF(decoder); err != nil {
+		return nil, err
+	}
+	meter := budget{limits: limits}
+	if err := meter.measure(document, 1, "$"); err != nil {
+		return nil, err
+	}
+
+	object, ok := document.(map[string]any)
+	if !ok {
+		return nil, invalid("$", "schema must be an object")
+	}
+	if typeValue, exists := object["type"]; exists {
+		typeName, ok := typeValue.(string)
+		if !ok || !strings.EqualFold(typeName, "object") {
+			return nil, invalid("$.type", "function parameters must have type object")
+		}
+	}
+	propertyCount := 0
+	if propertiesValue, exists := object["properties"]; exists {
+		properties, ok := propertiesValue.(map[string]any)
+		if !ok {
+			return nil, invalid("$.properties", "must be an object")
+		}
+		propertyCount = len(properties)
+	}
+	if len(object) == 0 || (propertyCount == 0 && onlyEmptyObjectKeywords(object)) {
+		return nil, nil
+	}
+
+	result, err := json.Marshal(document)
+	if err != nil {
+		return nil, invalid("$", "encode: %v", err)
+	}
+	return result, nil
+}
+
+func onlyEmptyObjectKeywords(schema map[string]any) bool {
+	for key := range schema {
+		if key != "type" && key != "properties" {
+			return false
+		}
+	}
+	return true
 }
 
 func resolvedLimits(limits Limits) (Limits, error) {

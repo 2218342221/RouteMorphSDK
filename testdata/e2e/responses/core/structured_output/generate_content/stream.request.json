@@ -1,0 +1,28 @@
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Return an object whose marker field is exactly RM_JSON_GENERATECONTENT_STREAM."
+        }
+      ]
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 256,
+    "responseMimeType": "application/json",
+    "responseJsonSchema": {
+      "type": "object",
+      "properties": {
+        "marker": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "marker"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

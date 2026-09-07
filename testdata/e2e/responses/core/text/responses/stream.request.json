@@ -1,0 +1,7 @@
+{
+  "model": "routemorph-live-client",
+  "input": "Return exactly the ASCII token RM_TEXT_RESPONSES_STREAM.",
+  "max_output_tokens": 256,
+  "stream": true,
+  "store": false
+}

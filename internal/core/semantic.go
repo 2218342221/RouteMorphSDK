@@ -31,12 +31,13 @@ type Message struct {
 	Name  string
 }
 type Part struct {
-	Kind       PartKind
-	Text       string
-	Media      *Media
-	ToolCall   *ToolCall
-	ToolResult *ToolResult
-	Opaque     string
+	Kind                  PartKind
+	Text                  string
+	Media                 *Media
+	ToolCall              *ToolCall
+	ToolResult            *ToolResult
+	Opaque                string
+	PromptCacheBreakpoint json.RawMessage
 }
 type Media struct{ URL, Data, MIMEType, FileID, Detail, Filename string }
 type ToolCall struct {
@@ -56,11 +57,15 @@ const (
 	ToolChoiceNone     ToolChoiceMode = "none"
 	ToolChoiceRequired ToolChoiceMode = "required"
 	ToolChoiceNamed    ToolChoiceMode = "named"
+	ToolChoiceAllowed  ToolChoiceMode = "allowed_tools"
 )
 
 type ToolChoice struct {
-	Mode ToolChoiceMode
-	Name string
+	Mode         ToolChoiceMode
+	Name         string
+	Kind         string
+	AllowedMode  ToolChoiceMode
+	AllowedNames []string
 }
 type JSONSchemaFormat struct {
 	Name, Description string
